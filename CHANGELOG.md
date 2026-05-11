@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.8 - 2026-05-10
 
 ### Added (CLI)
 - **Multiple Claude config directories.** Set `CLAUDE_CONFIG_DIRS` to an
