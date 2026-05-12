@@ -11,6 +11,10 @@
 - **Claude 1-hour cache write pricing.** 1-hour cache writes are now priced
   at 2x base input (previously used the 5-minute 1.25x rate for all writes).
   Daily cache bumped to v6 so stale totals are recomputed. Closes #276.
+- **OpenCode MCP usage now counted.** OpenCode stores MCP tool calls as
+  `<server>_<tool>` names, which the shared MCP pipeline did not recognize.
+  The provider now normalizes these to the canonical `mcp__<server>__<tool>`
+  form so MCP breakdowns and `optimize` work correctly. Closes #308.
 
 ## 0.9.8 - 2026-05-10
 
