@@ -141,7 +141,7 @@ describe('compactEntry', () => {
     expect(msg.content).toHaveLength(2)
     expect(msg.content[0]!.name).toBe('Read')
     expect(msg.content[0]!.id).toBe('tu1')
-    expect(msg.content[0]!.input).toEqual({})
+    expect(msg.content[0]!.input).toEqual({ file_path: '/foo' })
     expect(msg.content[1]!.name).toBe('Edit')
     expect(msg.content[1]!.id).toBe('tu2')
     expect(msg.content[1]!.input).toEqual({})
@@ -288,6 +288,44 @@ describe('compactEntry', () => {
     const cmd = msg.content[0]!.input['command'] as string
     expect(cmd.length).toBe(2000)
     expect(msg.content[0]!.input['description']).toBeUndefined()
+  })
+
+  it('keeps Read file_path capped and drops unrelated input fields', () => {
+    const raw = entry({
+      type: 'assistant',
+      message: {
+        type: 'message' as const,
+        role: 'assistant' as const,
+        model: 'claude-opus-4-6',
+        usage: { input_tokens: 10, output_tokens: 10 },
+        content: [
+          { type: 'tool_use', id: 'tu', name: 'Read', input: { file_path: '/tmp/' + 'x'.repeat(3000), content: 'big' } },
+        ],
+      },
+    })
+    const c = compactEntry(raw)
+    const msg = c.message as { content: Array<{ input: Record<string, unknown> }> }
+    expect((msg.content[0]!.input['file_path'] as string).length).toBe(2000)
+    expect(msg.content[0]!.input['content']).toBeUndefined()
+  })
+
+  it('keeps Agent subagent_type capped and drops prompt text', () => {
+    const raw = entry({
+      type: 'assistant',
+      message: {
+        type: 'message' as const,
+        role: 'assistant' as const,
+        model: 'claude-opus-4-6',
+        usage: { input_tokens: 10, output_tokens: 10 },
+        content: [
+          { type: 'tool_use', id: 'tu', name: 'Agent', input: { subagent_type: 'reviewer'.repeat(50), prompt: 'big' } },
+        ],
+      },
+    })
+    const c = compactEntry(raw)
+    const msg = c.message as { content: Array<{ input: Record<string, unknown> }> }
+    expect((msg.content[0]!.input['subagent_type'] as string).length).toBe(200)
+    expect(msg.content[0]!.input['prompt']).toBeUndefined()
   })
 
   it('handles entry with no message field', () => {

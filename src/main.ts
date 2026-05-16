@@ -2,7 +2,7 @@ import { Command } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { loadPricing, setModelAliases } from './models.js'
-import { parseAllSessions, filterProjectsByName, clearSessionCache } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache } from './parser.js'
 import { convertCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { type PeriodData, type ProviderCost } from './menubar-json.js'
@@ -615,13 +615,19 @@ program
       process.exit(1)
     }
 
-    const periods: PeriodExport[] = customRange
-      ? [{ label: formatDateRangeLabel(opts.from, opts.to), projects: fp(await parseAllSessions(customRange, pf)) }]
-      : [
-          { label: 'Today', projects: fp(await parseAllSessions(getDateRange('today').range, pf)) },
-          { label: '7 Days', projects: fp(await parseAllSessions(getDateRange('week').range, pf)) },
-          { label: '30 Days', projects: fp(await parseAllSessions(getDateRange('30days').range, pf)) },
-        ]
+    let periods: PeriodExport[]
+    if (customRange) {
+      periods = [{ label: formatDateRangeLabel(opts.from, opts.to), projects: fp(await parseAllSessions(customRange, pf)) }]
+      clearSessionCache()
+    } else {
+      const thirtyDayProjects = fp(await parseAllSessions(getDateRange('30days').range, pf))
+      clearSessionCache()
+      periods = [
+        { label: 'Today', projects: filterProjectsByDateRange(thirtyDayProjects, getDateRange('today').range) },
+        { label: '7 Days', projects: filterProjectsByDateRange(thirtyDayProjects, getDateRange('week').range) },
+        { label: '30 Days', projects: thirtyDayProjects },
+      ]
+    }
 
     if (periods.every(p => p.projects.length === 0)) {
       console.log('\n  No usage data found.\n')

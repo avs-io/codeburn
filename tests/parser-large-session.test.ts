@@ -64,6 +64,11 @@ function assistantLine(sessionId: string, timestamp: string, messageId: string, 
   })
 }
 
+function messageFirstLargeAssistantLine(sessionId: string, timestamp: string, messageId: string): string {
+  const hugeText = 'y'.repeat(3_000_000)
+  return `{"parentUuid":"u1","isSidechain":false,"message":{"model":"claude-sonnet-4-5","id":"${messageId}","type":"message","role":"assistant","content":[{"type":"text","text":"${hugeText}"},{"type":"tool_use","id":"tu-large","name":"Edit","input":{"file_path":"/tmp/x","old_string":"a","new_string":"b"}}],"usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":5000}},"uuid":"a1","timestamp":"${timestamp}","type":"assistant","sessionId":"${sessionId}","cwd":"/projects/app"}`
+}
+
 function attachmentLine(sessionId: string, timestamp: string): string {
   return JSON.stringify({
     type: 'attachment',
@@ -144,5 +149,32 @@ describe('parseAllSessions with large Claude fixture', () => {
 
     const sess = projects[0]!.sessions[0]!
     expect(sess.apiCalls).toBeGreaterThanOrEqual(1)
+  })
+
+  it('parses huge message-first assistant lines without full JSON.parse expansion', async () => {
+    const projectDir = join(home, '.claude', 'projects', 'messagefirst')
+    await mkdir(projectDir, { recursive: true })
+
+    const lines = [
+      userLine('s1', '2026-04-10T10:00:00Z', 100),
+      messageFirstLargeAssistantLine('s1', '2026-04-10T10:00:01Z', 'msg-large'),
+    ]
+
+    await writeFile(join(projectDir, 'session.jsonl'), lines.join('\n'))
+
+    const range: DateRange = {
+      start: new Date('2026-04-10T00:00:00Z'),
+      end: new Date('2026-04-10T23:59:59Z'),
+    }
+
+    const projects = await parseAllSessions(range, 'claude')
+    expect(projects.length).toBeGreaterThan(0)
+
+    const sess = projects[0]!.sessions[0]!
+    expect(sess.apiCalls).toBe(1)
+    expect(sess.totalInputTokens).toBe(1000)
+    expect(sess.totalOutputTokens).toBe(100)
+    expect(sess.totalCacheReadTokens).toBe(5000)
+    expect(sess.toolBreakdown['Edit']?.calls).toBe(1)
   })
 })

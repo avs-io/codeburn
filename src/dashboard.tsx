@@ -9,13 +9,12 @@ import { parseAllSessions, filterProjectsByName } from './parser.js'
 import { loadPricing } from './models.js'
 import { getAllProviders } from './providers/index.js'
 import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
-import { estimateContextBudget, discoverProjectCwd, type ContextBudget } from './context-budget.js'
+import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
 import { CompareView } from './compare.js'
 import { getPlanUsageOrNull, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
 import { getDateRange, PERIODS, PERIOD_LABELS, type Period, formatDateRangeLabel } from './cli-date.js'
-import { join } from 'path'
 import { patchStdoutForWindows } from './ink-win.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
@@ -25,6 +24,7 @@ const ORANGE = '#FF8C42'
 const DIM = '#555555'
 const GOLD = '#FFD700'
 const PLAN_BAR_WIDTH = 10
+const HEAVY_PERIODS = new Set<Period>(['30days', 'month', 'all'])
 
 const LANG_DISPLAY_NAMES: Record<string, string> = {
   javascript: 'JavaScript', typescript: 'TypeScript', python: 'Python',
@@ -99,6 +99,14 @@ function gradientColor(pct: number): string {
 
 function getPeriodRange(period: Period): { start: Date; end: Date } {
   return getDateRange(period).range
+}
+
+function isHeavyPeriod(period: Period): boolean {
+  return HEAVY_PERIODS.has(period)
+}
+
+function nextTick(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
 }
 
 type Layout = { dashWidth: number; wide: boolean; halfWidth: number; barWidth: number }
@@ -659,8 +667,8 @@ function StatusBar({ width, showProvider, view, findingCount, optimizeAvailable,
             <Text color={ORANGE} bold>5</Text><Text dimColor> 6 months</Text>
           </>
         )}
-        {!isOptimize && optimizeAvailable && findingCount != null && findingCount > 0 && (
-          <><Text dimColor>   </Text><Text color={ORANGE} bold>o</Text><Text dimColor> optimize</Text><Text color="#F55B5B"> ({findingCount})</Text></>
+        {!isOptimize && optimizeAvailable && (
+          <><Text dimColor>   </Text><Text color={ORANGE} bold>o</Text><Text dimColor> optimize</Text>{findingCount != null && findingCount > 0 ? <Text color="#F55B5B"> ({findingCount})</Text> : null}</>
         )}
         {!isOptimize && compareAvailable && (
           <><Text dimColor>   </Text><Text color={ORANGE} bold>c</Text><Text dimColor> compare</Text></>
@@ -716,6 +724,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
   const [detectedProviders, setDetectedProviders] = useState<string[]>([])
   const [view, setView] = useState<View>('dashboard')
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null)
+  const [optimizeLoading, setOptimizeLoading] = useState(false)
   const [projectBudgets, setProjectBudgets] = useState<Map<string, ContextBudget>>(new Map())
   const [planUsage, setPlanUsage] = useState<PlanUsage | undefined>(initialPlanUsage)
   // Cursor for the OptimizeView's findings window. Reset whenever the user
@@ -726,13 +735,16 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
   const { columns } = useWindowSize()
   const { dashWidth } = getLayout(columns)
   const multipleProviders = detectedProviders.length > 1
-  const optimizeAvailable = activeProvider === 'all' || activeProvider === 'claude'
+  const optimizeAvailable = !isCustomRange && (activeProvider === 'all' || activeProvider === 'claude')
   const modelCount = new Set(
     projects.flatMap(p => p.sessions.flatMap(s => Object.keys(s.modelBreakdown)))
   ).size
   const compareAvailable = modelCount >= 2
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reloadGenerationRef = useRef(0)
+  const reloadInFlightRef = useRef(false)
+  const currentReloadRef = useRef<{ period: Period; provider: string } | null>(null)
+  const pendingReloadRef = useRef<{ period: Period; provider: string } | null>(null)
   const findingCount = optimizeResult?.findings.length ?? 0
 
   useEffect(() => {
@@ -749,13 +761,11 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
   useEffect(() => {
     let cancelled = false
     async function loadBudgets() {
-      const claudeDir = join(homedir(), '.claude', 'projects')
       const budgets = new Map<string, ContextBudget>()
       for (const project of projects.slice(0, 8)) {
         if (cancelled) return
-        const cwd = await discoverProjectCwd(join(claudeDir, project.project))
-        if (!cwd) continue
-        budgets.set(project.project, await estimateContextBudget(cwd))
+        if (!project.projectPath.startsWith('/')) continue
+        budgets.set(project.project, await estimateContextBudget(project.projectPath))
       }
       if (!cancelled) setProjectBudgets(budgets)
     }
@@ -763,23 +773,30 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
     return () => { cancelled = true }
   }, [projects])
 
-  useEffect(() => {
-    if (!optimizeAvailable) { setOptimizeResult(null); return }
-    let cancelled = false
-    async function scan() {
-      if (projects.length === 0) { setOptimizeResult(null); return }
-      const result = await scanAndDetect(projects, getPeriodRange(period))
-      if (!cancelled) setOptimizeResult(result)
-    }
-    scan()
-    return () => { cancelled = true }
-  }, [projects, period, optimizeAvailable])
-
   const reloadData = useCallback(async (p: Period, prov: string) => {
+    if (reloadInFlightRef.current) {
+      const current = currentReloadRef.current
+      if (current?.period === p && current.provider === prov) {
+        pendingReloadRef.current = null
+        return
+      }
+      reloadGenerationRef.current++
+      pendingReloadRef.current = { period: p, provider: prov }
+      return
+    }
+    reloadInFlightRef.current = true
+    currentReloadRef.current = { period: p, provider: prov }
     const generation = ++reloadGenerationRef.current
     setLoading(true)
+    setOptimizeLoading(false)
     setOptimizeResult(null)
     try {
+      if (isHeavyPeriod(p)) {
+        setProjects([])
+        setProjectBudgets(new Map())
+        await nextTick()
+        if (reloadGenerationRef.current !== generation) return
+      }
       const range = getPeriodRange(p)
       const data = await parseAllSessions(range, prov)
       if (reloadGenerationRef.current !== generation) return
@@ -797,11 +814,37 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
       if (reloadGenerationRef.current === generation) {
         setLoading(false)
       }
+      reloadInFlightRef.current = false
+      currentReloadRef.current = null
+      const pending = pendingReloadRef.current
+      pendingReloadRef.current = null
+      if (pending) {
+        void reloadData(pending.period, pending.provider)
+      }
     }
   }, [projectFilter, excludeFilter])
 
+  const loadOptimizeResult = useCallback(async () => {
+    if (!optimizeAvailable || projects.length === 0 || optimizeLoading) return
+    setView('optimize')
+    setFindingsCursor(0)
+    if (optimizeResult) return
+
+    const generation = reloadGenerationRef.current
+    setOptimizeLoading(true)
+    try {
+      const result = await scanAndDetect(projects, getPeriodRange(period))
+      if (reloadGenerationRef.current === generation) setOptimizeResult(result)
+    } catch (error) {
+      console.error(error)
+    } finally {
+      if (reloadGenerationRef.current === generation) setOptimizeLoading(false)
+    }
+  }, [optimizeAvailable, projects, period, optimizeLoading, optimizeResult])
+
   useEffect(() => {
     if (!refreshSeconds || refreshSeconds <= 0) return
+    if (isHeavyPeriod(period)) return
     const id = setInterval(() => { reloadData(period, activeProvider) }, refreshSeconds * 1000)
     return () => clearInterval(id)
   }, [refreshSeconds, period, activeProvider, reloadData])
@@ -831,7 +874,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
 
   useInput((input, key) => {
     if (input === 'q') { exit(); return }
-    if (input === 'o' && findingCount > 0 && view === 'dashboard' && optimizeAvailable) { setView('optimize'); return }
+    if (input === 'o' && view === 'dashboard' && optimizeAvailable) { void loadOptimizeResult(); return }
     if ((input === 'b' || key.escape) && view === 'optimize') { setView('dashboard'); setFindingsCursor(0); return }
     if (view === 'optimize') {
       const total = optimizeResult?.findings.length ?? 0
@@ -869,7 +912,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
 
   const headerLabel = customRangeLabel ?? PERIOD_LABELS[period]
 
-  if (loading) {
+  if (loading || optimizeLoading) {
     return (
       <Box flexDirection="column" width={dashWidth}>
         {!isCustomRange && <PeriodTabs active={period} providerName={activeProvider} showProvider={view !== 'compare' && multipleProviders} />}
@@ -882,7 +925,9 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
                 <Text dimColor>Loading {headerLabel} model data...</Text>
               </Box>
             </Box>
-          : <Panel title="CodeBurn" color={ORANGE} width={dashWidth}><Text dimColor>Loading {headerLabel}...</Text></Panel>}
+          : view === 'optimize'
+            ? <Panel title="CodeBurn Optimize" color={ORANGE} width={dashWidth}><Text dimColor>Scanning {headerLabel}...</Text></Panel>
+            : <Panel title="CodeBurn" color={ORANGE} width={dashWidth}><Text dimColor>Loading {headerLabel}...</Text></Panel>}
         {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={0} optimizeAvailable={false} compareAvailable={false} customRange={isCustomRange} />}
       </Box>
     )

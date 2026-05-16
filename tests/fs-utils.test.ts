@@ -5,7 +5,6 @@ import { join } from 'path'
 
 import {
   MAX_SESSION_FILE_BYTES,
-  STREAM_THRESHOLD_BYTES,
   readSessionFile,
   readSessionLines,
 } from '../src/fs-utils.js'
@@ -34,11 +33,12 @@ describe('readSessionFile', () => {
     expect(await readSessionFile(p)).toBe('hello\nworld\n')
   })
 
-  it('returns content for files at the stream threshold via stream path', async () => {
-    const p = await tmpPath(Buffer.alloc(STREAM_THRESHOLD_BYTES, 'a'))
+  it('returns content for large files under the full-file cap', async () => {
+    const size = 8 * 1024 * 1024
+    const p = await tmpPath(Buffer.alloc(size, 'a'))
     const got = await readSessionFile(p)
     expect(got).not.toBeNull()
-    expect(got!.length).toBe(STREAM_THRESHOLD_BYTES)
+    expect(got!.length).toBe(size)
   })
 
   it('returns null and skips files over the cap', async () => {
@@ -86,6 +86,28 @@ describe('readSessionLines', () => {
     const lines: string[] = []
     for await (const line of readSessionLines(p)) lines.push(line)
     expect(lines).toEqual(['line1', 'line2', 'line3'])
+  })
+
+  it('skips old large lines before materializing the full line', async () => {
+    const oldLine = `{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","payload":"${'x'.repeat(100_000)}"}`
+    const newLine = '{"type":"assistant","timestamp":"2026-05-01T00:00:00Z"}'
+    const p = await tmpPath(`${oldLine}\n${newLine}\n`)
+    const lines: string[] = []
+    for await (const line of readSessionLines(p, head => head.includes('2026-01-01'))) {
+      lines.push(line)
+    }
+    expect(lines).toEqual([newLine])
+  })
+
+  it('yields large lines as Buffers when requested', async () => {
+    const largeLine = `{"type":"assistant","timestamp":"2026-05-01T00:00:00Z","payload":"${'x'.repeat(100_000)}"}`
+    const p = await tmpPath(`${largeLine}\nsmall\n`)
+    const lines: Array<string | Buffer> = []
+    for await (const line of readSessionLines(p, undefined, { largeLineAsBuffer: true })) {
+      lines.push(line)
+    }
+    expect(Buffer.isBuffer(lines[0])).toBe(true)
+    expect(lines[1]).toBe('small')
   })
 
   it('does not leak file descriptors when generator is abandoned early', async () => {

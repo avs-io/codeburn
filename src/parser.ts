@@ -32,12 +32,738 @@ function normalizeProjectPathKey(projectPath: string): string {
   return (normalized.replace(/\/+$/, '') || normalized).toLowerCase()
 }
 
-function parseJsonlLine(line: string): JournalEntry | null {
+const LARGE_JSONL_LINE_BYTES = 32 * 1024
+
+export function parseJsonlLine(line: string | Buffer): JournalEntry | null {
+  if (Buffer.isBuffer(line)) {
+    if (line.length > LARGE_JSONL_LINE_BYTES) return parseLargeJsonlBuffer(line)
+    try {
+      return JSON.parse(line.toString('utf-8')) as JournalEntry
+    } catch {
+      return null
+    }
+  }
+  if (line.length > LARGE_JSONL_LINE_BYTES) return parseLargeJsonlLine(line)
   try {
     return JSON.parse(line) as JournalEntry
   } catch {
     return null
   }
+}
+
+const RAW_HEAD_BYTES = 2048
+
+type JsonValueBounds = {
+  start: number
+  end: number
+  kind: 'string' | 'object' | 'array' | 'scalar'
+}
+
+function findJsonStringEnd(source: string, start: number, limit = source.length): number {
+  for (let i = start + 1; i < limit; i++) {
+    const ch = source.charCodeAt(i)
+    if (ch === 0x5c) {
+      i++
+      continue
+    }
+    if (ch === 0x22) return i
+  }
+  return -1
+}
+
+function findJsonContainerEnd(source: string, start: number, open: number, close: number, limit = source.length): number {
+  let depth = 0
+  let inString = false
+  for (let i = start; i < limit; i++) {
+    const ch = source.charCodeAt(i)
+    if (inString) {
+      if (ch === 0x5c) {
+        i++
+      } else if (ch === 0x22) {
+        inString = false
+      }
+      continue
+    }
+    if (ch === 0x22) {
+      inString = true
+    } else if (ch === open) {
+      depth++
+    } else if (ch === close) {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+function findJsonValueBounds(source: string, start: number, limit = source.length): JsonValueBounds | null {
+  let i = start
+  while (i < limit && /\s/.test(source[i]!)) i++
+  if (i >= limit) return null
+  const ch = source.charCodeAt(i)
+  if (ch === 0x22) {
+    const end = findJsonStringEnd(source, i, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'string' }
+  }
+  if (ch === 0x7b) {
+    const end = findJsonContainerEnd(source, i, 0x7b, 0x7d, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'object' }
+  }
+  if (ch === 0x5b) {
+    const end = findJsonContainerEnd(source, i, 0x5b, 0x5d, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'array' }
+  }
+  let end = i
+  while (end < limit) {
+    const c = source.charCodeAt(end)
+    if (c === 0x2c || c === 0x7d || c === 0x5d || /\s/.test(source[end]!)) break
+    end++
+  }
+  return { start: i, end, kind: 'scalar' }
+}
+
+function findObjectFieldValue(source: string, objectStart: number, objectEnd: number, field: string): JsonValueBounds | null {
+  if (source.charCodeAt(objectStart) !== 0x7b) return null
+  let i = objectStart + 1
+  while (i < objectEnd - 1) {
+    while (i < objectEnd && /\s/.test(source[i]!)) i++
+    if (source.charCodeAt(i) === 0x2c) {
+      i++
+      continue
+    }
+    if (source.charCodeAt(i) !== 0x22) {
+      i++
+      continue
+    }
+    const keyEnd = findJsonStringEnd(source, i, objectEnd)
+    if (keyEnd === -1) return null
+    const key = source.slice(i + 1, keyEnd)
+    i = keyEnd + 1
+    while (i < objectEnd && /\s/.test(source[i]!)) i++
+    if (source.charCodeAt(i) !== 0x3a) continue
+    const value = findJsonValueBounds(source, i + 1, objectEnd)
+    if (!value) return null
+    if (key === field) return value
+    i = value.end
+  }
+  return null
+}
+
+function readJsonString(source: string, bounds: JsonValueBounds | null, cap = Number.POSITIVE_INFINITY): string | undefined {
+  if (!bounds || bounds.kind !== 'string') return undefined
+  let out = ''
+  for (let i = bounds.start + 1; i < bounds.end - 1 && out.length < cap; i++) {
+    const ch = source[i]!
+    if (ch !== '\\') {
+      out += ch
+      continue
+    }
+    const next = source[++i]
+    if (!next) break
+    if (next === 'n') out += '\n'
+    else if (next === 'r') out += '\r'
+    else if (next === 't') out += '\t'
+    else if (next === 'b') out += '\b'
+    else if (next === 'f') out += '\f'
+    else if (next === 'u' && i + 4 < bounds.end) {
+      const hex = source.slice(i + 1, i + 5)
+      const code = Number.parseInt(hex, 16)
+      if (Number.isFinite(code)) out += String.fromCharCode(code)
+      i += 4
+    } else {
+      out += next
+    }
+  }
+  return out
+}
+
+function readJsonNumberField(source: string, objectBounds: JsonValueBounds | null, field: string): number | undefined {
+  if (!objectBounds || objectBounds.kind !== 'object') return undefined
+  const bounds = findObjectFieldValue(source, objectBounds.start, objectBounds.end, field)
+  if (!bounds) return undefined
+  const value = Number(source.slice(bounds.start, bounds.end))
+  return Number.isFinite(value) ? value : undefined
+}
+
+function parseLargeUsage(source: string, usageBounds: JsonValueBounds | null) {
+  const usage: AssistantMessageContent['usage'] = {
+    input_tokens: readJsonNumberField(source, usageBounds, 'input_tokens') ?? 0,
+    output_tokens: readJsonNumberField(source, usageBounds, 'output_tokens') ?? 0,
+    cache_creation_input_tokens: readJsonNumberField(source, usageBounds, 'cache_creation_input_tokens'),
+    cache_read_input_tokens: readJsonNumberField(source, usageBounds, 'cache_read_input_tokens'),
+  }
+
+  if (usageBounds?.kind === 'object') {
+    const cacheCreation = findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'cache_creation')
+    const ephemeral5m = readJsonNumberField(source, cacheCreation, 'ephemeral_5m_input_tokens')
+    const ephemeral1h = readJsonNumberField(source, cacheCreation, 'ephemeral_1h_input_tokens')
+    if (ephemeral5m !== undefined || ephemeral1h !== undefined) {
+      ;(usage as AssistantMessageContent['usage']).cache_creation = {
+        ...(ephemeral5m !== undefined ? { ephemeral_5m_input_tokens: ephemeral5m } : {}),
+        ...(ephemeral1h !== undefined ? { ephemeral_1h_input_tokens: ephemeral1h } : {}),
+      }
+    }
+
+    const serverToolUse = findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'server_tool_use')
+    const webSearch = readJsonNumberField(source, serverToolUse, 'web_search_requests')
+    const webFetch = readJsonNumberField(source, serverToolUse, 'web_fetch_requests')
+    if (webSearch !== undefined || webFetch !== undefined) {
+      ;(usage as AssistantMessageContent['usage']).server_tool_use = {
+        ...(webSearch !== undefined ? { web_search_requests: webSearch } : {}),
+        ...(webFetch !== undefined ? { web_fetch_requests: webFetch } : {}),
+      }
+    }
+
+    const speed = readJsonString(source, findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'speed'))
+    if (speed === 'standard' || speed === 'fast') usage.speed = speed
+  }
+
+  return usage
+}
+
+function extractLargeToolBlocks(source: string, contentBounds: JsonValueBounds | null): ToolUseBlock[] {
+  if (!contentBounds || contentBounds.kind !== 'array') return []
+  const tools: ToolUseBlock[] = []
+  let i = contentBounds.start + 1
+  while (i < contentBounds.end - 1 && tools.length < MAX_TOOL_BLOCKS) {
+    while (i < contentBounds.end && /\s/.test(source[i]!)) i++
+    if (source.charCodeAt(i) === 0x2c) {
+      i++
+      continue
+    }
+    if (source.charCodeAt(i) !== 0x7b) {
+      i++
+      continue
+    }
+    const objectEnd = findJsonContainerEnd(source, i, 0x7b, 0x7d, contentBounds.end)
+    if (objectEnd === -1) break
+    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
+    const blockType = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'type'))
+    if (blockType === 'tool_use') {
+      const name = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'name')) ?? ''
+      const id = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'id')) ?? ''
+      const inputBounds = findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'input')
+      const input: Record<string, unknown> = {}
+      if (inputBounds?.kind === 'object') {
+        if (name === 'Skill') {
+          const skill = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'skill'), 200)
+          const skillName = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'name'), 200)
+          if (skill !== undefined) input['skill'] = skill
+          if (skillName !== undefined) input['name'] = skillName
+        } else if (name === 'Read' || name === 'FileReadTool') {
+          const filePath = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'file_path'), BASH_COMMAND_CAP)
+          if (filePath !== undefined) input['file_path'] = filePath
+        } else if (name === 'Agent' || name === 'Task') {
+          const subagentType = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'subagent_type'), 200)
+          if (subagentType !== undefined) input['subagent_type'] = subagentType
+        } else if (BASH_TOOLS.has(name)) {
+          const command = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'command'), BASH_COMMAND_CAP)
+          if (command !== undefined) input['command'] = command
+        }
+      }
+      tools.push({ type: 'tool_use', id, name, input })
+    }
+    i = objectEnd + 1
+  }
+  return tools
+}
+
+function extractLargeUserText(source: string, contentBounds: JsonValueBounds | null): string | undefined {
+  if (!contentBounds) return undefined
+  if (contentBounds.kind === 'string') return readJsonString(source, contentBounds, USER_TEXT_CAP)
+  if (contentBounds.kind !== 'array') return undefined
+
+  let text = ''
+  let i = contentBounds.start + 1
+  while (i < contentBounds.end - 1 && text.length < USER_TEXT_CAP) {
+    while (i < contentBounds.end && /\s/.test(source[i]!)) i++
+    if (source.charCodeAt(i) === 0x2c) {
+      i++
+      continue
+    }
+    if (source.charCodeAt(i) !== 0x7b) {
+      i++
+      continue
+    }
+    const objectEnd = findJsonContainerEnd(source, i, 0x7b, 0x7d, contentBounds.end)
+    if (objectEnd === -1) break
+    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
+    const type = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'type'))
+    if (type === 'text' || type === 'input_text') {
+      const part = readJsonString(
+        source,
+        findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'text'),
+        USER_TEXT_CAP - text.length,
+      )
+      if (part) text += (text ? ' ' : '') + part
+    }
+    i = objectEnd + 1
+  }
+  return text || undefined
+}
+
+function extractLargeAddedNames(source: string, attachmentBounds: JsonValueBounds | null): string[] {
+  if (!attachmentBounds || attachmentBounds.kind !== 'object') return []
+  const attachmentType = readJsonString(source, findObjectFieldValue(source, attachmentBounds.start, attachmentBounds.end, 'type'))
+  if (attachmentType !== 'deferred_tools_delta') return []
+  const addedNames = findObjectFieldValue(source, attachmentBounds.start, attachmentBounds.end, 'addedNames')
+  if (!addedNames || addedNames.kind !== 'array') return []
+  const names: string[] = []
+  let i = addedNames.start + 1
+  while (i < addedNames.end - 1 && names.length < MAX_ADDED_NAMES) {
+    while (i < addedNames.end && /\s/.test(source[i]!)) i++
+    if (source.charCodeAt(i) === 0x2c) {
+      i++
+      continue
+    }
+    if (source.charCodeAt(i) !== 0x22) {
+      i++
+      continue
+    }
+    const end = findJsonStringEnd(source, i, addedNames.end)
+    if (end === -1) break
+    const name = readJsonString(source, { start: i, end: end + 1, kind: 'string' }, 500)
+    if (name) names.push(name)
+    i = end + 1
+  }
+  return names
+}
+
+function parseLargeJsonlLine(line: string): JournalEntry | null {
+  const rootEnd = findJsonContainerEnd(line, 0, 0x7b, 0x7d)
+  if (rootEnd === -1) return null
+  const rootStart = 0
+  const rootLimit = rootEnd + 1
+  const type = readJsonString(line, findObjectFieldValue(line, rootStart, rootLimit, 'type'))
+  if (!type) return null
+
+  const entry: JournalEntry = { type }
+  const timestamp = readJsonString(line, findObjectFieldValue(line, rootStart, rootLimit, 'timestamp'))
+  const sessionId = readJsonString(line, findObjectFieldValue(line, rootStart, rootLimit, 'sessionId'))
+  const cwd = readJsonString(line, findObjectFieldValue(line, rootStart, rootLimit, 'cwd'))
+  if (timestamp !== undefined) entry.timestamp = timestamp
+  if (sessionId !== undefined) entry.sessionId = sessionId
+  if (cwd !== undefined) entry.cwd = cwd
+  const addedNames = extractLargeAddedNames(line, findObjectFieldValue(line, rootStart, rootLimit, 'attachment'))
+  if (addedNames.length > 0) {
+    ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames }
+  }
+
+  if (type === 'user') {
+    const message = findObjectFieldValue(line, rootStart, rootLimit, 'message')
+    if (message?.kind === 'object') {
+      const content = findObjectFieldValue(line, message.start, message.end, 'content')
+      const text = extractLargeUserText(line, content)
+      if (text !== undefined) entry.message = { role: 'user', content: text }
+    }
+    return entry
+  }
+
+  if (type !== 'assistant') return entry
+  const message = findObjectFieldValue(line, rootStart, rootLimit, 'message')
+  if (message?.kind !== 'object') return entry
+  const model = readJsonString(line, findObjectFieldValue(line, message.start, message.end, 'model'))
+  const usageBounds = findObjectFieldValue(line, message.start, message.end, 'usage')
+  if (!model || usageBounds?.kind !== 'object') return entry
+  const id = readJsonString(line, findObjectFieldValue(line, message.start, message.end, 'id'))
+  const contentBounds = findObjectFieldValue(line, message.start, message.end, 'content')
+
+  entry.message = {
+    type: 'message',
+    role: 'assistant',
+    model,
+    ...(id !== undefined ? { id } : {}),
+    content: extractLargeToolBlocks(line, contentBounds),
+    usage: parseLargeUsage(line, usageBounds),
+  }
+
+  return entry
+}
+
+type BufferJsonValueBounds = {
+  start: number
+  end: number
+  kind: 'string' | 'object' | 'array' | 'scalar'
+}
+
+function isJsonWhitespaceByte(ch: number | undefined): boolean {
+  return ch === 0x20 || ch === 0x0a || ch === 0x0d || ch === 0x09
+}
+
+function findJsonStringEndBuffer(source: Buffer, start: number, limit = source.length): number {
+  for (let i = start + 1; i < limit; i++) {
+    const ch = source[i]
+    if (ch === 0x5c) {
+      i++
+      continue
+    }
+    if (ch === 0x22) return i
+  }
+  return -1
+}
+
+function findJsonContainerEndBuffer(source: Buffer, start: number, open: number, close: number, limit = source.length): number {
+  let depth = 0
+  let inString = false
+  for (let i = start; i < limit; i++) {
+    const ch = source[i]
+    if (inString) {
+      if (ch === 0x5c) {
+        i++
+      } else if (ch === 0x22) {
+        inString = false
+      }
+      continue
+    }
+    if (ch === 0x22) {
+      inString = true
+    } else if (ch === open) {
+      depth++
+    } else if (ch === close) {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+function findJsonValueBoundsBuffer(source: Buffer, start: number, limit = source.length): BufferJsonValueBounds | null {
+  let i = start
+  while (i < limit && isJsonWhitespaceByte(source[i])) i++
+  if (i >= limit) return null
+  const ch = source[i]
+  if (ch === 0x22) {
+    const end = findJsonStringEndBuffer(source, i, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'string' }
+  }
+  if (ch === 0x7b) {
+    const end = findJsonContainerEndBuffer(source, i, 0x7b, 0x7d, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'object' }
+  }
+  if (ch === 0x5b) {
+    const end = findJsonContainerEndBuffer(source, i, 0x5b, 0x5d, limit)
+    return end === -1 ? null : { start: i, end: end + 1, kind: 'array' }
+  }
+  let end = i
+  while (end < limit) {
+    const c = source[end]
+    if (c === 0x2c || c === 0x7d || c === 0x5d || isJsonWhitespaceByte(c)) break
+    end++
+  }
+  return { start: i, end, kind: 'scalar' }
+}
+
+function bufferKeyEquals(source: Buffer, keyStart: number, keyEnd: number, field: string): boolean {
+  if (keyEnd - keyStart !== field.length) return false
+  return source.subarray(keyStart, keyEnd).equals(Buffer.from(field))
+}
+
+function findObjectFieldValueBuffer(source: Buffer, objectStart: number, objectEnd: number, field: string): BufferJsonValueBounds | null {
+  if (source[objectStart] !== 0x7b) return null
+  let i = objectStart + 1
+  while (i < objectEnd - 1) {
+    while (i < objectEnd && isJsonWhitespaceByte(source[i])) i++
+    if (source[i] === 0x2c) {
+      i++
+      continue
+    }
+    if (source[i] !== 0x22) {
+      i++
+      continue
+    }
+    const keyEnd = findJsonStringEndBuffer(source, i, objectEnd)
+    if (keyEnd === -1) return null
+    const keyStart = i + 1
+    i = keyEnd + 1
+    while (i < objectEnd && isJsonWhitespaceByte(source[i])) i++
+    if (source[i] !== 0x3a) continue
+    const value = findJsonValueBoundsBuffer(source, i + 1, objectEnd)
+    if (!value) return null
+    if (bufferKeyEquals(source, keyStart, keyEnd, field)) return value
+    i = value.end
+  }
+  return null
+}
+
+function appendBufferJsonSegment(source: Buffer, start: number, end: number, current: string, cap: number): string {
+  if (start >= end || current.length >= cap) return current
+  const remaining = cap - current.length
+  const cappedEnd = Number.isFinite(cap) ? Math.min(end, start + remaining * 4) : end
+  return current + source.subarray(start, cappedEnd).toString('utf-8').slice(0, remaining)
+}
+
+function readJsonStringBuffer(source: Buffer, bounds: BufferJsonValueBounds | null, cap = Number.POSITIVE_INFINITY): string | undefined {
+  if (!bounds || bounds.kind !== 'string') return undefined
+  let out = ''
+  let segmentStart = bounds.start + 1
+  for (let i = bounds.start + 1; i < bounds.end - 1 && out.length < cap; i++) {
+    const ch = source[i]
+    if (ch !== 0x5c) continue
+
+    out = appendBufferJsonSegment(source, segmentStart, i, out, cap)
+    if (out.length >= cap) break
+    const next = source[++i]
+    if (next === undefined) break
+    if (next === 0x6e) out += '\n'
+    else if (next === 0x72) out += '\r'
+    else if (next === 0x74) out += '\t'
+    else if (next === 0x62) out += '\b'
+    else if (next === 0x66) out += '\f'
+    else if (next === 0x75 && i + 4 < bounds.end) {
+      const hex = source.subarray(i + 1, i + 5).toString('ascii')
+      const code = Number.parseInt(hex, 16)
+      if (Number.isFinite(code)) out += String.fromCharCode(code)
+      i += 4
+    } else {
+      out += String.fromCharCode(next)
+    }
+    segmentStart = i + 1
+  }
+  return appendBufferJsonSegment(source, segmentStart, bounds.end - 1, out, cap)
+}
+
+function readJsonNumberFieldBuffer(source: Buffer, objectBounds: BufferJsonValueBounds | null, field: string): number | undefined {
+  if (!objectBounds || objectBounds.kind !== 'object') return undefined
+  const bounds = findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, field)
+  if (!bounds) return undefined
+  const value = Number(source.subarray(bounds.start, bounds.end).toString('ascii'))
+  return Number.isFinite(value) ? value : undefined
+}
+
+function parseLargeUsageBuffer(source: Buffer, usageBounds: BufferJsonValueBounds | null) {
+  const usage: AssistantMessageContent['usage'] = {
+    input_tokens: readJsonNumberFieldBuffer(source, usageBounds, 'input_tokens') ?? 0,
+    output_tokens: readJsonNumberFieldBuffer(source, usageBounds, 'output_tokens') ?? 0,
+    cache_creation_input_tokens: readJsonNumberFieldBuffer(source, usageBounds, 'cache_creation_input_tokens'),
+    cache_read_input_tokens: readJsonNumberFieldBuffer(source, usageBounds, 'cache_read_input_tokens'),
+  }
+
+  if (usageBounds?.kind === 'object') {
+    const cacheCreation = findObjectFieldValueBuffer(source, usageBounds.start, usageBounds.end, 'cache_creation')
+    const ephemeral5m = readJsonNumberFieldBuffer(source, cacheCreation, 'ephemeral_5m_input_tokens')
+    const ephemeral1h = readJsonNumberFieldBuffer(source, cacheCreation, 'ephemeral_1h_input_tokens')
+    if (ephemeral5m !== undefined || ephemeral1h !== undefined) {
+      ;(usage as AssistantMessageContent['usage']).cache_creation = {
+        ...(ephemeral5m !== undefined ? { ephemeral_5m_input_tokens: ephemeral5m } : {}),
+        ...(ephemeral1h !== undefined ? { ephemeral_1h_input_tokens: ephemeral1h } : {}),
+      }
+    }
+
+    const serverToolUse = findObjectFieldValueBuffer(source, usageBounds.start, usageBounds.end, 'server_tool_use')
+    const webSearch = readJsonNumberFieldBuffer(source, serverToolUse, 'web_search_requests')
+    const webFetch = readJsonNumberFieldBuffer(source, serverToolUse, 'web_fetch_requests')
+    if (webSearch !== undefined || webFetch !== undefined) {
+      ;(usage as AssistantMessageContent['usage']).server_tool_use = {
+        ...(webSearch !== undefined ? { web_search_requests: webSearch } : {}),
+        ...(webFetch !== undefined ? { web_fetch_requests: webFetch } : {}),
+      }
+    }
+
+    const speed = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, usageBounds.start, usageBounds.end, 'speed'))
+    if (speed === 'standard' || speed === 'fast') usage.speed = speed
+  }
+
+  return usage
+}
+
+function extractLargeToolBlocksBuffer(source: Buffer, contentBounds: BufferJsonValueBounds | null): ToolUseBlock[] {
+  if (!contentBounds || contentBounds.kind !== 'array') return []
+  const tools: ToolUseBlock[] = []
+  let i = contentBounds.start + 1
+  while (i < contentBounds.end - 1 && tools.length < MAX_TOOL_BLOCKS) {
+    while (i < contentBounds.end && isJsonWhitespaceByte(source[i])) i++
+    if (source[i] === 0x2c) {
+      i++
+      continue
+    }
+    if (source[i] !== 0x7b) {
+      i++
+      continue
+    }
+    const objectEnd = findJsonContainerEndBuffer(source, i, 0x7b, 0x7d, contentBounds.end)
+    if (objectEnd === -1) break
+    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
+    const blockType = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'type'))
+    if (blockType === 'tool_use') {
+      const name = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'name')) ?? ''
+      const id = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'id')) ?? ''
+      const inputBounds = findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'input')
+      const input: Record<string, unknown> = {}
+      if (inputBounds?.kind === 'object') {
+        if (name === 'Skill') {
+          const skill = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, inputBounds.start, inputBounds.end, 'skill'), 200)
+          const skillName = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, inputBounds.start, inputBounds.end, 'name'), 200)
+          if (skill !== undefined) input['skill'] = skill
+          if (skillName !== undefined) input['name'] = skillName
+        } else if (name === 'Read' || name === 'FileReadTool') {
+          const filePath = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, inputBounds.start, inputBounds.end, 'file_path'), BASH_COMMAND_CAP)
+          if (filePath !== undefined) input['file_path'] = filePath
+        } else if (name === 'Agent' || name === 'Task') {
+          const subagentType = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, inputBounds.start, inputBounds.end, 'subagent_type'), 200)
+          if (subagentType !== undefined) input['subagent_type'] = subagentType
+        } else if (BASH_TOOLS.has(name)) {
+          const command = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, inputBounds.start, inputBounds.end, 'command'), BASH_COMMAND_CAP)
+          if (command !== undefined) input['command'] = command
+        }
+      }
+      tools.push({ type: 'tool_use', id, name, input })
+    }
+    i = objectEnd + 1
+  }
+  return tools
+}
+
+function extractLargeUserTextBuffer(source: Buffer, contentBounds: BufferJsonValueBounds | null): string | undefined {
+  if (!contentBounds) return undefined
+  if (contentBounds.kind === 'string') return readJsonStringBuffer(source, contentBounds, USER_TEXT_CAP)
+  if (contentBounds.kind !== 'array') return undefined
+
+  let text = ''
+  let i = contentBounds.start + 1
+  while (i < contentBounds.end - 1 && text.length < USER_TEXT_CAP) {
+    while (i < contentBounds.end && isJsonWhitespaceByte(source[i])) i++
+    if (source[i] === 0x2c) {
+      i++
+      continue
+    }
+    if (source[i] !== 0x7b) {
+      i++
+      continue
+    }
+    const objectEnd = findJsonContainerEndBuffer(source, i, 0x7b, 0x7d, contentBounds.end)
+    if (objectEnd === -1) break
+    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
+    const type = readJsonStringBuffer(source, findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'type'))
+    if (type === 'text' || type === 'input_text') {
+      const part = readJsonStringBuffer(
+        source,
+        findObjectFieldValueBuffer(source, objectBounds.start, objectBounds.end, 'text'),
+        USER_TEXT_CAP - text.length,
+      )
+      if (part) text += (text ? ' ' : '') + part
+    }
+    i = objectEnd + 1
+  }
+  return text || undefined
+}
+
+function extractLargeAddedNamesBuffer(source: Buffer, attachmentBounds: BufferJsonValueBounds | null): string[] {
+  if (!attachmentBounds || attachmentBounds.kind !== 'object') return []
+  const attachmentType = readJsonStringBuffer(
+    source,
+    findObjectFieldValueBuffer(source, attachmentBounds.start, attachmentBounds.end, 'type'),
+  )
+  if (attachmentType !== 'deferred_tools_delta') return []
+  const addedNames = findObjectFieldValueBuffer(source, attachmentBounds.start, attachmentBounds.end, 'addedNames')
+  if (!addedNames || addedNames.kind !== 'array') return []
+  const names: string[] = []
+  let i = addedNames.start + 1
+  while (i < addedNames.end - 1 && names.length < MAX_ADDED_NAMES) {
+    while (i < addedNames.end && isJsonWhitespaceByte(source[i])) i++
+    if (source[i] === 0x2c) {
+      i++
+      continue
+    }
+    if (source[i] !== 0x22) {
+      i++
+      continue
+    }
+    const end = findJsonStringEndBuffer(source, i, addedNames.end)
+    if (end === -1) break
+    const name = readJsonStringBuffer(source, { start: i, end: end + 1, kind: 'string' }, 500)
+    if (name) names.push(name)
+    i = end + 1
+  }
+  return names
+}
+
+function parseLargeJsonlBuffer(line: Buffer): JournalEntry | null {
+  let rootStart = 0
+  while (rootStart < line.length && isJsonWhitespaceByte(line[rootStart])) rootStart++
+  if (line[rootStart] !== 0x7b) return null
+  const rootEnd = findJsonContainerEndBuffer(line, rootStart, 0x7b, 0x7d)
+  if (rootEnd === -1) return null
+  const rootLimit = rootEnd + 1
+  const type = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, rootStart, rootLimit, 'type'))
+  if (!type) return null
+
+  const entry: JournalEntry = { type }
+  const timestamp = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, rootStart, rootLimit, 'timestamp'))
+  const sessionId = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, rootStart, rootLimit, 'sessionId'))
+  const cwd = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, rootStart, rootLimit, 'cwd'))
+  if (timestamp !== undefined) entry.timestamp = timestamp
+  if (sessionId !== undefined) entry.sessionId = sessionId
+  if (cwd !== undefined) entry.cwd = cwd
+  const addedNames = extractLargeAddedNamesBuffer(line, findObjectFieldValueBuffer(line, rootStart, rootLimit, 'attachment'))
+  if (addedNames.length > 0) {
+    ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames }
+  }
+
+  if (type === 'user') {
+    const message = findObjectFieldValueBuffer(line, rootStart, rootLimit, 'message')
+    if (message?.kind === 'object') {
+      const content = findObjectFieldValueBuffer(line, message.start, message.end, 'content')
+      const text = extractLargeUserTextBuffer(line, content)
+      if (text !== undefined) entry.message = { role: 'user', content: text }
+    }
+    return entry
+  }
+
+  if (type !== 'assistant') return entry
+  const message = findObjectFieldValueBuffer(line, rootStart, rootLimit, 'message')
+  if (message?.kind !== 'object') return entry
+  const model = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, message.start, message.end, 'model'))
+  const usageBounds = findObjectFieldValueBuffer(line, message.start, message.end, 'usage')
+  if (!model || usageBounds?.kind !== 'object') return entry
+  const id = readJsonStringBuffer(line, findObjectFieldValueBuffer(line, message.start, message.end, 'id'))
+  const contentBounds = findObjectFieldValueBuffer(line, message.start, message.end, 'content')
+
+  entry.message = {
+    type: 'message',
+    role: 'assistant',
+    model,
+    ...(id !== undefined ? { id } : {}),
+    content: extractLargeToolBlocksBuffer(line, contentBounds),
+    usage: parseLargeUsageBuffer(line, usageBounds),
+  }
+
+  return entry
+}
+
+function getTopLevelRawJsonStringField(head: string, field: string): string | null {
+  let i = 0
+  while (i < head.length && /\s/.test(head[i]!)) i++
+  if (head.charCodeAt(i) !== 0x7b) return null
+  i++
+  while (i < head.length) {
+    while (i < head.length && /\s/.test(head[i]!)) i++
+    if (head.charCodeAt(i) === 0x2c) {
+      i++
+      continue
+    }
+    if (head.charCodeAt(i) === 0x7d) return null
+    if (head.charCodeAt(i) !== 0x22) return null
+    const keyEnd = findJsonStringEnd(head, i)
+    if (keyEnd === -1) return null
+    const key = head.slice(i + 1, keyEnd)
+    i = keyEnd + 1
+    while (i < head.length && /\s/.test(head[i]!)) i++
+    if (head.charCodeAt(i) !== 0x3a) return null
+    const value = findJsonValueBounds(head, i + 1)
+    if (!value) return null
+    if (key === field) return readJsonString(head, value) ?? null
+    i = value.end
+  }
+  return null
+}
+
+export function shouldSkipLine(line: string, threshold: string): boolean {
+  const head = line.length > RAW_HEAD_BYTES ? line.slice(0, RAW_HEAD_BYTES) : line
+  const type = getTopLevelRawJsonStringField(head, 'type')
+  if (type !== 'user' && type !== 'assistant') return false
+  const ts = getTopLevelRawJsonStringField(head, 'timestamp')
+  if (!ts || ts.length < 10) return false
+  return ts < threshold
 }
 
 const USER_TEXT_CAP = 2000
@@ -100,6 +826,12 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
       const ri = (tb.input ?? {}) as Record<string, unknown>
       if (typeof ri['skill'] === 'string') input['skill'] = (ri['skill'] as string).slice(0, 200)
       if (typeof ri['name'] === 'string') input['name'] = (ri['name'] as string).slice(0, 200)
+    } else if (tb.name === 'Read' || tb.name === 'FileReadTool') {
+      const ri = (tb.input ?? {}) as Record<string, unknown>
+      if (typeof ri['file_path'] === 'string') input['file_path'] = (ri['file_path'] as string).slice(0, BASH_COMMAND_CAP)
+    } else if (tb.name === 'Agent' || tb.name === 'Task') {
+      const ri = (tb.input ?? {}) as Record<string, unknown>
+      if (typeof ri['subagent_type'] === 'string') input['subagent_type'] = (ri['subagent_type'] as string).slice(0, 200)
     } else if (BASH_TOOLS.has(tb.name)) {
       const ri = (tb.input ?? {}) as Record<string, unknown>
       if (typeof ri['command'] === 'string') {
@@ -518,7 +1250,18 @@ async function parseSessionFile(
   const entries: JournalEntry[] = []
   let hasLines = false
 
-  for await (const line of readSessionLines(filePath)) {
+  // When a dateRange is given, skip user/assistant lines whose timestamp
+  // is older than range.start - 24h without calling JSON.parse. Huge lines
+  // that cannot be skipped are yielded as Buffers and compact-parsed without
+  // converting the whole line into a V8 string.
+  const earlySkipThreshold = dateRange
+    ? new Date(dateRange.start.getTime() - 86_400_000).toISOString()
+    : null
+  const skipFn = earlySkipThreshold
+    ? (head: string) => shouldSkipLine(head, earlySkipThreshold)
+    : undefined
+
+  for await (const line of readSessionLines(filePath, skipFn, { largeLineAsBuffer: true })) {
     hasLines = true
     const entry = parseJsonlLine(line)
     if (entry) entries.push(compactEntry(entry))
@@ -823,6 +1566,35 @@ export function filterProjectsByName(
     })
   }
   return result
+}
+
+function turnIsInDateRange(turn: ClassifiedTurn, dateRange: DateRange): boolean {
+  if (turn.assistantCalls.length === 0) return false
+  const firstCallTs = turn.assistantCalls[0]!.timestamp
+  if (!firstCallTs) return false
+  const ts = new Date(firstCallTs)
+  return ts >= dateRange.start && ts <= dateRange.end
+}
+
+export function filterProjectsByDateRange(projects: ProjectSummary[], dateRange: DateRange): ProjectSummary[] {
+  const filtered: ProjectSummary[] = []
+  for (const project of projects) {
+    const sessions: SessionSummary[] = []
+    for (const session of project.sessions) {
+      const turns = session.turns.filter(turn => turnIsInDateRange(turn, dateRange))
+      if (turns.length === 0) continue
+      sessions.push(buildSessionSummary(session.sessionId, session.project, turns, session.mcpInventory))
+    }
+    if (sessions.length === 0) continue
+    filtered.push({
+      project: project.project,
+      projectPath: project.projectPath,
+      sessions,
+      totalCostUSD: sessions.reduce((s, sess) => s + sess.totalCostUSD, 0),
+      totalApiCalls: sessions.reduce((s, sess) => s + sess.apiCalls, 0),
+    })
+  }
+  return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
 }
 
 export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
