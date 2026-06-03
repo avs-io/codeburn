@@ -27,6 +27,9 @@ function isValidRate(value: unknown): value is number {
 let active: CurrencyState = { code: 'USD', rate: 1, symbol: '$' }
 
 const USD: CurrencyState = { code: 'USD', rate: 1, symbol: '$' }
+const SYMBOL_OVERRIDES: Record<string, string> = {
+  CNY: '¥',
+}
 
 // Intl.NumberFormat throws on invalid ISO 4217 codes, so we use it as a validator
 export function isValidCurrencyCode(code: string): boolean {
@@ -39,6 +42,8 @@ export function isValidCurrencyCode(code: string): boolean {
 }
 
 function resolveSymbol(code: string): string {
+  if (SYMBOL_OVERRIDES[code]) return SYMBOL_OVERRIDES[code]
+
   const parts = new Intl.NumberFormat('en', {
     style: 'currency',
     currency: code,

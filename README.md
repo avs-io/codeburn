@@ -281,6 +281,7 @@ Subscription tracking for Claude Pro, Claude Max, Cursor Pro, and custom provide
 codeburn currency GBP          # set to British Pounds
 codeburn currency AUD          # set to Australian Dollars
 codeburn currency JPY          # set to Japanese Yen
+codeburn currency CNY          # set to Chinese Yuan
 codeburn currency              # show current setting
 codeburn currency --reset      # back to USD
 ```

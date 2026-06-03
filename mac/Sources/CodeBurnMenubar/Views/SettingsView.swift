@@ -36,7 +36,7 @@ private struct GeneralSettingsTab: View {
                     get: { store.currency },
                     set: { applyCurrency(code: $0) }
                 )) {
-                    ForEach(["USD", "EUR", "GBP", "INR", "JPY", "AUD", "CAD"], id: \.self) { code in
+                    ForEach(["USD", "EUR", "GBP", "INR", "JPY", "CNY", "AUD", "CAD"], id: \.self) { code in
                         Text(code).tag(code)
                     }
                 }
