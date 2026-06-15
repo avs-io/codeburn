@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/providers.png" alt="CodeBurn" width="520" />
 </p>
 
-<p align="center"><strong>See where your AI coding tokens go.</strong></p>
+<p align="center"><strong>See where your AI tokens usage go.</strong></p>
 
 <p align="center">                                                                                                                                                                          
     <a href="https://www.npmjs.com/package/codeburn"><img src="https://img.shields.io/npm/v/codeburn.svg" alt="npm version" /></a>
