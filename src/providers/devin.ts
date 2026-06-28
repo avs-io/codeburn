@@ -14,17 +14,32 @@ import type {
 import { readSessionFile } from "../fs-utils.js";
 import { isPositiveNumber, safeNumber } from "../parser.js";
 
-type AgentTrajectory<T extends Step> = {
+type AgentTrajectory<StepType extends Step = Step, AgentExtra = unknown> = {
   schema_version: string;
   session_id?: string;
-  agent: Agent;
-  steps: T[];
+  agent: Agent<AgentExtra>;
+  steps: StepType[];
+  final_metrics?: FinalMetrics;
 };
 
-type Agent = {
+type FinalMetrics = {
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  total_cached_tokens?: number;
+  total_steps?: number;
+};
+
+type DevinAgentExtra = {
+  backend?: string;
+  permission_mode?: string;
+};
+
+type Agent<Extra = unknown> = {
   name: string;
   version: string;
   model_name?: string;
+  tool_definitions?: unknown;
+  extra?: Extra;
 };
 
 type ToolCall = {
@@ -53,17 +68,77 @@ type DevinMetadata = {
   };
 };
 
-type Step = {
-  step_id: number;
-  source: string;
-  model_name?: string;
-  message: string;
-  tool_calls?: Array<ToolCall>;
+type ContentPart = ContentPartText | ContentPartImage;
+
+type ContentPartText = {
+  type: "text";
+  text: string;
 };
 
-type DevinStep = Step & { metadata?: DevinMetadata };
+type ContentPartImage = {
+  type: "image";
+  source: ImageSource;
+};
 
-type DevinAgentTrajectory = AgentTrajectory<DevinStep>;
+function isTextContentPart(
+  contentPart: ContentPart,
+): contentPart is ContentPartText {
+  return contentPart.type === "text";
+}
+
+type ImageSource = {
+  media_type: string;
+  path: string;
+};
+
+type Step<StepExtra = unknown, MetricsExtra = unknown> = {
+  step_id: number;
+  timestamp?: string;
+  source: string;
+  model_name?: string;
+  message: string | Array<ContentPart>;
+  tool_calls?: Array<ToolCall>;
+  extra?: StepExtra;
+  observation?: Observation;
+  metrics?: Metrics<MetricsExtra>;
+};
+
+type DevinTelemetry = {
+  source?: string;
+  operation?: string;
+};
+
+type DevinStepExtra = {
+  committed_acu_cost?: number;
+  generation_model?: string;
+  telemetry?: DevinTelemetry;
+};
+
+type Observation = {
+  results: Array<ObservationResult>;
+};
+
+type ObservationResult = {
+  source_call_id?: string;
+  content?: string | Array<ContentPart>;
+};
+
+type Metrics<Extra = unknown> = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  extra?: Extra;
+};
+
+type DevinMetricsExtra = {
+  cache_creation_input_tokens?: number;
+};
+
+type DevinStep = Step<DevinStepExtra, DevinMetricsExtra> & {
+  metadata?: DevinMetadata;
+};
+
+type DevinAgentTrajectory = AgentTrajectory<DevinStep, DevinAgentExtra>;
 
 type DevinSessionMetadata = {
   id: string;
@@ -110,28 +185,79 @@ function parseNumericTimestamp(value: number): string {
   return new Date(millis).toISOString();
 }
 
-function getUsage(
-  metadata: DevinMetadata | undefined | null,
-): DevinUsage | null {
-  if (!metadata) return null;
-  const metrics = metadata.metrics;
+function getCommittedAcuCost(step: DevinStep): number {
+  const acuCost = [
+    step.metadata?.committed_acu_cost,
+    step.extra?.committed_acu_cost,
+  ].filter((cost) => isPositiveNumber(cost));
+
+  return acuCost.shift() || 0;
+}
+
+function hasAnyTokenField(
+  metrics: Metrics<DevinMetricsExtra> | null | undefined,
+): boolean {
+  if (!metrics) return false;
+  return [
+    metrics.prompt_tokens,
+    metrics.completion_tokens,
+    metrics.cached_tokens,
+    metrics.extra?.cache_creation_input_tokens,
+  ].some((value) => value != null);
+}
+
+function getMetricsFromStep(
+  step: DevinStep,
+): Metrics<DevinMetricsExtra> | null {
+  // Prefer step.metrics (standard ATIF v1.7) only when it actually carries
+  // token fields; a present-but-empty metrics object must not shadow the
+  // legacy metadata.metrics location.
+  if (hasAnyTokenField(step.metrics)) {
+    return step.metrics ?? null;
+  }
+
+  if (step.metadata) {
+    return getDevinMetricsFromMetadata(step.metadata);
+  }
+
+  return step.metrics ?? null;
+}
+
+function getDevinMetricsFromMetadata(
+  metadata: DevinMetadata,
+): Metrics<DevinMetricsExtra> {
+  return {
+    prompt_tokens: metadata.metrics?.input_tokens,
+    completion_tokens: metadata.metrics?.output_tokens,
+    cached_tokens: metadata.metrics?.cache_read_tokens,
+    extra: {
+      cache_creation_input_tokens: metadata.metrics?.cache_creation_tokens,
+    },
+  };
+}
+
+function getUsage(step: DevinStep): DevinUsage | null {
+  const committedAcuCost = getCommittedAcuCost(step);
+  const metrics = getMetricsFromStep(step);
 
   const hasAnyUsage = [
-    metadata.committed_acu_cost,
-    metrics?.input_tokens,
-    metrics?.output_tokens,
-    metrics?.cache_creation_tokens,
-    metrics?.cache_read_tokens,
+    committedAcuCost,
+    metrics?.prompt_tokens,
+    metrics?.completion_tokens,
+    metrics?.extra?.cache_creation_input_tokens,
+    metrics?.cached_tokens,
   ].some((x) => isPositiveNumber(x));
 
   if (!hasAnyUsage) return null;
 
   return {
-    committedAcuCost: safeNumber(metadata.committed_acu_cost),
-    inputTokens: safeNumber(metrics?.input_tokens),
-    outputTokens: safeNumber(metrics?.output_tokens),
-    cacheCreationInputTokens: safeNumber(metrics?.cache_creation_tokens),
-    cacheReadInputTokens: safeNumber(metrics?.cache_read_tokens),
+    committedAcuCost,
+    inputTokens: safeNumber(metrics?.prompt_tokens),
+    outputTokens: safeNumber(metrics?.completion_tokens),
+    cacheCreationInputTokens: safeNumber(
+      metrics?.extra?.cache_creation_input_tokens,
+    ),
+    cacheReadInputTokens: safeNumber(metrics?.cached_tokens),
   };
 }
 
@@ -198,6 +324,21 @@ function getToolNames(step: DevinStep): string[] {
   return (step.tool_calls ?? []).map((call) => call.function_name);
 }
 
+function normalizeContentPartMessage(contentPart: ContentPart) {
+  if (isTextContentPart(contentPart)) {
+    return contentPart.text;
+  } else {
+    return contentPart.source.path;
+  }
+}
+
+function normalizeStepMessage(message: string | Array<ContentPart>): string {
+  if (Array.isArray(message)) {
+    return message.map((x) => normalizeContentPartMessage(x).trim()).join(" ");
+  }
+  return message.trim();
+}
+
 function getFirstUserMessageBeforeStep(
   steps: DevinStep[],
   index: number,
@@ -205,7 +346,9 @@ function getFirstUserMessageBeforeStep(
   for (let i = index - 1; i >= 0; i--) {
     const step = steps[i];
     if (!step?.metadata?.is_user_input) continue;
-    const message = step.message?.trim();
+    const message = step.message
+      ? normalizeStepMessage(step.message)
+      : undefined;
     if (message) return message;
   }
   return null;
@@ -282,7 +425,7 @@ class DevinSessionParser implements SessionParser {
       const step = transcript.steps[index];
       if (step.metadata?.is_user_input) continue;
 
-      const usage = getUsage(step.metadata);
+      const usage = getUsage(step);
       if (!usage) continue;
 
       const timestamp = getTimestamp(step, session) ?? "";
