@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'fs'
 import { isAbsolute, join } from 'path'
 import { homedir } from 'os'
 import type { ActionKind, ActionPlan, PlannedChange } from './types.js'
+import { sha256 } from './backup.js'
 import type { WasteFinding } from '../optimize.js'
 
 // Turns an optimize finding into a concrete, journaled file-mutation plan.
@@ -107,7 +108,16 @@ function findServerKey(container: Record<string, unknown> | undefined, server: s
   return null
 }
 
-type DocState = { path: string; doc: Record<string, unknown>; existed: boolean; dirty: boolean }
+type DocState = {
+  path: string
+  doc: Record<string, unknown>
+  existed: boolean
+  dirty: boolean
+  // sha256 of the raw bytes the doc was parsed from (before the BOM strip);
+  // null when the file did not exist. Becomes the change's expectedHash so
+  // runAction refuses to apply over a file edited after the plan was built.
+  rawHash: string | null
+}
 
 // Reads each config file at most once, tracks parse errors, and emits one
 // PlannedChange per file it actually mutated.
@@ -119,22 +129,24 @@ class ConfigDocs {
   load(path: string): DocState | null {
     if (this.docs.has(path)) return this.docs.get(path)!
     if (!existsSync(path)) {
-      const state: DocState = { path, doc: {}, existed: false, dirty: false }
+      const state: DocState = { path, doc: {}, existed: false, dirty: false, rawHash: null }
       this.docs.set(path, state)
       return state
     }
-    let raw: string
+    let buf: Buffer
     try {
-      raw = readFileSync(path, 'utf-8')
+      buf = readFileSync(path)
     } catch (e) {
       this.errors.set(path, `could not read ${shortPath(path, this.homeDir)}: ${errMessage(e)}`)
       this.docs.set(path, null)
       return null
     }
+    const rawHash = sha256(buf)
+    let raw = buf.toString('utf-8')
     if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1)
     try {
       const doc = JSON.parse(raw) as Record<string, unknown>
-      const state: DocState = { path, doc, existed: true, dirty: false }
+      const state: DocState = { path, doc, existed: true, dirty: false, rawHash }
       this.docs.set(path, state)
       return state
     } catch (e) {
@@ -152,6 +164,7 @@ class ConfigDocs {
           op: state.existed ? 'edit' : 'create',
           path: state.path,
           content: JSON.stringify(state.doc, null, 2) + '\n',
+          expectedHash: state.rawHash,
         })
       }
     }
@@ -393,17 +406,26 @@ function upsertMarkerBlock(existing: string | null, id: string, text: string, st
   return existing.endsWith('\n') ? existing + block : existing + '\n' + block
 }
 
+function markerChange(target: string, id: string, text: string, style: 'html' | 'hash'): PlannedChange {
+  const buf = existsSync(target) ? readFileSync(target) : null
+  const existing = buf === null ? null : buf.toString('utf-8')
+  return {
+    op: buf === null ? 'create' : 'edit',
+    path: target,
+    content: upsertMarkerBlock(existing, id, text, style),
+    expectedHash: buf === null ? null : sha256(buf),
+  }
+}
+
 function buildClaudeMdRule(finding: WasteFinding, r: ResolvedPaths): BuiltPlan {
   if (finding.fix.type !== 'paste') return { plan: null, notes: [] }
   const target = r.projectClaudeMd
-  const existing = existsSync(target) ? readFileSync(target, 'utf-8') : null
-  const content = upsertMarkerBlock(existing, finding.id, finding.fix.text, 'html')
   return {
     plan: {
       kind: 'claude-md-rule',
       findingId: finding.id,
       description: `Add the ${finding.id} rule block to ${shortPath(target, r.homeDir)}`,
-      changes: [{ op: existing === null ? 'create' : 'edit', path: target, content }],
+      changes: [markerChange(target, finding.id, finding.fix.text, 'html')],
     },
     notes: [],
   }
@@ -412,14 +434,12 @@ function buildClaudeMdRule(finding: WasteFinding, r: ResolvedPaths): BuiltPlan {
 function buildShellConfig(finding: WasteFinding, r: ResolvedPaths): BuiltPlan {
   if (finding.fix.type !== 'paste') return { plan: null, notes: [] }
   const target = r.shellRc
-  const existing = existsSync(target) ? readFileSync(target, 'utf-8') : null
-  const content = upsertMarkerBlock(existing, finding.id, finding.fix.text, 'hash')
   return {
     plan: {
       kind: 'shell-config',
       findingId: finding.id,
       description: `Set the bash output cap in ${shortPath(target, r.homeDir)}`,
-      changes: [{ op: existing === null ? 'create' : 'edit', path: target, content }],
+      changes: [markerChange(target, finding.id, finding.fix.text, 'hash')],
     },
     notes: [],
   }

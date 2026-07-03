@@ -586,3 +586,70 @@ describe('runOptimizeApply end-to-end', () => {
     expect(out).toContain('could not parse')
   })
 })
+
+describe('stale-plan detection', () => {
+  it('rejects when the target changed after the plan was built, leaving nothing behind', async () => {
+    const fx = await makeFixture()
+    const claudeJson = join(fx.home, '.claude.json')
+    await writeFile(claudeJson, JSON.stringify({ mcpServers: { s: {} } }, null, 2) + '\n')
+    const plan = planFor(
+      makeFinding('mcp-low-coverage', CMD_FIX, { kind: 'mcp-remove', servers: ['s'] }),
+      { homeDir: fx.home, cwd: fx.project },
+    )
+    expect(plan).not.toBeNull()
+
+    const interim = JSON.stringify({ mcpServers: { s: {}, addedMeanwhile: {} } }, null, 2) + '\n'
+    await writeFile(claudeJson, interim)
+
+    await expect(runAction(plan!, fx.actionsDir)).rejects.toThrow(/changed since the plan was built; re-run codeburn optimize --apply/)
+    expect(await readFile(claudeJson, 'utf-8')).toBe(interim)
+    expect(await readRecords(fx.actionsDir)).toHaveLength(0)
+    const backups = await readdir(join(fx.actionsDir, 'backups')).catch(() => [])
+    expect(backups).toEqual([])
+  })
+
+  it('rejects a plan expecting an absent file when the file appeared', async () => {
+    const fx = await makeFixture()
+    const claudeMd = join(fx.project, 'CLAUDE.md')
+    const plan = planFor(
+      makeFinding('read-edit-ratio', { type: 'paste', destination: 'claude-md', label: '', text: 'rule' }),
+      { homeDir: fx.home, cwd: fx.project },
+    )
+    expect(plan!.changes[0]).toMatchObject({ op: 'create', expectedHash: null })
+
+    await writeFile(claudeMd, '# appeared meanwhile\n')
+
+    await expect(runAction(plan!, fx.actionsDir)).rejects.toThrow(/changed since the plan was built/)
+    expect(await readFile(claudeMd, 'utf-8')).toBe('# appeared meanwhile\n')
+    expect(await readRecords(fx.actionsDir)).toHaveLength(0)
+  })
+
+  it('applies when the target still matches the expected hash', async () => {
+    const fx = await makeFixture()
+    const claudeJson = join(fx.home, '.claude.json')
+    await writeFile(claudeJson, JSON.stringify({ mcpServers: { s: {} } }, null, 2) + '\n')
+    const plan = planFor(
+      makeFinding('mcp-low-coverage', CMD_FIX, { kind: 'mcp-remove', servers: ['s'] }),
+      { homeDir: fx.home, cwd: fx.project },
+    )
+    expect(plan!.changes[0]!.op === 'move' ? undefined : plan!.changes[0]!.expectedHash).toMatch(/^[0-9a-f]{64}$/)
+
+    const rec = await runAction(plan!, fx.actionsDir)
+    expect(rec.status).toBe('applied')
+    expect(JSON.parse(await readFile(claudeJson, 'utf-8')).mcpServers).toEqual({})
+  })
+
+  it('a change without expectedHash skips validation (framework back-compat)', async () => {
+    const fx = await makeFixture()
+    const p = join(fx.home, 'free.txt')
+    await writeFile(p, 'anything at all')
+
+    const rec = await runAction({
+      kind: 'claude-md-rule',
+      description: 'no expected hash',
+      changes: [{ op: 'edit', path: p, content: 'overwritten' }],
+    }, fx.actionsDir)
+    expect(rec.status).toBe('applied')
+    expect(await readFile(p, 'utf-8')).toBe('overwritten')
+  })
+})

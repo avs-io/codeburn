@@ -26,9 +26,14 @@ export type ActionRecord = {
   baseline?: Record<string, number>
 }
 
+// expectedHash: sha256 of the raw on-disk bytes the plan's content was
+// computed from (null when the plan expects the file to be absent). runAction
+// refuses to apply when the target no longer matches, so a file edited
+// between preview and confirm is never silently clobbered with stale
+// content. undefined skips the check.
 export type PlannedChange =
-  | { op: 'edit'; path: string; content: string | Buffer }
-  | { op: 'create'; path: string; content: string | Buffer }
+  | { op: 'edit'; path: string; content: string | Buffer; expectedHash?: string | null }
+  | { op: 'create'; path: string; content: string | Buffer; expectedHash?: string | null }
   | { op: 'move'; path: string; movedTo: string }
 
 export type ActionPlan = {

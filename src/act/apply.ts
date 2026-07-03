@@ -41,6 +41,16 @@ export async function runAction(plan: ActionPlan, actionsDir: string = defaultAc
 
     const done: number[] = []
     try {
+      // Stale-plan guard: plans carry full post-edit content computed at
+      // build time, so refuse if a target changed between preview and
+      // confirm. Runs before any mutation; failure needs no rollback (the
+      // catch below only removes the backup dir).
+      for (const pc of plan.changes) {
+        if (pc.op === 'move' || pc.expectedHash === undefined) continue
+        if ((await sha256File(pc.path)) !== pc.expectedHash) {
+          throw new Error(`${pc.path} changed since the plan was built; re-run codeburn optimize --apply`)
+        }
+      }
       for (let i = 0; i < plan.changes.length; i++) {
         const pc = plan.changes[i]!
         if (pc.op === 'move') {
