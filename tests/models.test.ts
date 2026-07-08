@@ -620,3 +620,58 @@ describe('DeepSeek v4 models resolve to pricing', () => {
     }
   })
 })
+
+describe('provider pricing suffix variants', () => {
+  const cases: Array<[string, string]> = [
+    ['GLM-4.7-TEE', 'glm-4.7'],
+    ['glm-4.7:thinking', 'glm-4.7'],
+    ['Kimi-K2.5-TEE', 'kimi-k2.5'],
+    ['deepseek-v4-pro:cloud', 'deepseek-v4-pro'],
+    ['glm-5:thinking', 'glm-5'],
+    ['kimi-k2.6:thinking', 'kimi-k2.6'],
+    ['deepseek-v4-flash:thinking', 'deepseek-v4-flash'],
+    ['minimax-m3:cloud', 'minimax-m3'],
+  ]
+
+  for (const [input, expectedBase] of cases) {
+    it(`${input} resolves through ${expectedBase}`, () => {
+      const costs = getModelCosts(input)
+      const expected = getModelCosts(expectedBase)
+      expect(costs).not.toBeNull()
+      expect(expected).not.toBeNull()
+      expect(costs!.inputCostPerToken).toBe(expected!.inputCostPerToken)
+      expect(costs!.outputCostPerToken).toBe(expected!.outputCostPerToken)
+    })
+  }
+
+  it('does not strip arbitrary local runtime tags', () => {
+    expect(getModelCosts('qwen3.6:35b-a3b-bf16')).toBeNull()
+  })
+
+  it('does not strip free-tier markers into paid pricing', () => {
+    expect(getModelCosts('mimo-v2-flash:free')).toBeNull()
+  })
+})
+
+describe('observed provider model aliases', () => {
+  const cases: Array<[string, string]> = [
+    ['MiMo-V2-Flash', 'xiaomi/mimo-v2-flash'],
+    ['KAT-Coder-Pro-V1', 'kwaipilot/kat-coder-pro'],
+  ]
+
+  for (const [input, expectedModel] of cases) {
+    it(`${input} resolves through ${expectedModel}`, () => {
+      const costs = getModelCosts(input)
+      const expected = getModelCosts(expectedModel)
+      expect(costs).not.toBeNull()
+      expect(expected).not.toBeNull()
+      expect(costs).toEqual(expected)
+      expect(calculateCost(input, 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+    })
+  }
+
+  it('does not map dated Qwen3 Max to a reseller price without provider context', () => {
+    expect(getModelCosts('qwen3-max-2026-01-23')).toBeNull()
+    expect(calculateCost('qwen3-max-2026-01-23', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
+  })
+})

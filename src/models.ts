@@ -289,6 +289,8 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'kimi-auto':                     'kimi-k2-thinking',
   'kimi-code':                     'kimi-k2-thinking',
   'kimi-for-coding':               'kimi-k2-thinking',
+  'mimo-v2-flash':                 'xiaomi/mimo-v2-flash',
+  'kat-coder-pro-v1':              'kwaipilot/kat-coder-pro',
   // Cursor emits dot-version tier-last names plus tier/reasoning suffixes
   // that LiteLLM does not index (`-high`, `-low`, `-medium`, `-thinking`,
   // `-high-thinking`, `-fast-mode`). Missing aliases here surface as $0 in
@@ -575,6 +577,8 @@ export function getProxyPathsConfigHash(): string {
 function resolveAlias(model: string): string {
   if (Object.hasOwn(userAliases, model)) return userAliases[model]!
   if (Object.hasOwn(BUILTIN_ALIASES, model)) return BUILTIN_ALIASES[model]!
+  const lowercase = model.toLowerCase()
+  if (lowercase !== model && Object.hasOwn(BUILTIN_ALIASES, lowercase)) return BUILTIN_ALIASES[lowercase]!
   return model
 }
 function getCanonicalName(model: string): string {
@@ -582,6 +586,16 @@ function getCanonicalName(model: string): string {
     .replace(/@.*$/, '')       // strip pin: claude-sonnet-4-6@20250929 -> claude-sonnet-4-6
     .replace(/-\d{8}$/, '')   // strip date: claude-sonnet-4-20250514 -> claude-sonnet-4
     .replace(/^[^/]+\//, '') // strip provider prefix: anthropic/foo -> foo
+}
+
+function stripKnownPricingVariantSuffix(model: string): string | null {
+  const withoutColonSuffix = model.replace(/:(thinking|cloud)$/i, '')
+  if (withoutColonSuffix !== model) return withoutColonSuffix
+
+  const withoutTeeSuffix = model.replace(/-TEE$/i, '')
+  if (withoutTeeSuffix !== model) return withoutTeeSuffix
+
+  return null
 }
 
 export function getModelCosts(model: string): ModelCosts | null {
@@ -630,6 +644,18 @@ export function getModelCosts(model: string): ModelCosts | null {
   if (byCanonical) return byCanonical
   const byPrefix = lowerIndex.get(withPrefix.toLowerCase())
   if (byPrefix) return byPrefix
+
+  const withPrefixVariant = stripKnownPricingVariantSuffix(withPrefix)
+  if (withPrefixVariant && withPrefixVariant !== withPrefix) {
+    const variantCosts = getModelCosts(withPrefixVariant)
+    if (variantCosts) return variantCosts
+  }
+
+  const canonicalVariant = stripKnownPricingVariantSuffix(canonical)
+  if (canonicalVariant && canonicalVariant !== canonical && canonicalVariant !== withPrefixVariant) {
+    const variantCosts = getModelCosts(canonicalVariant)
+    if (variantCosts) return variantCosts
+  }
 
   return null
 }
