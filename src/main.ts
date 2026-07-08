@@ -865,7 +865,7 @@ program
   .option('--force', 'Reinstall even if an older copy is already in ~/Applications')
   .action(async (opts: { force?: boolean }) => {
     try {
-      const result = await installMenubarApp({ force: opts.force })
+      const result = await installMenubarApp({ force: opts.force, cliVersion: version })
       console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
