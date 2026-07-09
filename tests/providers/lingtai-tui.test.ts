@@ -177,4 +177,31 @@ describe('lingtai-tui provider', () => {
     expect(provider.modelDisplayName('claude-sonnet-4-6')).toBe('Sonnet 4.6')
     expect(provider.modelDisplayName('some-future-model')).toBe('some-future-model')
   })
+
+  // A planted .agent.json can be valid JSON with wrong-typed fields. Before the
+  // manifest was normalized, an object-valued agent_name reached
+  // sanitizeProject().trim() and threw — and discoverAllSessions loops providers
+  // with no try/catch, so that one file broke usage discovery for EVERY
+  // provider. Discovery and parsing must both survive it.
+  it('does not crash on a valid-JSON manifest with wrong-typed fields', async () => {
+    const ledgerPath = await writeAgent('agent-hostile', {
+      manifest: {
+        agent_name: {},
+        agent_id: [1, 2],
+        address: 42,
+        nickname: { x: 1 },
+        llm: { model: {}, base_url: [] },
+      },
+      ledgerLines: [
+        { source: 'main', ts: '2026-06-04T01:26:09Z', input: 10, output: 5, model: 'gpt-5.5' },
+      ],
+    })
+
+    const provider = createLingTaiTuiProvider(tmpDir)
+    await expect(provider.discoverSessions()).resolves.toBeInstanceOf(Array)
+    const calls = await collectCalls(provider, ledgerPath)
+    expect(calls).toHaveLength(1)
+    // Wrong-typed manifest name falls back to the sanitized agent directory.
+    expect(typeof calls[0]!.model).toBe('string')
+  })
 })

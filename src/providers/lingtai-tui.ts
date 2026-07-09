@@ -183,7 +183,24 @@ async function readJson<T>(path: string): Promise<T | null> {
 }
 
 async function readAgentManifest(agentDir: string): Promise<LingTaiAgentManifest | null> {
-  return readJson<LingTaiAgentManifest>(join(agentDir, '.agent.json'))
+  const obj = asObject(await readJson<unknown>(join(agentDir, '.agent.json')))
+  if (!obj) return null
+  // .agent.json is untrusted: a planted file can be valid JSON with wrong-typed
+  // fields (e.g. `agent_name: {}`). Reading it as a raw cast let a non-string
+  // field reach sanitizeProject().trim() and throw — and because
+  // discoverAllSessions loops providers without a try/catch, that one file took
+  // down usage discovery for EVERY provider. Normalize to string-or-undefined
+  // here so no downstream string op ever sees a non-string.
+  const llm = asObject(obj['llm'])
+  return {
+    agent_id: stringField(obj, 'agent_id'),
+    agent_name: stringField(obj, 'agent_name'),
+    address: stringField(obj, 'address'),
+    nickname: stringField(obj, 'nickname') ?? null,
+    llm: llm
+      ? { model: stringField(llm, 'model'), base_url: stringField(llm, 'base_url') }
+      : undefined,
+  }
 }
 
 function agentDirFromLedgerPath(ledgerPath: string): string {
