@@ -1,0 +1,363 @@
+// Types mirrored verbatim from the codeburn CLI (`src/*`). The renderer is a
+// pure view over CLI JSON, so these shapes must match the emitters exactly.
+// Do not invent fields — copy from the cited source files.
+
+// ————— Period + IPC error contract —————
+
+export type Period = 'today' | 'week' | '30days' | 'month' | 'all'
+
+export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout'
+
+/** Structured failure surfaced across the IPC boundary as plain data. */
+export interface CliError {
+  kind: CliErrorKind
+  message: string
+}
+
+// ————— src/menubar-json.ts —————
+
+export type DailyModelBreakdown = {
+  name: string
+  cost: number
+  savingsUSD: number
+  calls: number
+  inputTokens: number
+  outputTokens: number
+}
+
+export type DailyHistoryEntry = {
+  date: string
+  cost: number
+  savingsUSD: number
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  topModels: DailyModelBreakdown[]
+}
+
+export type LocalModelSavings = {
+  totalUSD: number
+  calls: number
+  byModel: Array<{
+    name: string
+    calls: number
+    actualUSD: number
+    savingsUSD: number
+    baselineModel: string
+    inputTokens: number
+    outputTokens: number
+  }>
+  byProvider: Array<{ name: string; calls: number; savingsUSD: number }>
+}
+
+export type DeviceSummary = {
+  id: string
+  name: string
+  local: boolean
+  error?: string
+  cost: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreateTokens: number
+  cacheReadTokens: number
+  totalTokens: number
+}
+
+export type CombinedUsage = {
+  perDevice: DeviceSummary[]
+  combined: {
+    cost: number
+    calls: number
+    sessions: number
+    inputTokens: number
+    outputTokens: number
+    cacheCreateTokens: number
+    cacheReadTokens: number
+    totalTokens: number
+    deviceCount: number
+    reachableCount: number
+  }
+}
+
+export type ClaudeConfigOption = {
+  id: string
+  label: string
+  path: string
+}
+
+export type ClaudeConfigSelector = {
+  selectedId: string | null
+  options: ClaudeConfigOption[]
+}
+
+export type MenubarPayload = {
+  generated: string
+  current: {
+    label: string
+    cost: number
+    calls: number
+    sessions: number
+    oneShotRate: number | null
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens: number
+    cacheWriteTokens: number
+    cacheHitPercent: number
+    codexCredits: number
+    topActivities: Array<{
+      name: string
+      cost: number
+      savingsUSD: number
+      turns: number
+      oneShotRate: number | null
+    }>
+    topModels: Array<{
+      name: string
+      cost: number
+      savingsUSD: number
+      savingsBaselineModel: string
+      calls: number
+    }>
+    unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
+    localModelSavings: LocalModelSavings
+    providers: Record<string, number>
+    topProjects: Array<{
+      name: string
+      cost: number
+      savingsUSD: number
+      sessions: number
+      avgCostPerSession: number
+      sessionDetails: Array<{
+        cost: number
+        savingsUSD: number
+        calls: number
+        inputTokens: number
+        outputTokens: number
+        date: string
+        models: Array<{ name: string; cost: number; savingsUSD: number }>
+      }>
+    }>
+    modelEfficiency: Array<{
+      name: string
+      costPerEdit: number | null
+      oneShotRate: number | null
+    }>
+    topSessions: Array<{
+      project: string
+      cost: number
+      savingsUSD: number
+      calls: number
+      date: string
+    }>
+    retryTax: {
+      totalUSD: number
+      retries: number
+      editTurns: number
+      byModel: Array<{
+        name: string
+        taxUSD: number
+        retries: number
+        retriesPerEdit: number | null
+      }>
+    }
+    routingWaste: {
+      totalSavingsUSD: number
+      baselineModel: string
+      baselineCostPerEdit: number
+      byModel: Array<{
+        name: string
+        costPerEdit: number
+        editTurns: number
+        actualUSD: number
+        counterfactualUSD: number
+        savingsUSD: number
+      }>
+    }
+    tools: Array<{ name: string; calls: number }>
+    skills: Array<{ name: string; turns: number; cost: number }>
+    subagents: Array<{ name: string; calls: number; cost: number }>
+    mcpServers: Array<{ name: string; calls: number }>
+  }
+  optimize: {
+    findingCount: number
+    savingsUSD: number
+    topFindings: Array<{
+      title: string
+      impact: 'high' | 'medium' | 'low'
+      savingsUSD: number
+    }>
+  }
+  history: {
+    daily: DailyHistoryEntry[]
+  }
+  combined?: CombinedUsage
+  claudeConfigs?: ClaudeConfigSelector
+}
+
+// ————— src/types.ts + src/models-report.ts —————
+
+export type TaskCategory =
+  | 'coding'
+  | 'debugging'
+  | 'feature'
+  | 'refactoring'
+  | 'testing'
+  | 'exploration'
+  | 'planning'
+  | 'delegation'
+  | 'git'
+  | 'build/deploy'
+  | 'conversation'
+  | 'brainstorming'
+  | 'general'
+
+export type ModelReportRow = {
+  provider: string
+  providerDisplayName: string
+  model: string
+  modelDisplayName: string
+  category: TaskCategory | null
+  inputTokens: number
+  outputTokens: number
+  cacheWriteTokens: number
+  cacheReadTokens: number
+  totalTokens: number
+  costUSD: number
+  savingsUSD: number
+  savingsBaselineModel: string
+  calls: number
+  credits: number | null
+  topCategory?: TaskCategory
+  topCategoryCost?: number
+  topCategoryShare?: number
+}
+
+// ————— src/yield.ts —————
+
+export type YieldCategory = 'productive' | 'reverted' | 'abandoned'
+
+export type YieldBucketJson = {
+  costUSD: number
+  sessions: number
+  costPercent: number
+  sessionPercent: number
+}
+
+export type SessionYieldJson = {
+  sessionId: string
+  project: string
+  category: YieldCategory
+  commitCount: number
+  costUSD: number
+}
+
+export type YieldJsonReport = {
+  period: {
+    label: string
+    start: string
+    end: string
+  }
+  summary: {
+    productive: YieldBucketJson
+    reverted: YieldBucketJson
+    abandoned: YieldBucketJson
+    total: { costUSD: number; sessions: number }
+    productiveToRevertedCostRatio: number | null
+  }
+  details: SessionYieldJson[]
+}
+
+// ————— src/config.ts + src/plan-usage.ts + src/main.ts (status --format json) —————
+
+export type PlanId =
+  | 'claude-pro'
+  | 'claude-max'
+  | 'claude-max-5x'
+  | 'cursor-pro'
+  | 'supergrok'
+  | 'supergrok-heavy'
+  | 'custom'
+  | 'none'
+export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'all'
+export type PlanStatus = 'under' | 'near' | 'over'
+
+/** Serialized plan summary from `attachPlanSummaries` (src/main.ts:90). */
+export type JsonPlanSummary = {
+  id: PlanId
+  provider: PlanProvider
+  budget: number
+  spent: number
+  percentUsed: number
+  status: PlanStatus
+  projectedMonthEnd: number
+  daysUntilReset: number
+  periodStart: string
+  periodEnd: string
+}
+
+/** `codeburn status --format json` payload (src/main.ts:751), with plan summaries attached. */
+export type StatusJson = {
+  currency: string
+  today: { cost: number; savings: number; calls: number }
+  month: { cost: number; savings: number; calls: number }
+  localModelSavings?: { today: number; month: number; callsToday: number; callsMonth: number }
+  plan?: JsonPlanSummary
+  plans?: Partial<Record<PlanProvider, JsonPlanSummary>>
+}
+
+// ————— T1a: src/spend-flow.ts (defined by the shared contract) —————
+
+export type SpendFlowNode = { id: string; label: string; cost: number }
+export type SpendFlowLink = { model: string; project: string; cost: number }
+export type SpendFlow = {
+  period: { label: string; start: string; end: string }
+  models: SpendFlowNode[]
+  projects: SpendFlowNode[]
+  links: SpendFlowLink[]
+}
+
+// ————— T1b: src/sharing/* (defined by the shared contract) —————
+
+export type PendingPairing = { id: string; name: string; code: string }
+export type ShareStatus = {
+  sharing: boolean
+  name: string
+  port: number
+  always: boolean
+  peers: number
+  pending: PendingPairing[]
+}
+
+/** Public identity subset served by /api/identity (src/web-dashboard.ts:229). */
+export type Identity = {
+  name: string
+  fingerprint: string
+}
+
+export type ScannedDevice = {
+  name: string
+  host: string
+  port: number
+  fingerprint: string
+  code: string
+  paired: boolean
+}
+export type DeviceScanResult = { found: ScannedDevice[] }
+
+// ————— IPC surface (preload contextBridge → window.codeburn) —————
+
+export interface CodeburnBridge {
+  getOverview(period: Period, provider: string): Promise<MenubarPayload>
+  getPlans(period: Period): Promise<StatusJson>
+  getModels(period: Period, provider: string, byTask: boolean): Promise<ModelReportRow[]>
+  getYield(period: Period): Promise<YieldJsonReport>
+  getSpendFlow(period: Period, provider: string): Promise<SpendFlow>
+  getDevices(period: Period): Promise<CombinedUsage>
+  getShareStatus(): Promise<ShareStatus>
+  getIdentity(): Promise<Identity>
+  cliStatus(): Promise<{ found: boolean; path: string | null; error?: string }>
+}
