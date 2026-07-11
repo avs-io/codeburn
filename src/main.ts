@@ -4,7 +4,7 @@ import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache } from './parser.js'
-import { allProviderNames } from './providers/index.js'
+import { allProviderNames, getAllProviders } from './providers/index.js'
 import { convertCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
@@ -1496,10 +1496,51 @@ program
   .description('Compare two AI models side-by-side')
   .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', 'all')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
+  .option('--format <format>', 'Output format: tui, json', 'tui')
+  .option('--model-a <model>', 'First model to compare')
+  .option('--model-b <model>', 'Second model to compare')
   .action(async (opts) => {
     assertProvider(opts.provider, 'compare')
+    assertFormat(opts.format, ['tui', 'json'], 'compare')
     await loadPricing()
-    const { range } = getDateRange(opts.period)
+    const { range, label } = getDateRange(opts.period)
+    if (opts.format === 'json') {
+      const { aggregateModelStats, buildCompareJson, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
+      const projects = await parseAllSessions(range, opts.provider)
+      const models = aggregateModelStats(projects)
+
+      const providers = await getAllProviders()
+      const dirs: string[] = []
+      for (const provider of providers) {
+        const sessions = await provider.discoverSessions()
+        for (const session of sessions) dirs.push(session.path)
+      }
+      const corrections = await scanSelfCorrections(dirs)
+      for (const model of models) {
+        model.selfCorrections = corrections.get(model.model) ?? 0
+      }
+
+      if (!opts.modelA && !opts.modelB) {
+        process.stdout.write(JSON.stringify(models, null, 2) + '\n')
+        return
+      }
+      if (!opts.modelA || !opts.modelB) {
+        process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
+        process.exit(1)
+      }
+      const modelA = models.find(model => model.model === opts.modelA)
+      const modelB = models.find(model => model.model === opts.modelB)
+      if (!modelA) {
+        process.stderr.write(`codeburn compare: model not found: "${opts.modelA}".\n`)
+        process.exit(1)
+      }
+      if (!modelB) {
+        process.stderr.write(`codeburn compare: model not found: "${opts.modelB}".\n`)
+        process.exit(1)
+      }
+      process.stdout.write(renderCompareJson(buildCompareJson(projects, modelA, modelB, label, opts.provider)) + '\n')
+      return
+    }
     await renderCompare(range, opts.provider)
   })
 
@@ -1598,6 +1639,37 @@ program
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)
     }
+  })
+
+program
+  .command('sessions')
+  .description('Full per-session usage report')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
+  .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
+  .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--format <format>', 'Output format: table, json', 'table')
+  .action(async (opts) => {
+    assertProvider(opts.provider, 'sessions')
+    assertFormat(opts.format, ['table', 'json'], 'sessions')
+    const { aggregateSessions, renderJson, renderTable } = await import('./sessions-report.js')
+    await loadPricing()
+
+    let range
+    if (opts.from || opts.to) {
+      const customRange = parseDateRangeFlags(opts.from, opts.to)
+      if (!customRange) {
+        process.stderr.write('codeburn: --from and --to must be valid YYYY-MM-DD dates\n')
+        process.exit(1)
+      }
+      range = customRange
+    } else {
+      range = getDateRange(opts.period).range
+    }
+
+    const rows = aggregateSessions(await parseAllSessions(range, opts.provider))
+    const output = opts.format === 'json' ? renderJson(rows) : renderTable(rows)
+    process.stdout.write(output + '\n')
   })
 
 program

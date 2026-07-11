@@ -100,6 +100,18 @@ export type WorkingStyleRow = {
   formatFn: ComparisonRow['formatFn']
 }
 
+export type CompareJsonReport = {
+  period: {
+    label: string
+    provider: string
+  }
+  modelA: ModelStats
+  modelB: ModelStats
+  metrics: ComparisonRow[]
+  categories: CategoryComparison[]
+  workingStyle: WorkingStyleRow[]
+}
+
 type MetricDef = {
   section: string
   label: string
@@ -275,6 +287,27 @@ export function computeWorkingStyle(projects: ProjectSummary[], modelA: string, 
     { label: 'Avg tools / turn', valueA: avg(sA.totalToolCalls, sA.totalTurns), valueB: avg(sB.totalToolCalls, sB.totalTurns), formatFn: 'decimal' as const },
     { label: 'Fast mode usage', valueA: pct(sA.fastModeCalls, sA.totalTurns), valueB: pct(sB.fastModeCalls, sB.totalTurns), formatFn: 'percent' as const },
   ]
+}
+
+export function buildCompareJson(
+  projects: ProjectSummary[],
+  modelA: ModelStats,
+  modelB: ModelStats,
+  label: string,
+  provider: string,
+): CompareJsonReport {
+  return {
+    period: { label, provider },
+    modelA,
+    modelB,
+    metrics: computeComparison(modelA, modelB),
+    categories: computeCategoryComparison(projects, modelA.model, modelB.model),
+    workingStyle: computeWorkingStyle(projects, modelA.model, modelB.model),
+  }
+}
+
+export function renderCompareJson(report: CompareJsonReport): string {
+  return JSON.stringify(report, null, 2)
 }
 
 const SELF_CORRECTION_PATTERNS = [
