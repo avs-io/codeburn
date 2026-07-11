@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, nativeTheme, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
 import { CliError, resolveCodeburnPath, spawnCli } from './cli'
@@ -149,7 +149,7 @@ function createWindow(): BrowserWindow {
     height: 820,
     minWidth: 900,
     minHeight: 600,
-    backgroundColor: '#0B0D13',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0e1013' : '#f5f6f8',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

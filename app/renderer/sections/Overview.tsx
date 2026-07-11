@@ -94,6 +94,23 @@ function streakDays(daily: DailyHistoryEntry[], now: Date): number {
   return streak
 }
 
+// The daily chart is a trend, not scoped to the period selector: always show a
+// contiguous window of at least 30 calendar days, filling gaps with zero bars.
+function buildDailyWindow(daily: DailyHistoryEntry[], now: Date, days: number): DailyHistoryEntry[] {
+  const byDate = new Map(daily.map(day => [day.date, day]))
+  const window: DailyHistoryEntry[] = []
+  for (let offset = days - 1; offset >= 0; offset--) {
+    const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset)
+    const key = localDateKey(date)
+    window.push(byDate.get(key) ?? {
+      date: key, cost: 0, calls: 0, savingsUSD: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      topModels: [],
+    })
+  }
+  return window
+}
+
 function CountUp({ value }: { value: number }) {
   const ref = useRef<HTMLDivElement>(null)
 
@@ -271,6 +288,7 @@ export function OverviewContent({
   const now = new Date()
   const stats = deriveStats(data, now)
   const periodDaily = sliceDailyToPeriod(data.history.daily, period, now)
+  const chartDaily = buildDailyWindow(data.history.daily, now, Math.max(30, periodDaily.length))
   const recent14 = data.history.daily.slice(-14)
   const dailyAverage = mean(periodDaily.map(day => day.cost))
   const averageDelta = dailyAverage > 0 ? ((stats.todayCost - dailyAverage) / dailyAverage) * 100 : 0
@@ -317,7 +335,7 @@ export function OverviewContent({
 
       <div className="ov-card ov-panel">
         <div className="ov-panel-head"><h3>Daily spend</h3><span className="r">{topModel ? `Biggest driver: ${topModel.name}` : 'No model driver yet'}</span></div>
-        <div className="ov-panel-body">{periodDaily.length ? <DailyChart daily={periodDaily} /> : <EmptyNote>No spend in this range yet.</EmptyNote>}</div>
+        <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
       </div>
 
       <div className="ov-card ov-panel">

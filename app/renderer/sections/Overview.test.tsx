@@ -170,16 +170,17 @@ describe('Overview', () => {
     expect(screen.getByText('from 0 applied fixes')).toBeInTheDocument()
   })
 
-  it('slices the capsule chart to the selected period window', async () => {
+  it('always shows at least a 30-day window regardless of the selected period', async () => {
     const now = new Date()
     getOverview.mockResolvedValue(makePayload(now))
 
-    // period="week" → last 7 calendar days. The other 23 backfill entries are
-    // outside the window and must be excluded from the chart.
+    // The daily chart is a trend, not scoped to the period selector: even for a
+    // short period like "week" it renders a contiguous >= 30-day window,
+    // backfilling days with no activity as zero-height bars.
     const { container } = render(<Overview period="week" provider="all" />)
 
     expect(await screen.findByText('parser-service')).toBeInTheDocument()
-    expect(container.querySelectorAll('.chart .col')).toHaveLength(7)
+    expect(container.querySelectorAll('.chart .col')).toHaveLength(30)
   })
 
   it('computes month-to-date, projection, and previous-month pace', async () => {
