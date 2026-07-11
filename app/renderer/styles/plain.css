@@ -103,7 +103,10 @@ html, body, #root { height: 100%; margin: 0; }
 body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .win { height: 100%; min-height: 0; border-radius: 0; background: var(--canvas); box-shadow: none; }
 .ct { min-height: 0; }
-.body { overflow-y: auto; min-height: 0; }
+.body { overflow-y: auto; min-height: 0; align-items: center; }
+/* Children keep their natural height (don't flex-shrink to fit) so the pane
+   scrolls instead of squishing; capped width keeps content from stretching. */
+.body > * { flex-shrink: 0; width: 100%; max-width: 940px; }
 /* Use the real OS window controls, not the wireframe's fake traffic-light dots. */
 .lights { display: none; }
 .sb { padding-top: 12px; }
