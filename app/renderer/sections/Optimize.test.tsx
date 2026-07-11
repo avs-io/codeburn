@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MenubarPayload, YieldJsonReport } from '../lib/types'
 import { Optimize } from './Optimize'
@@ -94,10 +94,6 @@ describe('Optimize', () => {
     getYield.mockReset()
   })
 
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
   it('renders waste findings with savings and segment totals from overview and yield payloads', async () => {
     getOverview.mockResolvedValue(makePayload())
     getYield.mockResolvedValue(makeYield())
@@ -129,6 +125,62 @@ describe('Optimize', () => {
     expect(screen.getByText('agentseal-dash')).toBeInTheDocument()
     expect(screen.queryByText('sandbox-spike')).not.toBeInTheDocument()
     expect(screen.queryByText('desktop-app')).not.toBeInTheDocument()
+  })
+
+  it('switches to Abandoned and shows only abandoned yield details', async () => {
+    getOverview.mockResolvedValue(makePayload())
+    getYield.mockResolvedValue(makeYield())
+
+    render(<Optimize period="30days" provider="all" />)
+    expect(await screen.findByText('Opus is doing your small talk')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Abandoned $65.40' }))
+
+    expect(screen.getByText('sandbox-spike')).toBeInTheDocument()
+    expect(screen.getByText('0 commits · abn-1')).toBeInTheDocument()
+    expect(screen.getByText('$65.40')).toHaveClass('val')
+    expect(screen.getByText('$65.40')).not.toHaveClass('ok')
+    expect(screen.queryByText('codeburn')).not.toBeInTheDocument()
+    expect(screen.queryByText('agentseal-dash')).not.toBeInTheDocument()
+    expect(screen.queryByText('desktop-app')).not.toBeInTheDocument()
+  })
+
+  it('renders an honest placeholder for unavailable yield totals and list bodies', async () => {
+    getOverview.mockResolvedValue(makePayload())
+    getYield.mockRejectedValue(new Error('yield failed'))
+
+    render(<Optimize period="30days" provider="all" />)
+
+    expect(await screen.findByRole('button', { name: 'Reverts —' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Abandoned —' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reverts $0.00' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Abandoned $0.00' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reverts —' }))
+    expect(screen.getByText('—')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Abandoned —' }))
+    expect(screen.getByText('—')).toBeInTheDocument()
+  })
+
+  it('switches to Fixes and shows populated and empty states', async () => {
+    getOverview.mockResolvedValue(makePayload())
+    getYield.mockResolvedValue(makeYield())
+
+    const { rerender } = render(<Optimize period="30days" provider="all" />)
+    expect(await screen.findByText('Opus is doing your small talk')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Fixes 3' }))
+
+    expect(screen.getByText('3 findings · $94.40 potential')).toBeInTheDocument()
+    expect(screen.queryByText('3 fixes ready')).not.toBeInTheDocument()
+    expect(screen.queryByText('$94.40 recoverable waste')).not.toBeInTheDocument()
+
+    getOverview.mockResolvedValue(emptyPayload())
+    rerender(<Optimize period="week" provider="all" />)
+
+    expect(await screen.findByText('No fixes in this range yet.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Fixes 0' })).toBeInTheDocument()
   })
 
   it('renders honest empty states for missing optimize findings and yield details', async () => {

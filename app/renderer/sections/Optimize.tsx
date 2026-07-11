@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 import { Panel } from '../components/Panel'
 import { SegTabs } from '../components/SegTabs'
-import { usePolled } from '../hooks/usePolled'
+import { type Polled, usePolled } from '../hooks/usePolled'
 import { codeburn } from '../lib/ipc'
 import type { MenubarPayload, Period, SessionYieldJson, YieldJsonReport } from '../lib/types'
 
@@ -51,12 +51,13 @@ export function Optimize({ period, provider }: { period: Period; provider: strin
     )
   }
 
-  const revertedTotal = yieldReport.data?.summary.reverted.costUSD ?? 0
-  const abandonedTotal = yieldReport.data?.summary.abandoned.costUSD ?? 0
+  const yieldData = !yieldReport.loading && !yieldReport.error ? yieldReport.data : null
+  const revertedTotal = yieldData ? fmtUsd(yieldData.summary.reverted.costUSD) : '—'
+  const abandonedTotal = yieldData ? fmtUsd(yieldData.summary.abandoned.costUSD) : '—'
   const options = [
     { value: 'waste', label: `Waste ${fmtUsd(overview.data.optimize.savingsUSD)}` },
-    { value: 'reverts', label: `Reverts ${fmtUsd(revertedTotal)}` },
-    { value: 'abandoned', label: `Abandoned ${fmtUsd(abandonedTotal)}` },
+    { value: 'reverts', label: `Reverts ${revertedTotal}` },
+    { value: 'abandoned', label: `Abandoned ${abandonedTotal}` },
     { value: 'fixes', label: `Fixes ${overview.data.optimize.findingCount.toLocaleString('en-US')}` },
   ]
 
@@ -109,14 +110,12 @@ function YieldRows({
   category,
   empty,
 }: {
-  report: ReturnType<typeof usePolled<YieldJsonReport>>
+  report: Polled<YieldJsonReport>
   category: SessionYieldJson['category']
   empty: string
 }) {
-  if (!report.data) {
-    if (report.error) return <p style={{ color: 'var(--red)', margin: 0, fontSize: 12 }}>{report.error.message}</p>
-    return <EmptyNote>{report.loading ? 'Loading yield analysis…' : empty}</EmptyNote>
-  }
+  if (report.loading || report.error) return <EmptyNote>—</EmptyNote>
+  if (!report.data) return <EmptyNote>{empty}</EmptyNote>
 
   const rows = report.data.details.filter(row => row.category === category)
   if (!rows.length) return <EmptyNote>{empty}</EmptyNote>
@@ -132,7 +131,7 @@ function YieldRows({
               {row.commitCount.toLocaleString('en-US')} {row.commitCount === 1 ? 'commit' : 'commits'} · {row.sessionId}
             </span>
           </div>
-          <span className="val ok">{fmtUsd(row.costUSD)}</span>
+          <span className="val">{fmtUsd(row.costUSD)}</span>
         </div>
       ))}
     </>
@@ -147,10 +146,10 @@ function FixesRows({ data }: { data: MenubarPayload }) {
     <div className="li" style={{ alignItems: 'flex-start' }}>
       <span className="no">{String(count).padStart(2, '0')}</span>
       <div className="lx">
-        <b>{count.toLocaleString('en-US')} fixes ready</b>
-        <span>{fmtUsd(data.optimize.savingsUSD)} recoverable waste</span>
+        <b>
+          {count.toLocaleString('en-US')} findings · {fmtUsd(data.optimize.savingsUSD)} potential
+        </b>
       </div>
-      <span className="val ok">{fmtUsd(data.optimize.savingsUSD)}</span>
     </div>
   )
 }
