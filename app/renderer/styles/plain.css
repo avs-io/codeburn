@@ -266,6 +266,8 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .ov-fuel-name { font-size: 12px; font-weight: 560; }
 .ov-fuel-reset { font-size: 11px; color: var(--mut); font-family: var(--mono); margin-top: 1px; }
 .ov-fuel-empty { margin: auto; text-align: center; color: var(--mut); font-size: 12px; }
+.ov-insight-band { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.ov-insight-band > :only-child { grid-column: 1 / -1; }
 .ov-coach { display: flex; align-items: center; gap: 11px; padding: 9px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .ov-coach > svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--mut2); fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .ov-coach-tx { font-size: 12.5px; color: var(--mut); flex: 1; line-height: 1.45; }
@@ -303,7 +305,9 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .ov-models th:nth-child(2), .ov-models td:nth-child(2) { width: 100%; text-align: left; }
 .ov-models .ov-model-name { overflow: hidden; color: var(--ink); font-weight: 550; text-overflow: ellipsis; }
 .ov-models td.mono { font-family: var(--mono); color: var(--ink); }
-.ov-body-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); align-items: start; gap: 12px; }
+.ov-analytics-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
+.ov-analytics-row > :only-child { grid-column: 1 / -1; }
+.ov-body-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
 .ov-main-column, .ov-side-column { display: grid; min-width: 0; gap: 12px; }
 .ov-outcome-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line2); border-radius: 7px; }
 .ov-outcome-metrics > div { display: flex; min-width: 0; flex-direction: column; gap: 5px; padding: 9px 10px; border-right: 1px solid var(--line2); }
@@ -361,7 +365,12 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
   .ov-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .ov-kpi:nth-child(3) { border-right: 0; }
   .ov-kpi:nth-child(-n+3) { border-bottom: 1px solid var(--line2); }
-  .ov-body-grid, .ov-hero-row, .ov-hero-split, .ov-stats3 { grid-template-columns: 1fr; }
+  .ov-insight-band, .ov-analytics-row, .ov-body-grid, .ov-hero-row, .ov-hero-split, .ov-stats3 { grid-template-columns: 1fr; }
+  .ov-main-column, .ov-side-column { display: contents; }
+  .ov-models-widget { order: 1; }
+  .ov-activities-widget { order: 2; }
+  .ov-chart-widget { order: 3; }
+  .ov-sessions-widget { order: 4; }
   .ov-hero-split > * + *, .ov-stats3 > * + * { border-top: 1px solid var(--line2); border-left: 0; }
 }
 @media (max-width: 600px) {

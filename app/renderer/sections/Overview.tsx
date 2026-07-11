@@ -595,45 +595,37 @@ export function OverviewContent({
         <EfficiencyScorecard current={data.current} bare />
       </div>
 
-      <div className="ov-coach">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg>
-        <div className="ov-coach-tx">
-          {weeklyPct === null ? <>No prior-week pacing baseline yet</> : <>You're pacing <span className="num">{weeklyPct}% {weeklyDirection}</span> than last week</>}{topModel ? <>; <span className="num">{topModel.name}</span> is the biggest driver</> : ''}. <span className="num">{formatUsd(data.optimize.savingsUSD)}</span> is recoverable.
-        </div>
-        <button className="ov-coach-cta" type="button" onClick={() => onNavigate?.('optimize')}>Review →</button>
-      </div>
-
-      <AnomalyCallouts anomalies={anomalies} />
-
       <div className="ov-card ov-stats3">
         <div className="ov-stat"><div className="ov-label">Month to date</div><div className="v">{formatUsd(stats.mtd)}</div><div className="d">{stats.pacePct === null ? `No ${stats.prevMonthName} pace yet` : `${stats.pacePct >= 0 ? '+' : ''}${Math.round(stats.pacePct)}% vs ${stats.prevMonthName} pace`}</div></div>
         <div className="ov-stat"><div className="ov-label">Projected month</div><div className="v">{formatUsd(stats.projected)} <small>est</small></div><div className="d warn">{formatUsd(Math.max(0, stats.projected - stats.mtd))} to go</div></div>
         <FuelRing status={plans.data} onNavigate={onNavigate} bare />
       </div>
 
+      <div className="ov-insight-band">
+        <div className="ov-coach">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg>
+          <div className="ov-coach-tx">
+            {weeklyPct === null ? <>No prior-week pacing baseline yet</> : <>You're pacing <span className="num">{weeklyPct}% {weeklyDirection}</span> than last week</>}{topModel ? <>; <span className="num">{topModel.name}</span> is the biggest driver</> : ''}. <span className="num">{formatUsd(data.optimize.savingsUSD)}</span> is recoverable.
+          </div>
+          <button className="ov-coach-cta" type="button" onClick={() => onNavigate?.('optimize')}>Review →</button>
+        </div>
+
+        <AnomalyCallouts anomalies={anomalies} />
+      </div>
+
+      <div className="ov-analytics-row">
+        <CostPerOutcome outcome={yieldReport} />
+        <RoutingWhatIf routing={data.current.routingWaste} onNavigate={onNavigate} />
+      </div>
+
       <div className="ov-body-grid">
         <div className="ov-main-column">
-          <div className="ov-card ov-panel">
+          <div className="ov-card ov-panel ov-models-widget">
             <div className="ov-panel-head"><h3>Models this period</h3><span className="r">Sorted by cost</span></div>
             <div className="ov-panel-body ov-model-panel"><ModelsTable models={models} /></div>
           </div>
 
-          <div className="ov-card ov-panel">
-            <div className="ov-panel-head"><h3>Daily spend</h3><span className="r">{topModel ? `Biggest driver: ${topModel.name}` : 'No model driver yet'}</span></div>
-            <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
-          </div>
-        </div>
-
-        <div className="ov-side-column">
-          <CostPerOutcome outcome={yieldReport} />
-          <RoutingWhatIf routing={data.current.routingWaste} onNavigate={onNavigate} />
-
-          <div className="ov-card ov-panel">
-            <div className="ov-panel-head"><h3>Top activities</h3><span className="r">Sorted by cost</span></div>
-            <div className="ov-panel-body"><TopActivities activities={data.current.topActivities} /></div>
-          </div>
-
-          <div className="ov-card ov-panel">
+          <div className="ov-card ov-panel ov-sessions-widget">
             <div className="ov-panel-head"><h3>Most expensive sessions</h3><span className="r"><button className="ov-link" type="button">See all →</button></span></div>
             <div className="ov-panel-body">
               {data.current.topSessions.length ? data.current.topSessions.map((session, index) => {
@@ -642,6 +634,18 @@ export function OverviewContent({
                 return <ListRow key={`${session.project}-${session.date}-${index}`} no={String(index + 1).padStart(2, '0')} dotColor={seriesColorForModel(model)} title={session.project} sub={sub} value={formatUsd(session.cost)} />
               }) : <EmptyNote>No sessions in this range.</EmptyNote>}
             </div>
+          </div>
+        </div>
+
+        <div className="ov-side-column">
+          <div className="ov-card ov-panel ov-activities-widget">
+            <div className="ov-panel-head"><h3>Top activities</h3><span className="r">Sorted by cost</span></div>
+            <div className="ov-panel-body"><TopActivities activities={data.current.topActivities} /></div>
+          </div>
+
+          <div className="ov-card ov-panel ov-chart-widget">
+            <div className="ov-panel-head"><h3>Daily spend</h3><span className="r">{topModel ? `Biggest driver: ${topModel.name}` : 'No model driver yet'}</span></div>
+            <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
           </div>
         </div>
       </div>
