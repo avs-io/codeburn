@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { Hint } from './components/Hint'
 import { Panel } from './components/Panel'
 import { Sidebar, type Section } from './components/Sidebar'
@@ -138,6 +139,7 @@ export function App() {
     <Window>
       <Sidebar active={section} onNavigate={setSection} status={<StatusLine polled={overview} />} />
       <div className="ct">
+        <ErrorBoundary key={section}>
         {section === 'plans' ? (
           <Plans period={period} refreshToken={refreshToken} />
         ) : section === 'settings' ? (
@@ -175,6 +177,7 @@ export function App() {
             </div>
           </>
         )}
+        </ErrorBoundary>
         {section !== 'settings' && (
           <Hint
             items={[
