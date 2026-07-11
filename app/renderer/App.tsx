@@ -11,6 +11,8 @@ import { codeburn } from './lib/ipc'
 import { OverviewContent } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
 import { Models } from './sections/Models'
+import { Sessions } from './sections/Sessions'
+import { Compare } from './sections/Compare'
 import { Plans } from './sections/Plans'
 import { Settings } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
@@ -18,9 +20,11 @@ import type { DateRange, MenubarPayload, Period } from './lib/types'
 
 const SECTION_TITLES: Record<Section, string> = {
   overview: 'Overview',
+  sessions: 'Sessions',
   spend: 'Spend',
   optimize: 'Optimize',
   models: 'Models',
+  compare: 'Compare',
   plans: 'Plans',
   settings: 'Settings',
 }
@@ -100,10 +104,12 @@ export function App() {
       if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey) return
       const key = event.key.toLowerCase()
       if (key === '1') setSection('overview')
-      else if (key === '2') setSection('spend')
-      else if (key === '3') setSection('optimize')
-      else if (key === '4') setSection('models')
-      else if (key === '5') setSection('plans')
+      else if (key === '2') setSection('sessions')
+      else if (key === '3') setSection('spend')
+      else if (key === '4') setSection('optimize')
+      else if (key === '5') setSection('models')
+      else if (key === '6') setSection('compare')
+      else if (key === '7') setSection('plans')
       else if (key === ',') setSection('settings')
       else if (key === 'r') refreshVisible()
       else return
@@ -153,12 +159,16 @@ export function App() {
             <div className="body">
               {section === 'overview' ? (
                 <OverviewContent period={period} overview={overview} onNavigate={setSection} />
+              ) : section === 'sessions' ? (
+                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} />
               ) : section === 'spend' ? (
                 <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} />
               ) : section === 'optimize' ? (
                 <OptimizeContent period={period} range={customRange} overview={overview} refreshToken={refreshToken} />
               ) : section === 'models' ? (
                 <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} />
+              ) : section === 'compare' ? (
+                <Compare period={period} provider={provider} refreshToken={refreshToken} />
               ) : (
                 <SectionPlaceholder title={SECTION_TITLES[section]} />
               )}
@@ -168,7 +178,7 @@ export function App() {
         {section !== 'settings' && (
           <Hint
             items={[
-              { k: '⌘1-5', label: 'Navigate' },
+              { k: '⌘1-7', label: 'Navigate' },
               { k: '⌘,', label: 'Settings' },
               { k: '⌘R', label: 'Refresh' },
             ]}

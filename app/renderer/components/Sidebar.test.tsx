@@ -5,12 +5,13 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { Sidebar } from './Sidebar'
 
 describe('Sidebar', () => {
-  it('renders all six nav items', () => {
+  it('renders all eight nav items in the desktop order', () => {
     render(<Sidebar active="overview" onNavigate={() => {}} />)
-    expect(screen.getAllByRole('button')).toHaveLength(6)
-    for (const label of ['Overview', 'Spend', 'Optimize', 'Models', 'Plans', 'Settings']) {
-      expect(screen.getByRole('button', { name: new RegExp(label) })).toBeInTheDocument()
-    }
+    const labels = screen.getAllByRole('button').map(item => item.textContent?.replace(/⌘[\d,]/, ''))
+    expect(labels).toEqual(['Overview', 'Sessions', 'Spend', 'Optimize', 'Models', 'Compare', 'Plans', 'Settings'])
+    expect(screen.getByRole('button', { name: /Sessions.*⌘2/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Compare.*⌘6/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Plans.*⌘7/ })).toBeInTheDocument()
   })
 
   it('calls onNavigate with the section id when a nav item is clicked', () => {

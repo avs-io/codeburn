@@ -48,7 +48,7 @@ export function Settings({ period, refreshToken = 0 }: { period: Period; refresh
       </div>
       <Hint
         items={[
-          { k: '⌘1-5', label: 'Navigate' },
+          { k: '⌘1-7', label: 'Navigate' },
           { k: '⌘R', label: 'Refresh' },
         ]}
         right="pairing uses mutual TLS · approve-style, no PIN"

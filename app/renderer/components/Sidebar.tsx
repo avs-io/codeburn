@@ -2,22 +2,28 @@ import type { ReactNode } from 'react'
 
 import flameLogo from '../assets/flame.png'
 
-export type Section = 'overview' | 'spend' | 'optimize' | 'models' | 'plans' | 'settings'
+export type Section = 'overview' | 'sessions' | 'spend' | 'optimize' | 'models' | 'compare' | 'plans' | 'settings'
 
 export const NAV_ITEMS: Array<{ id: Section; label: string; key: string; icon: ReactNode }> = [
   { id: 'overview', label: 'Overview', key: '⌘1', icon: (
     <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1" /><rect x="14" y="3" width="7" height="5" rx="1" /><rect x="14" y="12" width="7" height="9" rx="1" /><rect x="3" y="16" width="7" height="5" rx="1" /></svg>
   ) },
-  { id: 'spend', label: 'Spend', key: '⌘2', icon: (
+  { id: 'sessions', label: 'Sessions', key: '⌘2', icon: (
+    <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="4" rx="1"/><rect x="4" y="10" width="16" height="4" rx="1"/><rect x="4" y="16" width="16" height="4" rx="1"/></svg>
+  ) },
+  { id: 'spend', label: 'Spend', key: '⌘3', icon: (
     <svg viewBox="0 0 24 24"><line x1="6" y1="20" x2="6" y2="13" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="18" y1="20" x2="18" y2="9" /></svg>
   ) },
-  { id: 'optimize', label: 'Optimize', key: '⌘3', icon: (
+  { id: 'optimize', label: 'Optimize', key: '⌘4', icon: (
     <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" /></svg>
   ) },
-  { id: 'models', label: 'Models', key: '⌘4', icon: (
+  { id: 'models', label: 'Models', key: '⌘5', icon: (
     <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /><path d="M3.3 7 12 12l8.7-5M12 22V12" /></svg>
   ) },
-  { id: 'plans', label: 'Plans', key: '⌘5', icon: (
+  { id: 'compare', label: 'Compare', key: '⌘6', icon: (
+    <svg viewBox="0 0 24 24"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="M16 21l4-4-4-4"/><path d="M20 17H4"/></svg>
+  ) },
+  { id: 'plans', label: 'Plans', key: '⌘7', icon: (
     <svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2" /><line x1="2" y1="10" x2="22" y2="10" /></svg>
   ) },
   { id: 'settings', label: 'Settings', key: '⌘,', icon: (

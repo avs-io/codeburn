@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<SpendFlow>>(),
   getModels: vi.fn(),
+  getSessions: vi.fn(),
+  getCompareModels: vi.fn(),
+  getCompare: vi.fn(),
   getPlans: vi.fn(),
   getActReport: vi.fn(),
   getYield: vi.fn(),
@@ -82,6 +85,8 @@ describe('App shortcuts', () => {
     mocks.getOverview.mockResolvedValue(overviewPayload())
     mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
     mocks.getModels.mockResolvedValue([])
+    mocks.getSessions.mockResolvedValue([])
+    mocks.getCompareModels.mockResolvedValue([])
     mocks.getPlans.mockResolvedValue({})
     mocks.getActReport.mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
     mocks.getYield.mockResolvedValue({
@@ -120,30 +125,35 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '2', metaKey: true })
-
-    expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
+    expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
   })
 
   it('keeps command navigation, settings, and refresh shortcuts active without stale hints', async () => {
     render(<App />)
 
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
-    expect(screen.getByText('⌘1-5')).toBeInTheDocument()
+    expect(screen.getByText('⌘1-7')).toBeInTheDocument()
     expect(screen.getAllByText('⌘,').length).toBeGreaterThan(0)
     expect(screen.getByText('⌘R')).toBeInTheDocument()
     expect(screen.queryByText('Command')).not.toBeInTheDocument()
     expect(screen.queryByText('Export view')).not.toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '2', metaKey: true })
-    expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
+    expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '3', metaKey: true })
-    expect(await screen.findByText('No waste findings in this range yet.')).toBeInTheDocument()
+    expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '4', metaKey: true })
-    expect(await screen.findByText('No model usage in this range yet.')).toBeInTheDocument()
+    expect(await screen.findByText('No waste findings in this range yet.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '5', metaKey: true })
+    expect(await screen.findByText('No model usage in this range yet.')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '6', metaKey: true })
+    expect(await screen.findByText('Need at least two models with usage in this range to compare.')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '7', metaKey: true })
     expect(await screen.findByText('No plans configured')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
@@ -158,7 +168,7 @@ describe('App shortcuts', () => {
   it('re-polls visible section data when period or provider changes', async () => {
     render(<App />)
 
-    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    fireEvent.keyDown(document, { key: '3', metaKey: true })
     expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('Today'))
@@ -180,7 +190,7 @@ describe('App shortcuts', () => {
   it('applies a calendar range to overview and visible section polls', async () => {
     render(<App />)
 
-    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    fireEvent.keyDown(document, { key: '3', metaKey: true })
     expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Choose date range' }))
 
