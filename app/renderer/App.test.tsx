@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
   getCompareModels: vi.fn(),
   getCompare: vi.fn(),
+  getQuota: vi.fn(),
   getPlans: vi.fn(),
   getActReport: vi.fn(),
   getYield: vi.fn(),
@@ -104,6 +105,10 @@ describe('App shortcuts', () => {
     mocks.getModels.mockResolvedValue([])
     mocks.getSessions.mockResolvedValue([])
     mocks.getCompareModels.mockResolvedValue([])
+    mocks.getQuota.mockResolvedValue([
+      { provider: 'claude', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] },
+      { provider: 'codex', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] },
+    ])
     mocks.getPlans.mockResolvedValue({})
     mocks.getActReport.mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
     mocks.getYield.mockResolvedValue({
@@ -180,7 +185,7 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('Need at least two models with usage in this range to compare.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '7', metaKey: true })
-    expect(await screen.findByText('No plans configured')).toBeInTheDocument()
+    expect(await screen.findByText('Connect Claude — log in with the Claude CLI')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
     expect((await screen.findAllByText('Settings')).length).toBeGreaterThan(0)

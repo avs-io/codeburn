@@ -408,6 +408,28 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .track i, .tglon { background: var(--accent); box-shadow: none; }
 .track i.over { background: var(--bad); }
 .track i.mut { background: var(--bar); }
+.track i.accent { background: var(--accent); }
+.track i.warn { background: var(--warn); }
+.track i.bad { background: var(--bad); }
+
+/* Plans: live subscription quota, followed by manual dollar budgets. */
+.quota-title { display: inline-flex; align-items: baseline; gap: 8px; }
+.quota-title small { color: var(--mut); font-size: 10.5px; font-weight: 520; }
+.quota-connection { display: inline-flex; align-items: center; gap: 5px; color: var(--mut); font-size: 10px; font-weight: 520; }
+.quota-connection i { width: 6px; height: 6px; border-radius: 50%; background: var(--mut2); }
+.quota-connection-connected i { background: var(--ok); }
+.quota-connection-stale i, .quota-connection-transientFailure i { background: var(--warn); }
+.quota-connection-terminalFailure i { background: var(--bad); }
+.quota-connection-note { margin: 0; color: var(--mut); font-size: 12px; }
+.quota-connection-note.quota-terminal { color: var(--bad); }
+.quota-windows { display: grid; gap: 15px; }
+.quota-window-labels { display: flex; align-items: baseline; gap: 12px; color: var(--ink); font-size: 12px; }
+.quota-window-labels span:last-child { margin-left: auto; color: var(--mut); font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
+.quota-window .track { margin-top: 7px; }
+.quota-footer { display: flex; flex-direction: column; gap: 3px; margin-top: 13px; padding-top: 10px; border-top: 1px solid var(--line2); color: var(--mut); font-size: 10.5px; }
+.plans-section-heading { margin: 2px 0 8px; color: var(--mut); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.budget-plans { display: grid; width: 100%; gap: 12px; }
+.budget-plans > .panel { width: 100%; }
 
 .ov-dashboard { display: grid; width: 100%; gap: 12px; }
 .ov-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--card-shadow); }

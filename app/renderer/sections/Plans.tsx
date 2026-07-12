@@ -4,11 +4,10 @@ import type { Section } from '../components/Sidebar'
 import { usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
-import type { JsonPlanSummary, Period, PlanId, PlanProvider, StatusJson } from '../lib/types'
+import type { JsonPlanSummary, Period, PlanId, PlanProvider, QuotaProvider, QuotaWindow, StatusJson } from '../lib/types'
 import type { SettingsPane } from './Settings'
 
 const PROVIDER_ORDER: PlanProvider[] = ['all', 'claude', 'codex', 'cursor', 'grok']
-const MS_PER_DAY = 24 * 60 * 60 * 1000
 
 const PLAN_NAMES: Record<PlanId, string> = {
   'claude-pro': 'Claude Pro',
@@ -23,12 +22,6 @@ const PLAN_NAMES: Record<PlanId, string> = {
 
 function fmtPct(n: number): string {
   return Number.isInteger(n) ? `${n}%` : `${n.toFixed(1)}%`
-}
-
-function parseIsoDay(iso: string): number | null {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return null
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
 }
 
 function cycleEndDate(plan: JsonPlanSummary): Date | null {
@@ -47,25 +40,6 @@ function formatShortDate(value: string | Date): string {
   }).format(date)
 }
 
-function cycleLabels(plan: JsonPlanSummary | undefined): { caption: string; pop: string } | null {
-  if (!plan) return null
-  const startDay = parseIsoDay(plan.periodStart)
-  const endDay = parseIsoDay(plan.periodEnd)
-  const start = formatShortDate(plan.periodStart)
-  const inclusiveEnd = cycleEndDate(plan)
-  const end = inclusiveEnd ? formatShortDate(inclusiveEnd) : 'unknown'
-  const pop = `Cycle: ${start} – ${end}`
-
-  if (startDay === null || endDay === null) return { caption: `Cycle ${start} – ${end}`, pop }
-
-  const totalDays = Math.max(1, Math.round((endDay - startDay) / MS_PER_DAY))
-  const day = Math.min(totalDays, Math.max(1, totalDays - plan.daysUntilReset))
-  return {
-    caption: `Cycle ${start} – ${end} · day ${day} of ${totalDays}`,
-    pop,
-  }
-}
-
 function planSummaries(status: StatusJson): JsonPlanSummary[] {
   const plans = status.plans
   if (plans) {
@@ -78,48 +52,149 @@ function planSummaries(status: StatusJson): JsonPlanSummary[] {
   return status.plan ? [status.plan] : []
 }
 
+function manualPlanSummaries(status: StatusJson): JsonPlanSummary[] {
+  return planSummaries(status).filter(plan => plan.provider !== 'claude' && plan.provider !== 'codex')
+}
+
 export function Plans({ period, refreshToken = 0, onNavigate }: { period: Period; refreshToken?: number; onNavigate?: (section: Section, pane?: SettingsPane) => void }) {
-  const report = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken])
-  const plans = report.data ? planSummaries(report.data) : []
-  const cycle = cycleLabels(plans[0])
+  const quota = usePolled<QuotaProvider[]>(() => codeburn.getQuota(), [refreshToken])
+  const budgetReport = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken])
+  const manualPlans = budgetReport.data ? manualPlanSummaries(budgetReport.data) : []
 
   return (
     <>
       <div className="bar">
         <div className="t">Plans</div>
-        {cycle ? <span className="scope">{cycle.caption}</span> : <span className="scope">Cycle unavailable</span>}
         <div className="sp" />
-        <span className="scope">{cycle ? cycle.pop : 'Cycle unavailable'}</span>
         <button type="button" className="btn btn-s" onClick={() => onNavigate?.('settings', 'plans')}>
           Add plan…
         </button>
       </div>
-      <div className="body">{renderBody(report.data, report.error, plans)}</div>
+      <div className="body">
+        {renderQuota(quota.data, quota.error)}
+        {renderBudgetPlans(budgetReport.data, budgetReport.error, manualPlans)}
+      </div>
     </>
   )
 }
 
-function renderBody(data: StatusJson | null, error: ReturnType<typeof usePolled<StatusJson>>['error'], plans: JsonPlanSummary[]) {
+function renderQuota(data: QuotaProvider[] | null, error: ReturnType<typeof usePolled<QuotaProvider[]>>['error']) {
   if (!data) {
-    if (error) return <CliErrorPanel error={error} subject="plan pacing" />
+    if (error) {
+      return (
+        <Panel title="Live quota">
+          <p className="quota-connection-note quota-terminal">Live quota is unavailable.</p>
+        </Panel>
+      )
+    }
     return (
-      <Panel title="Plans">
-        <p style={{ color: 'var(--t3)', margin: 0, fontSize: 12 }}>Scanning plan usage…</p>
+      <Panel title="Live quota">
+        <p className="quota-connection-note">Loading quota…</p>
       </Panel>
     )
   }
 
-  if (plans.length === 0) {
+  if (data.length === 0) {
     return (
-      <Panel title="No plans configured">
-        <p style={{ color: 'var(--t3)', margin: 0, fontSize: 12 }}>
-          Add a plan in the CLI settings to see budget pacing here.
-        </p>
+      <Panel title="Live quota">
+        <p className="quota-connection-note">No quota providers available.</p>
       </Panel>
     )
   }
 
-  return plans.map(plan => <PlanPanel key={`${plan.provider}-${plan.id}`} plan={plan} />)
+  return data.map(provider => <QuotaPanel key={provider.provider} quota={provider} />)
+}
+
+function renderBudgetPlans(data: StatusJson | null, error: ReturnType<typeof usePolled<StatusJson>>['error'], plans: JsonPlanSummary[]) {
+  if (!data && error) {
+    return (
+      <section className="budget-plans">
+        <h2 className="plans-section-heading">Budget plans</h2>
+        <CliErrorPanel error={error} subject="plan pacing" />
+      </section>
+    )
+  }
+  if (plans.length === 0) return null
+
+  return (
+    <section className="budget-plans">
+      <h2 className="plans-section-heading">Budget plans</h2>
+      {plans.map(plan => <PlanPanel key={`${plan.provider}-${plan.id}`} plan={plan} />)}
+    </section>
+  )
+}
+
+function QuotaPanel({ quota }: { quota: QuotaProvider }) {
+  const providerName = quota.provider === 'claude' ? 'Claude' : 'Codex'
+  return (
+    <Panel
+      className="quota-card"
+      title={<span className="quota-title">{providerName}{quota.planLabel ? <small>{quota.planLabel}</small> : null}</span>}
+      right={<ConnectionIndicator connection={quota.connection} />}
+    >
+      <QuotaContent quota={quota} providerName={providerName} />
+    </Panel>
+  )
+}
+
+function ConnectionIndicator({ connection }: { connection: QuotaProvider['connection'] }) {
+  const label = connection === 'transientFailure' ? 'waiting' : connection === 'terminalFailure' ? 'error' : connection
+  return <span className={`quota-connection quota-connection-${connection}`}><i />{label}</span>
+}
+
+function QuotaContent({ quota, providerName }: { quota: QuotaProvider; providerName: string }) {
+  if (quota.connection === 'disconnected') {
+    return <p className="quota-connection-note">Connect {providerName} — log in with the {providerName} CLI</p>
+  }
+  if (quota.connection === 'loading') return <p className="quota-connection-note">Loading quota…</p>
+  if (quota.connection === 'stale' || quota.connection === 'transientFailure') {
+    return <p className="quota-connection-note">waiting on the CLI…</p>
+  }
+  if (quota.connection === 'terminalFailure') {
+    return <p className="quota-connection-note quota-terminal">Quota is currently unavailable.</p>
+  }
+
+  return (
+    <>
+      <div className="quota-windows">
+        {quota.details.map((window, index) => <QuotaMeter key={`${window.label}-${index}`} window={window} />)}
+      </div>
+      {quota.footerLines.length > 0 ? (
+        <div className="quota-footer">{quota.footerLines.map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}</div>
+      ) : null}
+    </>
+  )
+}
+
+function QuotaMeter({ window }: { window: QuotaWindow }) {
+  const percent = Math.round(window.percent * 100)
+  const severity = window.percent >= 0.9 ? 'bad' : window.percent >= 0.7 ? 'warn' : 'accent'
+  const reset = formatResetTime(window.resetsAt)
+  return (
+    <div className="quota-window">
+      <div className="quota-window-labels">
+        <span>{window.label}</span>
+        <span>{percent}% used{reset ? ` · resets ${reset}` : ''}</span>
+      </div>
+      <div className="track" data-testid={`quota-track-${window.label}`}>
+        <i className={severity} style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+      </div>
+    </div>
+  )
+}
+
+function formatResetTime(resetsAt: string | null): string | null {
+  if (!resetsAt) return null
+  const reset = Date.parse(resetsAt)
+  if (!Number.isFinite(reset)) return null
+  const remainingMinutes = Math.floor((reset - Date.now()) / 60_000)
+  if (remainingMinutes <= 0) return 'now'
+  const days = Math.floor(remainingMinutes / (24 * 60))
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60)
+  const minutes = remainingMinutes % 60
+  if (days > 0) return `in ${days}d${hours > 0 ? ` ${hours}h` : ''}`
+  if (hours > 0) return `in ${hours}h${minutes > 0 ? ` ${minutes}m` : ''}`
+  return `in ${minutes}m`
 }
 
 function PlanPanel({ plan }: { plan: JsonPlanSummary }) {

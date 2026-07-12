@@ -2,15 +2,16 @@
 import { render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { JsonPlanSummary, StatusJson } from '../lib/types'
+import type { JsonPlanSummary, QuotaProvider, StatusJson } from '../lib/types'
 import { Plans } from './Plans'
 
-const { getPlans } = vi.hoisted(() => ({
+const { getPlans, getQuota } = vi.hoisted(() => ({
   getPlans: vi.fn<(period: string) => Promise<StatusJson>>(),
+  getQuota: vi.fn<() => Promise<QuotaProvider[]>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
-  return { ...actual, codeburn: { getPlans } }
+  return { ...actual, codeburn: { getPlans, getQuota } }
 })
 
 const periodStart = new Date(2026, 5, 15).toISOString()
@@ -70,34 +71,51 @@ const statusWithPlans: StatusJson = {
   },
 }
 
+function quotaProviders(): QuotaProvider[] {
+  const now = Date.now()
+  return [
+    {
+      provider: 'claude',
+      connection: 'connected',
+      primary: { label: 'Weekly', percent: 0.92, resetsAt: new Date(now + (3 * 24 + 14) * 60 * 60_000 + 30 * 60_000).toISOString() },
+      details: [
+        { label: '5-hour', percent: 0.25, resetsAt: new Date(now + 2 * 60 * 60_000 + 30 * 60_000).toISOString() },
+        { label: 'Weekly', percent: 0.92, resetsAt: new Date(now + (3 * 24 + 14) * 60 * 60_000 + 30 * 60_000).toISOString() },
+      ],
+      planLabel: 'Max 20x',
+      footerLines: [],
+    },
+    {
+      provider: 'codex',
+      connection: 'disconnected',
+      primary: null,
+      details: [],
+      planLabel: null,
+      footerLines: [],
+    },
+  ]
+}
+
 describe('Plans', () => {
   beforeEach(() => {
     getPlans.mockReset()
+    getQuota.mockReset()
+    getQuota.mockResolvedValue(quotaProviders())
   })
 
-  it('renders plan rows from StatusJson with clamped tracks, overage, pace, and cycle caption', async () => {
+  it('renders live quota windows, tier, severity, disconnected hint, and manual plans below', async () => {
     getPlans.mockResolvedValue(statusWithPlans)
 
     const { container } = render(<Plans period="30days" />)
 
-    expect(await screen.findByText('Claude Max')).toBeInTheDocument()
-    expect([...container.querySelectorAll('.plrow b')].map(row => row.textContent)).toEqual([
-      'Claude Max',
-      'API usage',
-      'Cursor Pro',
-    ])
-    expect(screen.getByText('Cycle Jun 15 – Jul 14 · day 26 of 30')).toBeInTheDocument()
-    expect(screen.getByText('Cycle: Jun 15 – Jul 14')).toBeInTheDocument()
-    expect(screen.getByText('$200.00 / month · claude')).toBeInTheDocument()
-    expect(screen.getByText('$230.00 · 115% · $30.00 over')).toBeInTheDocument()
+    expect(await screen.findByText('Max 20x')).toBeInTheDocument()
+    expect(screen.getByText('25% used · resets in 2h 29m')).toBeInTheDocument()
+    expect(screen.getByText('92% used · resets in 3d 14h')).toBeInTheDocument()
+    expect(container.querySelector('[data-testid="quota-track-5-hour"] i')).toHaveClass('accent')
+    expect(container.querySelector('[data-testid="quota-track-Weekly"] i')).toHaveClass('bad')
+    expect(screen.getByText('Connect Codex — log in with the Codex CLI')).toBeInTheDocument()
 
-    const claudeFill = container.querySelector('[data-testid="plan-track-claude"] i')
-    expect(claudeFill).toHaveStyle({ width: '100%' })
-    expect(claudeFill).toHaveClass('over')
-
-    const hotPace = screen.getByText('On pace to exceed; projected $254.00 by Jul 14')
-    expect(hotPace).toHaveClass('pace', 'hot')
-
+    expect(screen.getByRole('heading', { name: 'Budget plans' })).toBeInTheDocument()
     expect(screen.getByText('Cursor Pro')).toBeInTheDocument()
     expect(screen.getByText('$20.00 / month · cursor')).toBeInTheDocument()
     expect(screen.getByText('$8.20 · 41%')).toBeInTheDocument()
@@ -105,13 +123,26 @@ describe('Plans', () => {
     expect(cursorFill).toHaveStyle({ width: '41%' })
     expect(cursorFill).not.toHaveClass('over')
     expect(screen.getByText('On track')).toHaveClass('pace', 'ok')
+    expect(screen.queryByText('Claude Max')).not.toBeInTheDocument()
+    expect(screen.queryByText('API usage')).not.toBeInTheDocument()
+  })
 
-    expect(screen.getByText('API usage')).toBeInTheDocument()
-    expect(screen.getByText('codex · pay as you go, no plan')).toBeInTheDocument()
-    expect(screen.getByText('$31.02 this cycle')).toBeInTheDocument()
-    const codexFill = container.querySelector('[data-testid="plan-track-codex"] i')
-    expect(codexFill).toHaveStyle({ width: '15%' })
-    expect(codexFill).toHaveClass('mut')
+  it('keeps manual budget overage and clamped-track behavior', async () => {
+    getPlans.mockResolvedValue({
+      ...baseStatus,
+      plans: {
+        grok: { ...claudePlan, id: 'supergrok', provider: 'grok' },
+      },
+    })
+
+    const { container } = render(<Plans period="30days" />)
+
+    expect(await screen.findByText('SuperGrok')).toBeInTheDocument()
+    expect(screen.getByText('$230.00 · 115% · $30.00 over')).toBeInTheDocument()
+    const fill = container.querySelector('[data-testid="plan-track-grok"] i')
+    expect(fill).toHaveStyle({ width: '100%' })
+    expect(fill).toHaveClass('over')
+    expect(screen.getByText('On pace to exceed; projected $254.00 by Jul 14')).toHaveClass('pace', 'hot')
   })
 
   it('renders near status as an amber non-exceeding projection when below budget', async () => {
@@ -149,10 +180,9 @@ describe('Plans', () => {
     render(<Plans period="month" />)
 
     expect(await screen.findByText('Cursor Pro')).toBeInTheDocument()
-    expect(screen.getByText('Cycle Jun 15 – Jul 14 · day 26 of 30')).toBeInTheDocument()
   })
 
-  it('renders an honest empty state when StatusJson has no plan summaries', async () => {
+  it('omits the budget section when StatusJson has no manual plan summaries', async () => {
     getPlans.mockResolvedValue({
       currency: 'USD',
       today: { cost: 0, savings: 0, calls: 0 },
@@ -161,8 +191,8 @@ describe('Plans', () => {
 
     render(<Plans period="month" />)
 
-    expect(await screen.findByText('No plans configured')).toBeInTheDocument()
-    expect(screen.getByText('Add a plan in the CLI settings to see budget pacing here.')).toBeInTheDocument()
+    expect(await screen.findByText('Connect Codex — log in with the Codex CLI')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Budget plans' })).not.toBeInTheDocument()
   })
 
   it('renders the CLI locate state when getPlans reports not-found', async () => {
