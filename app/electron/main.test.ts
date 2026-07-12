@@ -31,6 +31,7 @@ function fakeSpawn(result: unknown = { current: { cost: 12.34 } }) {
 // must spawn. cliStatus is the one channel that resolves without spawning.
 const CHANNELS = [
   'codeburn:getOverview',
+  'codeburn:getQuota',
   'codeburn:getPlans',
   'codeburn:getActReport',
   'codeburn:getModels',
@@ -100,14 +101,15 @@ function flattenMenuItems(items: any[]): any[] {
 }
 
 describe('createBridgeHandlers (channel → argv for all channels)', () => {
+  const deps = (extra = {}) => ({ spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => null, getQuota: vi.fn(async () => []), ...extra })
   it('exposes exactly the bridge channels', () => {
-    const handlers = createBridgeHandlers({ spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => null })
+    const handlers = createBridgeHandlers(deps())
     expect(Object.keys(handlers).sort()).toEqual([...CHANNELS].sort())
   })
 
   it.each(ARGV_CASES)('$channel with $args spawns the expected argv', async ({ channel, args, argv }) => {
     const { spawnCli, spawnCliAction, calls } = fakeSpawn()
-    const handlers = createBridgeHandlers({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' })
+    const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
     const res = await handlers[channel]!(...args)
     expect(calls[0]).toEqual(argv)
     expect(res).toMatchObject({ ok: true })
@@ -115,7 +117,7 @@ describe('createBridgeHandlers (channel → argv for all channels)', () => {
 
   it('codeburn:cliStatus resolves from resolveCodeburnPath without spawning', async () => {
     const spawnCli = vi.fn()
-    const handlers = createBridgeHandlers({ spawnCli, spawnCliAction: vi.fn(), resolveCodeburnPath: () => '/opt/homebrew/bin/codeburn' })
+    const handlers = createBridgeHandlers(deps({ spawnCli, resolveCodeburnPath: () => '/opt/homebrew/bin/codeburn' }))
     const res = await handlers['codeburn:cliStatus']!()
     expect(spawnCli).not.toHaveBeenCalled()
     expect(res).toEqual({ ok: true, value: { found: true, path: '/opt/homebrew/bin/codeburn' } })
@@ -123,9 +125,21 @@ describe('createBridgeHandlers (channel → argv for all channels)', () => {
 })
 
 describe('createBridgeHandlers (IPC wiring)', () => {
+  const withQuota = <T extends object>(value: T) => ({ ...value, getQuota: vi.fn(async () => []) })
+  it('returns normalized quota through its own IPC channel and sanitizes unexpected failures', async () => {
+    const base = { spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => null }
+    const value = [{ provider: 'claude' as const, connection: 'connected' as const, primary: null, details: [], planLabel: 'Pro', footerLines: [] }]
+    const ok = createBridgeHandlers({ ...base, getQuota: vi.fn(async () => value) })
+    expect(await ok['codeburn:getQuota']!()).toEqual({ ok: true, value })
+
+    const failed = createBridgeHandlers({ ...base, getQuota: vi.fn(async () => { throw new Error('Bearer secret sk-ant-leak') }) })
+    const result = await failed['codeburn:getQuota']!()
+    expect(result).toMatchObject({ ok: false, error: { kind: 'nonzero' } })
+    expect(JSON.stringify(result)).not.toMatch(/secret|sk-ant-leak/)
+  })
   it('getOverview spawns menubar-json for the period, omitting --provider for "all"', async () => {
     const { spawnCli, spawnCliAction, calls } = fakeSpawn()
-    const handlers = createBridgeHandlers({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' })
+    const handlers = createBridgeHandlers(withQuota({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
     const res = await handlers['codeburn:getOverview']!('30days', 'all')
     expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days'])
     expect(res).toEqual({ ok: true, value: { current: { cost: 12.34 } } })
@@ -133,7 +147,7 @@ describe('createBridgeHandlers (IPC wiring)', () => {
 
   it('adds --provider and --by-task when requested', async () => {
     const { spawnCli, spawnCliAction, calls } = fakeSpawn([])
-    const handlers = createBridgeHandlers({ spawnCli, spawnCliAction, resolveCodeburnPath: () => null })
+    const handlers = createBridgeHandlers(withQuota({ spawnCli, spawnCliAction, resolveCodeburnPath: () => null }))
     await handlers['codeburn:getModels']!('week', 'claude', true)
     expect(calls[0]).toEqual(['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task'])
   })
@@ -142,17 +156,17 @@ describe('createBridgeHandlers (IPC wiring)', () => {
     const spawnCli = vi.fn(async () => {
       throw new CliError('nonzero', 'boom')
     })
-    const handlers = createBridgeHandlers({ spawnCli, spawnCliAction: vi.fn(), resolveCodeburnPath: () => '/bin/codeburn' })
+    const handlers = createBridgeHandlers(withQuota({ spawnCli, spawnCliAction: vi.fn(), resolveCodeburnPath: () => '/bin/codeburn' }))
     const res = await handlers['codeburn:getYield']!('today')
     expect(res).toEqual({ ok: false, error: { kind: 'nonzero', message: 'boom' } })
   })
 
   it('cliStatus reports the resolved binary path', async () => {
-    const handlers = createBridgeHandlers({
+    const handlers = createBridgeHandlers(withQuota({
       spawnCli: vi.fn(),
       spawnCliAction: vi.fn(),
       resolveCodeburnPath: () => '/opt/homebrew/bin/codeburn',
-    })
+    }))
     const res = await handlers['codeburn:cliStatus']!()
     expect(res).toEqual({ ok: true, value: { found: true, path: '/opt/homebrew/bin/codeburn' } })
   })

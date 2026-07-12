@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type Men
 import path from 'node:path'
 
 import { CliError, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult } from './cli'
+import { getQuota, sanitizeError } from './quota'
 
 // Result envelope: handlers never throw across IPC so the structured error
 // `kind` survives contextBridge serialization. preload.ts unwraps it.
@@ -26,6 +27,7 @@ type Deps = {
   spawnCli: (args: string[], opts?: { timeoutMs?: number }) => Promise<unknown>
   spawnCliAction: (args: string[], opts?: { timeoutMs?: number }) => Promise<ActionResult>
   resolveCodeburnPath: () => string | null
+  getQuota: typeof getQuota
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -35,7 +37,7 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * shell) and returns a result envelope. Pure + injectable so the wiring is
  * unit-testable without launching Electron.
  */
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath }): Record<string, Handler> {
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota }): Record<string, Handler> {
   const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
     try {
       return { ok: true, value: await deps.spawnCli(build(...args)) }
@@ -52,6 +54,10 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   }
 
   return {
+    'codeburn:getQuota': async () => {
+      try { return { ok: true, value: await deps.getQuota() } }
+      catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
+    },
     'codeburn:getOverview': run((period: string, provider: string, range?: DateRange) => [
       'status', '--format', 'menubar-json', '--period', period, ...providerArgs(provider), ...rangeArgs(range),
     ]),

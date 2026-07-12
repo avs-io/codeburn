@@ -19,6 +19,21 @@ export interface CliError {
 export type AliasRow = { from: string; to: string }
 export type ActionResult = { ok: boolean; stdout: string; stderr: string; code: number | null }
 
+export type QuotaWindow = {
+  label: string
+  percent: number
+  resetsAt: string | null
+}
+
+export type QuotaProvider = {
+  provider: 'claude' | 'codex'
+  connection: 'connected' | 'disconnected' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
+  primary: QuotaWindow | null
+  details: QuotaWindow[]
+  planLabel: string | null
+  footerLines: string[]
+}
+
 // ————— src/menubar-json.ts —————
 
 export type DailyModelBreakdown = {
@@ -468,6 +483,7 @@ export type CompareJsonReport = {
 // ————— IPC surface (preload contextBridge → window.codeburn) —————
 
 export interface CodeburnBridge {
+  getQuota(): Promise<QuotaProvider[]>
   getOverview(period: Period, provider: string, range?: DateRange): Promise<MenubarPayload>
   getPlans(period: Period): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>

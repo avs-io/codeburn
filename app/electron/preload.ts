@@ -18,6 +18,7 @@ async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
 // Shape matches CodeburnBridge (app/renderer/lib/types.ts); typing is enforced
 // renderer-side where `window.codeburn` is declared as CodeburnBridge.
 const bridge = {
+  getQuota: () => invoke('codeburn:getQuota'),
   getOverview: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getOverview', period, provider, range),
   getPlans: (period: string) => invoke('codeburn:getPlans', period),
   getActReport: () => invoke('codeburn:getActReport'),
