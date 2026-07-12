@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 
 import { CliErrorPanel } from '../components/CliErrorPanel'
 import { Panel } from '../components/Panel'
 import { SegTabs } from '../components/SegTabs'
 import { Stat } from '../components/Stat'
 import { usePolled } from '../hooks/usePolled'
-import { formatCompact, formatDayLong, formatDayShort, formatDuration, formatUsd } from '../lib/format'
+import { formatCompact, formatDayLong, formatDayShort, formatDuration, formatUsd, shortenProjectPath } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import type { DateRange, Period, SessionRow } from '../lib/types'
 
@@ -80,7 +80,6 @@ export function Sessions({
     [period, provider, range?.from, range?.to, refreshToken],
   )
   const rows = report.data ?? []
-  const selected = rows.find(row => row.sessionId === selectedId) ?? null
   const q = query.trim().toLowerCase()
   const filtered = rows.filter(row => q === '' || [
     row.project,
@@ -146,8 +145,6 @@ export function Sessions({
     )
   }
 
-  if (selected) return <SessionDetail session={selected} onBack={() => setSelectedId(null)} />
-
   if (!report.data.length) {
     return (
       <Panel title="Sessions">
@@ -197,27 +194,35 @@ export function Sessions({
           <div className="session-list">
             {renderedSequence.map(entry => entry.type === 'header' ? (
               <div className="provider-h" key={`provider-${entry.provider}`}>
-                {providerName(entry.provider)} · {entry.count.toLocaleString('en-US')} sessions · {formatUsd(entry.cost)}
+                <span>{providerName(entry.provider)}</span>
+                <span className="provider-count">{entry.count.toLocaleString('en-US')} sessions</span>
+                <span className="provider-cost">{formatUsd(entry.cost)}</span>
               </div>
             ) : (
-              <button
-                className="session-row"
-                key={entry.row.sessionId}
-                type="button"
-                onClick={() => setSelectedId(entry.row.sessionId)}
-              >
-                <span className="session-primary">
-                  <span className="session-title">{entry.row.project}</span>
-                  <span className="session-project">{entry.row.sessionId.slice(0, 18)}</span>
-                </span>
-                <span className="session-meta">
+              <Fragment key={entry.row.sessionId}>
+                <button
+                  className="session-row"
+                  type="button"
+                  aria-expanded={selectedId === entry.row.sessionId}
+                  onClick={() => setSelectedId(current => current === entry.row.sessionId ? null : entry.row.sessionId)}
+                >
+                  <span className="session-primary">
+                    <span className="session-chevron" aria-hidden="true">›</span>
+                    <span className="session-project-copy">
+                      <span className="session-title">{shortenProjectPath(entry.row.project)}</span>
+                      <span className="session-project">{entry.row.sessionId.slice(0, 18)}</span>
+                    </span>
+                  </span>
                   <span className="session-when">{formatDayShort(entry.row.endedAt)}</span>
-                  <span>{entry.row.models.join(', ')}</span>
-                  <span>{entry.row.turns} turns</span>
+                  <span className="session-models">{entry.row.models.join(', ')}</span>
+                  <span>{entry.row.turns}</span>
                   <span>{formatUsd(entry.row.cost)}</span>
-                  <span>{formatCompact(entry.row.inputTokens + entry.row.outputTokens)} tok</span>
-                </span>
-              </button>
+                  <span>{formatCompact(entry.row.inputTokens + entry.row.outputTokens)}</span>
+                </button>
+                {selectedId === entry.row.sessionId && (
+                  <SessionDetail session={entry.row} onCollapse={() => setSelectedId(null)} />
+                )}
+              </Fragment>
             ))}
           </div>
           <div className="sessions-more-caption">Showing {renderedRows} of {filtered.length}</div>
@@ -232,23 +237,22 @@ export function Sessions({
   )
 }
 
-function SessionDetail({ session, onBack }: { session: SessionRow; onBack: () => void }) {
+function SessionDetail({ session, onCollapse }: { session: SessionRow; onCollapse: () => void }) {
   const cacheTotal = session.inputTokens + session.cacheReadTokens
   const cacheHit = cacheTotal > 0 ? Math.round(session.cacheReadTokens / cacheTotal * 100) : 0
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onBack()
+      if (event.key === 'Escape') onCollapse()
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onBack])
+  }, [onCollapse])
 
   return (
-    <div className="session-detail">
-      <button className="back-link" type="button" onClick={onBack}>← Back to sessions</button>
-      <div className="panel detail-head">
-        <h3 className="detail-title">{session.project}</h3>
+    <div className="session-inline-detail" role="region" aria-label={`${shortenProjectPath(session.project)} session details`}>
+      <div className="detail-head">
+        <h3 className="detail-title">{shortenProjectPath(session.project)}</h3>
         <div className="detail-line">{session.provider} · {session.models.join(', ')}</div>
         <div className="detail-line">
           {formatDayLong(session.startedAt)} → {formatDayLong(session.endedAt)} · {formatDuration(session.durationMs)}

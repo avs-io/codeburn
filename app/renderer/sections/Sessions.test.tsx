@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -35,7 +35,7 @@ function session(overrides: Partial<SessionRow> & Pick<SessionRow, 'sessionId' |
 const rows: SessionRow[] = [
   session({
     sessionId: 'claude-session-123456789',
-    project: 'codeburn',
+    project: '-Users-torukmakto-Projects-codeburn',
     provider: 'claude',
     models: ['Opus 4.8'],
     cost: 8.41,
@@ -119,9 +119,11 @@ describe('Sessions', () => {
     const { container } = render(<Sessions period="30days" provider="all" />)
 
     expect(await screen.findByText('6 sessions · $21.93 · 4.2M tokens')).toBeInTheDocument()
-    expect(screen.getByText('Claude · 3 sessions · $10.01')).toBeInTheDocument()
-    expect(screen.getByText('Codex · 3 sessions · $11.92')).toBeInTheDocument()
+    expect(screen.getByText('Claude').closest('.provider-h')).toHaveTextContent('Claude3 sessions$10.01')
+    expect(screen.getByText('Codex').closest('.provider-h')).toHaveTextContent('Codex3 sessions$11.92')
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
+    expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
+    expect(screen.queryByText('-Users-torukmakto-Projects-codeburn')).not.toBeInTheDocument()
   })
 
   it('filters by project and offers to clear a search with no matches', async () => {
@@ -133,7 +135,7 @@ describe('Sessions', () => {
     await user.type(search, 'codeb')
     expect(screen.getByText('1 sessions · $8.41 · 1.5M tokens')).toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(1)
-    expect(screen.getByText('codeburn')).toBeInTheDocument()
+    expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
     expect(screen.queryByText('client-api')).not.toBeInTheDocument()
 
     await user.clear(search)
@@ -152,9 +154,9 @@ describe('Sessions', () => {
     const { container } = render(<Sessions period="30days" provider="all" />)
     await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
 
-    expect(container.querySelector('.session-row .session-title')).toHaveTextContent('zeta-search')
+    expect(container.querySelector('.session-row .session-title')).toHaveTextContent('zeta/search')
     await user.click(screen.getByRole('button', { name: 'Turns' }))
-    expect(container.querySelector('.session-row .session-title')).toHaveTextContent('alpha-worker')
+    expect(container.querySelector('.session-row .session-title')).toHaveTextContent('alpha/worker')
   })
 
   it('turns provider grouping off and back on', async () => {
@@ -192,27 +194,33 @@ describe('Sessions', () => {
     expect(getSessions).toHaveBeenCalledTimes(1)
   })
 
-  it('opens the live eight-stat detail and returns to the list with Escape', async () => {
+  it('expands the live eight-stat detail inline and collapses the row in place', async () => {
     const user = userEvent.setup()
     getSessions.mockResolvedValue(rows)
     const { container } = render(<Sessions period="30days" provider="all" />)
     await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
 
-    await user.click(screen.getByRole('button', { name: /codeburn/ }))
+    const row = screen.getByRole('button', { name: /projects\/codeburn/ })
+    await user.click(row)
 
-    expect(screen.getByRole('button', { name: '← Back to sessions' })).toBeInTheDocument()
+    expect(row).toHaveAttribute('aria-expanded', 'true')
+    const detail = screen.getByRole('region', { name: 'projects/codeburn session details' })
+    expect(detail).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '← Back to sessions' })).not.toBeInTheDocument()
     expect(screen.getByText('claude · Opus 4.8')).toBeInTheDocument()
     expect(screen.getByText(/Jul 11, 2026 → Jul 11, 2026 · 1h 35m/)).toBeInTheDocument()
     expect(container.querySelectorAll('.stat')).toHaveLength(8)
+    expect(container.querySelectorAll('.session-row')).toHaveLength(6)
     for (const label of ['Cost', 'Calls', 'Turns', 'Saved', 'Input', 'Output', 'Cache read', 'Cache write']) {
-      expect(screen.getByText(label)).toBeInTheDocument()
+      expect(within(detail).getByText(label)).toBeInTheDocument()
     }
     expect(screen.getByText('44')).toBeInTheDocument()
     expect(screen.getByText('44% hit')).toBeInTheDocument()
     expect(screen.queryByText('Context window')).not.toBeInTheDocument()
 
-    fireEvent.keyDown(window, { key: 'Escape' })
-    expect(await screen.findByText('6 sessions · $21.93 · 4.2M tokens')).toBeInTheDocument()
+    await user.click(row)
+    expect(row).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('region', { name: 'projects/codeburn session details' })).not.toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
   })
 

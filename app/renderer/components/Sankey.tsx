@@ -1,4 +1,4 @@
-import { formatUsd } from '../lib/format'
+import { formatUsd, shortenProjectPath } from '../lib/format'
 import { isOtherNode, seriesColorForModel } from '../lib/modelSeries'
 import type { SpendFlow, SpendFlowNode } from '../lib/types'
 
@@ -152,21 +152,7 @@ function modelDisplayLabel(raw: string): string {
 function projectDisplayLabel(raw: string): string {
   const value = raw.trim()
   if (isOtherNode(value)) return 'Other'
-  const pathDelimited = /[\\/]/.test(value)
-  const parts = value.split(pathDelimited ? /[\\/]+/ : /-+/).filter(Boolean)
-  let displayParts = parts.slice(-3)
-
-  // A three-segment tail rooted directly under a home directory starts with
-  // the user name, which adds noise rather than useful project context.
-  if (displayParts.length === 3 && /^(users?|home)$/i.test(parts.at(-4) ?? '')) {
-    displayParts = displayParts.slice(1)
-  }
-
-  if (/^(projects|src|config)$/i.test(displayParts[0] ?? '')) {
-    displayParts[0] = displayParts[0].toLowerCase()
-  }
-
-  return ellipsize(displayParts.join('/') || value, 24)
+  return ellipsize(shortenProjectPath(value), 24)
 }
 
 function shortenId(value: string): string {

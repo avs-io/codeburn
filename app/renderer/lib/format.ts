@@ -2,6 +2,27 @@ export function formatUsd(n: number): string {
   return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
+/** Shorten filesystem and CLI-mangled project paths to their useful trailing segments. */
+export function shortenProjectPath(value: string, maxSegments = 3): string {
+  const trimmed = value.trim()
+  const pathDelimited = /[\\/]/.test(trimmed)
+  const parts = trimmed.split(pathDelimited ? /[\\/]+/ : /-+/).filter(Boolean)
+  let displayParts = parts.slice(-Math.max(1, maxSegments))
+
+  // A tail rooted directly under a home directory starts with the user name,
+  // which adds noise rather than useful project context.
+  const precedingPart = parts.at(-(displayParts.length + 1))
+  if (displayParts.length > 1 && /^(users?|home)$/i.test(precedingPart ?? '')) {
+    displayParts = displayParts.slice(1)
+  }
+
+  if (/^(projects|src|config)$/i.test(displayParts[0] ?? '')) {
+    displayParts[0] = displayParts[0].toLowerCase()
+  }
+
+  return displayParts.join('/') || trimmed
+}
+
 /** Compact token/count formatting: 1_842 → "1.8K", 184_000 → "184K", 1_200_000 → "1.2M". */
 export function formatCompact(n: number): string {
   if (!Number.isFinite(n)) return '—'
