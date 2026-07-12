@@ -179,7 +179,7 @@ export function App() {
               ) : section === 'spend' ? (
                 <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} />
               ) : section === 'optimize' ? (
-                <OptimizeContent period={period} range={customRange} overview={overview} refreshToken={refreshToken} />
+                <OptimizeContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} />
               ) : section === 'models' ? (
                 <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} />
               ) : section === 'compare' ? (

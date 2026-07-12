@@ -75,6 +75,9 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
       'spend', '--format', 'flow-json', '--period', period, ...providerArgs(provider), ...rangeArgs(range),
     ]),
+    'codeburn:getOptimizeReport': run((period: string, provider: string, range?: DateRange) => [
+      'optimize', '--format', 'json', '--period', period, ...providerArgs(provider), ...rangeArgs(range),
+    ]),
     'codeburn:getDevices': run((period: string) => ['devices', '--format', 'json', '--period', period]),
     'codeburn:getDevicesScan': run(() => ['devices', 'scan', '--format', 'json']),
     'codeburn:getShareStatus': run(() => ['share', 'status', '--format', 'json']),

@@ -504,9 +504,15 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .ov-models th:first-child, .ov-models td:first-child { width: 100%; text-align: left; }
 .ov-models .ov-model-name { overflow: hidden; color: var(--ink); font-weight: 550; text-overflow: ellipsis; }
 .ov-models td.mono { font-family: var(--mono); color: var(--ink); }
-.opt-findings { display: grid; }
-.opt-finding { display: grid; grid-template-columns: 28px minmax(0, 1fr) 104px 86px; align-items: center; column-gap: 12px; min-height: 43px; border-top: 1px solid var(--line2); }
+.opt-waste { min-width: 0; }
+.opt-summary { padding: 0 0 10px; color: var(--mut); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.opt-findings { display: grid; min-width: 0; }
+.opt-finding { display: grid; align-items: center; column-gap: 12px; min-height: 43px; border-top: 1px solid var(--line2); }
 .opt-finding:first-child { border-top: 0; }
+.opt-finding-legacy { grid-template-columns: 28px minmax(0, 1fr) 104px 86px; }
+.opt-finding-toggle { width: 100%; grid-template-columns: 104px minmax(0, 1fr) 86px 92px 18px; padding: 0; border-right: 0; border-bottom: 0; border-left: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.opt-finding-toggle:hover, .opt-finding-toggle:focus-visible { background: var(--hover); outline: none; }
+.opt-finding-toggle:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
 .opt-finding-rank { color: var(--mut2); font-family: var(--mono); font-size: 10px; font-variant-numeric: tabular-nums; }
 .opt-finding-title { overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 570; text-overflow: ellipsis; white-space: nowrap; }
 .opt-impact { --impact: var(--mut2); display: inline-flex; width: fit-content; align-items: center; gap: 4px; border-radius: 999px; padding: 3px 7px; background: color-mix(in srgb, var(--impact) 12%, transparent); color: var(--impact); font-size: 10px; font-weight: 650; line-height: 1; }
@@ -514,6 +520,19 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .opt-impact-medium { --impact: var(--warn); }
 .opt-impact-low { --impact: var(--mut2); }
 .opt-finding-savings { color: var(--ok); font-family: var(--mono); font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.opt-finding-tokens { color: var(--mut); font-family: var(--mono); font-size: 10.5px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.opt-finding-chevron { color: var(--mut2); font-family: system-ui, sans-serif; font-size: 17px; line-height: 1; transition: transform 140ms ease; }
+.opt-finding-toggle[aria-expanded="true"] .opt-finding-chevron { transform: rotate(90deg); }
+.opt-finding-detail { min-width: 0; padding: 12px; border-top: 1px solid var(--line2); background: color-mix(in srgb, var(--panel) 84%, var(--hover)); }
+.opt-explanation { margin: 0 0 12px; color: var(--mut); font-size: 12px; line-height: 1.55; }
+.opt-fix { min-width: 0; }
+.opt-fix-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.opt-fix-head b { display: block; color: var(--ink); font-size: 10.5px; font-weight: 620; }
+.opt-fix-path { display: block; margin-top: 3px; color: var(--mut2); font-family: var(--mono); font-size: 10px; }
+.opt-fix-code { max-width: 100%; overflow-x: auto; margin: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--phead); color: var(--ink); font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre; }
+.opt-fix-command .opt-fix-code code::before { content: '$ '; color: var(--mut2); user-select: none; }
+.opt-copy { flex: 0 0 auto; padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--mut); font: inherit; font-size: 10.5px; cursor: pointer; }
+.opt-copy:hover, .opt-copy:focus-visible { border-color: var(--accent); color: var(--ink); outline: none; }
 .ov-analytics-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
 .ov-analytics-row > :only-child { grid-column: 1 / -1; }
 .ov-body-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }

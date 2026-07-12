@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from './App'
-import type { DateRange, MenubarPayload, SpendFlow } from './lib/types'
+import type { DateRange, MenubarPayload, OptimizeJsonReport, SpendFlow } from './lib/types'
 
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
@@ -15,6 +15,7 @@ vi.stubGlobal('localStorage', {
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<SpendFlow>>(),
+  getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
   getSessions: vi.fn(),
   getCompareModels: vi.fn(),
@@ -91,6 +92,15 @@ describe('App shortcuts', () => {
     for (const mock of Object.values(mocks)) mock.mockReset()
     mocks.getOverview.mockResolvedValue(overviewPayload())
     mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
+    mocks.getOptimizeReport.mockResolvedValue({
+      period: { label: 'Last 30 days', start: null, end: null },
+      summary: {
+        healthScore: 100, healthGrade: 'A', findingCount: 0, periodCostUSD: 0,
+        sessions: 0, calls: 0, potentialSavingsTokens: 0, potentialSavingsCostUSD: 0,
+        potentialSavingsPercent: 0, costRateUSD: 0,
+      },
+      findings: [],
+    })
     mocks.getModels.mockResolvedValue([])
     mocks.getSessions.mockResolvedValue([])
     mocks.getCompareModels.mockResolvedValue([])

@@ -27,6 +27,7 @@ const bridge = {
   getCompare: (period: string, provider: string, modelA: string, modelB: string) => invoke('codeburn:getCompare', period, provider, modelA, modelB),
   getYield: (period: string, range?: DateRange) => invoke('codeburn:getYield', period, range),
   getSpendFlow: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getSpendFlow', period, provider, range),
+  getOptimizeReport: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getOptimizeReport', period, provider, range),
   getDevices: (period: string) => invoke('codeburn:getDevices', period),
   getDevicesScan: () => invoke('codeburn:getDevicesScan'),
   getShareStatus: () => invoke('codeburn:getShareStatus'),

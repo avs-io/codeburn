@@ -325,6 +325,39 @@ export type SpendFlow = {
   links: SpendFlowLink[]
 }
 
+// ————— src/optimize.ts —————
+
+export type WasteAction =
+  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' }
+  | { type: 'command'; label: string; text: string }
+  | { type: 'file-content'; label: string; path: string; content: string }
+
+export type OptimizeJsonReport = {
+  period: { label: string; start: string | null; end: string | null }
+  summary: {
+    healthScore: number
+    healthGrade: 'A' | 'B' | 'C' | 'D' | 'F'
+    findingCount: number
+    periodCostUSD: number
+    sessions: number
+    calls: number
+    potentialSavingsTokens: number
+    potentialSavingsCostUSD: number
+    potentialSavingsPercent: number | null
+    costRateUSD: number
+  }
+  findings: Array<{
+    id: string
+    title: string
+    explanation: string
+    severity: 'high' | 'medium' | 'low'
+    trend: 'active' | 'improving' | null
+    tokensSaved: number
+    estimatedSavingsUSD: number
+    fix: WasteAction
+  }>
+}
+
 // ————— T1b: src/sharing/* (defined by the shared contract) —————
 
 export type PendingPairing = { id: string; name: string; code: string }
@@ -445,6 +478,7 @@ export interface CodeburnBridge {
   getCompare(period: Period, provider: string, modelA: string, modelB: string): Promise<CompareJsonReport>
   getYield(period: Period, range?: DateRange): Promise<YieldJsonReport>
   getSpendFlow(period: Period, provider: string, range?: DateRange): Promise<SpendFlow>
+  getOptimizeReport(period: Period, provider: string, range?: DateRange): Promise<OptimizeJsonReport>
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>
