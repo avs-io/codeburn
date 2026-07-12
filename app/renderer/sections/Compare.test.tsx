@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { CompareJsonReport, ModelStats } from '../lib/types'
@@ -49,6 +50,7 @@ describe('Compare', () => {
   })
 
   it('defaults to the top two and renders formatted report panels and winners', async () => {
+    const user = userEvent.setup()
     mocks.getCompareModels.mockResolvedValue([modelA, modelB])
     mocks.getCompare.mockResolvedValue(report)
     render(<Compare period="30days" provider="all" />)
@@ -56,8 +58,8 @@ describe('Compare', () => {
     const first = await screen.findByLabelText('First model')
     const second = screen.getByLabelText('Second model')
     await waitFor(() => {
-      expect(first).toHaveValue('Opus 4.8')
-      expect(second).toHaveValue('Sonnet 5')
+      expect(first).toHaveTextContent('Opus 4.8 · 4,812 calls')
+      expect(second).toHaveTextContent('Sonnet 5 · 3,318 calls')
     })
 
     expect(await screen.findByText('Performance')).toBeInTheDocument()
@@ -73,6 +75,11 @@ describe('Compare', () => {
     const context = screen.getByText('Context').closest<HTMLElement>('.cmp-card')!
     expect(within(context).getByText('Cache hit rate')).toBeInTheDocument()
     expect(within(context).getByText('Days of data')).toBeInTheDocument()
+
+    await user.click(second)
+    await user.click(screen.getByRole('option', { name: 'Opus 4.8 · 4,812 calls' }))
+    await waitFor(() => expect(first).toHaveTextContent('Sonnet 5 · 3,318 calls'))
+    expect(mocks.getCompare).toHaveBeenCalledWith('30days', 'all', 'Sonnet 5', 'Opus 4.8')
   })
 
   it('renders the need-two-models note without requesting a report', async () => {

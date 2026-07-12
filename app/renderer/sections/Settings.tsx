@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 import { Hint } from '../components/Hint'
 import { CliErrorText, cliErrorDisplay } from '../components/CliErrorPanel'
+import { Dropdown } from '../components/Dropdown'
 import { Panel } from '../components/Panel'
 import { ProviderLogo } from '../components/ProviderLogo'
 import type { Section } from '../components/Sidebar'
@@ -23,6 +24,11 @@ const PLAN_PRESETS: PlanPreset[] = [
   { id: 'cursor-pro', label: 'Cursor Pro', provider: 'cursor' },
   { id: 'supergrok', label: 'SuperGrok', provider: 'grok' },
   { id: 'supergrok-heavy', label: 'SuperGrok Heavy', provider: 'grok' },
+]
+
+const CURRENCIES = [
+  'USD', 'EUR', 'GBP', 'JPY', 'CNY', 'CAD', 'AUD', 'CHF', 'HKD', 'SGD', 'INR', 'NZD', 'SEK', 'NOK', 'DKK',
+  'KRW', 'BRL', 'MXN', 'ZAR', 'AED', 'SAR', 'TRY', 'PLN', 'THB', 'IDR', 'MYR', 'PHP', 'RUB', 'ILS', 'CZK',
 ]
 
 function readSetting(key: string): string | null {
@@ -109,7 +115,7 @@ function GeneralPane({ period, refreshToken }: { period: Period; refreshToken: n
     setMessage({ text: result.ok ? 'Updated' : result.stderr || 'Unable to update currency', error: !result.ok })
     if (result.ok) setCurrencyNonce(value => value + 1)
   }
-  const currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'INR']
+  const currencies = [...CURRENCIES]
   if (plans.data?.currency && !currencies.includes(plans.data.currency)) currencies.push(plans.data.currency)
 
   return (
@@ -125,12 +131,10 @@ function GeneralPane({ period, refreshToken }: { period: Period; refreshToken: n
         <div className="about-sec set-last-sec">
           <div className="about-sec-h">Display</div>
           <div className="about-row"><label className="tx" htmlFor="settings-currency">Currency</label><span className="r">
-            {plans.data ? <select id="settings-currency" className="set-input" value={plans.data.currency} onChange={event => void codeburn.setCurrency(event.target.value).then(finishCurrency)}>{currencies.map(code => <option key={code}>{code}</option>)}</select> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
+            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => void codeburn.setCurrency(value).then(finishCurrency)} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
             <button className="set-text-button" onClick={() => void codeburn.resetCurrency().then(finishCurrency)}>Reset to USD</button>
           </span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><select id="settings-period" className="set-input" value={defaultPeriod} onChange={event => { setDefaultPeriod(event.target.value); writeSetting('codeburn.defaultPeriod', event.target.value) }}>
-            <option value="today">Today</option><option value="week">7d</option><option value="30days">30d</option><option value="month">Month</option><option value="all">All</option>
-          </select></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
           {message && <p className={message.error ? 'set-action-msg error' : 'set-action-msg'}>{message.text}</p>}
         </div>
       </div>
@@ -202,7 +206,7 @@ function PlansPane({ period, refreshToken, onNavigate }: { period: Period; refre
         {plans.error ? <SettingsErrorText error={plans.error} /> : !plans.data ? <p className="set-cap">Loading plans…</p> : configured.length === 0 ? <p className="set-cap">No plans configured.</p> : configured.map(plan => <div className="about-row" key={plan.provider}><span className="tx">{PLAN_PRESETS.find(item => item.id === plan.id)?.label ?? plan.id}<small>${plan.budget}/month · {plan.provider} · {plan.percentUsed}% used</small></span><span className="r"><button className="btnp" onClick={() => remove(plan)}>Remove</button></span></div>)}
       </div>
       <div className="about-sec set-last-sec">
-        <div className="about-row"><label className="tx" htmlFor="settings-plan-preset">Add a plan</label><span className="r"><select id="settings-plan-preset" className="set-input" value={presetId} onChange={event => setPresetId(event.target.value as PlanPreset['id'])}>{PLAN_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select><button className="btnp btnp-primary" onClick={add}>Add</button></span></div>
+        <div className="about-row"><label className="tx" htmlFor="settings-plan-preset">Add a plan</label><span className="r"><Dropdown id="settings-plan-preset" ariaLabel="Add a plan" value={presetId} options={PLAN_PRESETS.map(preset => ({ value: preset.id, label: preset.label }))} onChange={value => setPresetId(value as PlanPreset['id'])} width={160} /><button className="btnp btnp-primary" onClick={add}>Add</button></span></div>
         {message && <p className={message.error ? 'set-action-msg error' : 'set-action-msg'}>{message.text}</p>}
       </div>
     </div>
@@ -240,7 +244,7 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
     <div className="card">
       <div className="about-sec">
         <div className="about-row"><span className="tx">Format</span><span className="r"><span className="seg"><button className={format === 'csv' ? 'on' : undefined} onClick={() => setFormat('csv')}>CSV</button><button className={format === 'json' ? 'on' : undefined} onClick={() => setFormat('json')}>JSON</button></span></span></div>
-        <div className="about-row"><label className="tx" htmlFor="settings-export-provider">Provider</label><span className="r"><select id="settings-export-provider" className="set-input" value={provider} onChange={event => setProvider(event.target.value)}><option value="all">All providers</option>{providers.map(value => <option value={value} key={value}>{value.charAt(0).toUpperCase() + value.slice(1)}</option>)}</select></span></div>
+        <div className="about-row"><label className="tx" htmlFor="settings-export-provider">Provider</label><span className="r"><Dropdown id="settings-export-provider" ariaLabel="Provider" value={provider} options={[{ value: 'all', label: 'All providers' }, ...providers.map(value => ({ value, label: value.charAt(0).toUpperCase() + value.slice(1) }))]} onChange={setProvider} width={150} /></span></div>
         <div className="about-row"><span className="tx">Destination</span><span className="r set-export-destination"><span className="set-mono">{destination ?? 'Choose a folder…'}</span><button className="btnp" onClick={() => void chooseDirectory()}>Choose folder…</button></span></div>
       </div>
       <div className="about-sec set-last-sec"><div className="about-row"><span className="tx" /><span className="r"><button className="btnp btnp-primary" disabled={!destination || exporting} onClick={() => void exportNow()}>{exporting ? 'Exporting…' : 'Export'}</button></span></div>{message && <p className={message.error ? 'set-action-msg error' : 'set-action-msg'}>{message.text}</p>}</div>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
 import { CliErrorPanel } from '../components/CliErrorPanel'
+import { Dropdown } from '../components/Dropdown'
 import { Panel } from '../components/Panel'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
@@ -71,31 +72,29 @@ export function Compare({
   return (
     <>
       <div className="cmp-picker" aria-label="Models being compared">
-        <select
-          className="cmp-select"
-          aria-label="First model"
+        <Dropdown
+          id="compare-first-model"
+          ariaLabel="First model"
           value={modelA ?? ''}
-          onChange={event => {
-            const next = event.target.value
+          options={modelRows.map(model => ({ value: model.model, label: `${model.model} · ${model.calls.toLocaleString()} calls` }))}
+          onChange={next => {
             setModelA(next)
             if (next === modelB) setModelB(nudgeDistinct(next))
           }}
-        >
-          {modelRows.map(model => <option key={model.model} value={model.model}>{model.model} · {model.calls.toLocaleString()} calls</option>)}
-        </select>
+          width={230}
+        />
         <span className="cmp-vs">vs</span>
-        <select
-          className="cmp-select"
-          aria-label="Second model"
+        <Dropdown
+          id="compare-second-model"
+          ariaLabel="Second model"
           value={modelB ?? ''}
-          onChange={event => {
-            const next = event.target.value
+          options={modelRows.map(model => ({ value: model.model, label: `${model.model} · ${model.calls.toLocaleString()} calls` }))}
+          onChange={next => {
             setModelB(next)
             if (next === modelA) setModelA(nudgeDistinct(next))
           }}
-        >
-          {modelRows.map(model => <option key={model.model} value={model.model}>{model.model} · {model.calls.toLocaleString()} calls</option>)}
-        </select>
+          width={230}
+        />
       </div>
       {modelA && modelB && modelA !== modelB && (
         <CompareReport
