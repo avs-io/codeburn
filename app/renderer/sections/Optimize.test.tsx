@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MenubarPayload, YieldJsonReport } from '../lib/types'
@@ -95,7 +95,7 @@ describe('Optimize', () => {
     getYield.mockReset()
   })
 
-  it('renders waste findings with savings and segment totals from overview and yield payloads', async () => {
+  it('renders findings, reverted sessions, and abandoned sessions together with section totals', async () => {
     getOverview.mockResolvedValue(makePayload())
     getYield.mockResolvedValue(makeYield())
 
@@ -107,44 +107,17 @@ describe('Optimize', () => {
     expect(screen.getByText('Low')).toHaveClass('opt-impact-low')
     expect(screen.getByText('$9.10')).toBeInTheDocument()
     expect(screen.getByText('Cache hit is low in agentseal-dash')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Waste $94.40' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Reverts $107.00' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Abandoned $65.40' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Fixes 3' })).toBeInTheDocument()
-  })
-
-  it('switches to Reverts and shows only reverted yield details', async () => {
-    getOverview.mockResolvedValue(makePayload())
-    getYield.mockResolvedValue(makeYield())
-
-    render(<Optimize period="30days" provider="all" />)
-    expect(await screen.findByText('Opus is doing your small talk')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Reverts $107.00' }))
-
+    expect(screen.getByText('Optimization findings · 3 findings · $94.40 potential')).toBeInTheDocument()
+    expect(screen.getByText('Reverted sessions · $107.00')).toBeInTheDocument()
+    expect(screen.getByText('Abandoned sessions · $65.40')).toBeInTheDocument()
     expect(screen.getByText('codeburn')).toBeInTheDocument()
     expect(screen.getByText('2 commits · rev-1')).toBeInTheDocument()
     expect(screen.getByText('$55.00')).toBeInTheDocument()
     expect(screen.getByText('agentseal-dash')).toBeInTheDocument()
-    expect(screen.queryByText('sandbox-spike')).not.toBeInTheDocument()
-    expect(screen.queryByText('desktop-app')).not.toBeInTheDocument()
-  })
-
-  it('switches to Abandoned and shows only abandoned yield details', async () => {
-    getOverview.mockResolvedValue(makePayload())
-    getYield.mockResolvedValue(makeYield())
-
-    render(<Optimize period="30days" provider="all" />)
-    expect(await screen.findByText('Opus is doing your small talk')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Abandoned $65.40' }))
-
     expect(screen.getByText('sandbox-spike')).toBeInTheDocument()
     expect(screen.getByText('0 commits · abn-1')).toBeInTheDocument()
     expect(screen.getByText('$65.40')).toHaveClass('val')
     expect(screen.getByText('$65.40')).not.toHaveClass('ok')
-    expect(screen.queryByText('codeburn')).not.toBeInTheDocument()
-    expect(screen.queryByText('agentseal-dash')).not.toBeInTheDocument()
     expect(screen.queryByText('desktop-app')).not.toBeInTheDocument()
   })
 
@@ -154,56 +127,35 @@ describe('Optimize', () => {
 
     render(<Optimize period="30days" provider="all" />)
 
-    expect(await screen.findByRole('button', { name: 'Reverts —' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Abandoned —' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Reverts $0.00' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Abandoned $0.00' })).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Reverts —' }))
-    expect(screen.getByText('—')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Abandoned —' }))
-    expect(screen.getByText('—')).toBeInTheDocument()
+    expect(await screen.findByText('Reverted sessions · —')).toBeInTheDocument()
+    expect(screen.getByText('Abandoned sessions · —')).toBeInTheDocument()
+    expect(screen.getAllByText('—')).toHaveLength(2)
   })
 
-  it('switches to Fixes and shows populated and empty states', async () => {
-    getOverview.mockResolvedValue(makePayload())
-    getYield.mockResolvedValue(makeYield())
-
-    const { rerender } = render(<Optimize period="30days" provider="all" />)
-    expect(await screen.findByText('Opus is doing your small talk')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Fixes 3' }))
-
-    expect(screen.getByText('Opus is doing your small talk')).toBeInTheDocument()
-    expect(screen.getByText('Cache hit is low in agentseal-dash')).toBeInTheDocument()
-    expect(screen.getByText('High')).toHaveClass('opt-impact-high')
-    expect(screen.getByText('$9.10')).toHaveClass('opt-finding-savings')
-
-    getOverview.mockResolvedValue(emptyPayload())
-    rerender(<Optimize period="week" provider="all" />)
-
-    expect(await screen.findByText('No fixes in this range yet.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Fixes 0' })).toBeInTheDocument()
-  })
-
-  it('renders honest empty states for missing optimize findings and yield details', async () => {
+  it('shows one compact empty note and hides all empty sections', async () => {
     getOverview.mockResolvedValue(emptyPayload())
     getYield.mockResolvedValue(emptyYield())
 
     render(<Optimize period="30days" provider="all" />)
 
     expect(await screen.findByText('No waste findings in this range yet.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Waste $0.00' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Reverts $0.00' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Abandoned $0.00' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Fixes 0' })).toBeInTheDocument()
+    expect(screen.queryByText(/Optimization findings ·/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Reverted sessions ·/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Abandoned sessions ·/)).not.toBeInTheDocument()
+  })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reverts $0.00' }))
-    expect(screen.getByText('No reverted sessions in this range yet.')).toBeInTheDocument()
+  it('hides only yield sections whose category has no rows', async () => {
+    const report = makeYield()
+    report.summary.abandoned = { costUSD: 0, sessions: 0, costPercent: 0, sessionPercent: 0 }
+    report.details = report.details.filter(row => row.category !== 'abandoned')
+    getOverview.mockResolvedValue(makePayload())
+    getYield.mockResolvedValue(report)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Abandoned $0.00' }))
-    expect(screen.getByText('No abandoned sessions in this range yet.')).toBeInTheDocument()
+    render(<Optimize period="30days" provider="all" />)
+
+    expect(await screen.findByText('Reverted sessions · $107.00')).toBeInTheDocument()
+    expect(screen.queryByText(/Abandoned sessions ·/)).not.toBeInTheDocument()
+    expect(screen.getByText('Optimization findings · 3 findings · $94.40 potential')).toBeInTheDocument()
   })
 
   it('keeps last-good yield totals and rows visible during revalidation', async () => {
@@ -218,14 +170,13 @@ describe('Optimize', () => {
 
     const { rerender } = render(<OptimizeContent period="30days" overview={overview} refreshToken={0} />)
 
-    expect(await screen.findByRole('button', { name: 'Reverts $107.00' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Reverts $107.00' }))
+    expect(await screen.findByText('Reverted sessions · $107.00')).toBeInTheDocument()
     expect(screen.getByText('codeburn')).toBeInTheDocument()
 
     rerender(<OptimizeContent period="30days" overview={overview} refreshToken={1} />)
     await waitFor(() => expect(getYield).toHaveBeenCalledTimes(2))
 
-    expect(screen.getByRole('button', { name: 'Reverts $107.00' })).toBeInTheDocument()
+    expect(screen.getByText('Reverted sessions · $107.00')).toBeInTheDocument()
     expect(screen.getByText('codeburn')).toBeInTheDocument()
     expect(screen.queryByText('—')).not.toBeInTheDocument()
   })

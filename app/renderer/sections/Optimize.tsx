@@ -1,14 +1,9 @@
-import { useState } from 'react'
-
 import { CliErrorPanel } from '../components/CliErrorPanel'
 import { Panel } from '../components/Panel'
-import { SegTabs } from '../components/SegTabs'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import type { DateRange, MenubarPayload, Period, SessionYieldJson, YieldJsonReport } from '../lib/types'
-
-type OptimizeTab = 'waste' | 'reverts' | 'abandoned' | 'fixes'
 
 function EmptyNote({ children }: { children: React.ReactNode }) {
   return <p style={{ color: 'var(--t3)', margin: 0, fontSize: 12 }}>{children}</p>
@@ -37,7 +32,6 @@ export function OptimizeContent({
     () => range ? codeburn.getYield(period, range) : codeburn.getYield(period),
     [period, range?.from, range?.to, refreshToken],
   )
-  const [tab, setTab] = useState<OptimizeTab>('waste')
 
   if (!overview.data) {
     if (overview.error) return <CliErrorPanel error={overview.error} subject="optimize findings" />
@@ -51,32 +45,29 @@ export function OptimizeContent({
   const yieldData = yieldReport.error ? null : yieldReport.data
   const revertedTotal = yieldData ? formatUsd(yieldData.summary.reverted.costUSD) : '—'
   const abandonedTotal = yieldData ? formatUsd(yieldData.summary.abandoned.costUSD) : '—'
-  const options = [
-    { value: 'waste', label: `Waste ${formatUsd(overview.data.optimize.savingsUSD)}` },
-    { value: 'reverts', label: `Reverts ${revertedTotal}` },
-    { value: 'abandoned', label: `Abandoned ${abandonedTotal}` },
-    { value: 'fixes', label: `Fixes ${overview.data.optimize.findingCount.toLocaleString('en-US')}` },
-  ]
+  const revertedRows = !yieldData || yieldData.details.some(row => row.category === 'reverted')
+  const abandonedRows = !yieldData || yieldData.details.some(row => row.category === 'abandoned')
+  const hasFindings = overview.data.optimize.topFindings.length > 0
+  const isEmpty = !hasFindings && !revertedRows && !abandonedRows
 
   return (
     <>
-      <SegTabs
-        options={options}
-        value={tab}
-        onChange={value => setTab(value as OptimizeTab)}
-        style={{ alignSelf: 'flex-start' }}
-      />
-      <Panel>
-        {tab === 'waste' ? (
+      {hasFindings && (
+        <Panel title={`Optimization findings · ${overview.data.optimize.findingCount.toLocaleString('en-US')} findings · ${formatUsd(overview.data.optimize.savingsUSD)} potential`}>
           <WasteRows data={overview.data} />
-        ) : tab === 'reverts' ? (
+        </Panel>
+      )}
+      {revertedRows && (
+        <Panel title={`Reverted sessions · ${revertedTotal}`}>
           <YieldRows report={yieldReport} category="reverted" empty="No reverted sessions in this range yet." />
-        ) : tab === 'abandoned' ? (
+        </Panel>
+      )}
+      {abandonedRows && (
+        <Panel title={`Abandoned sessions · ${abandonedTotal}`}>
           <YieldRows report={yieldReport} category="abandoned" empty="No abandoned sessions in this range yet." />
-        ) : (
-          <FixesRows data={overview.data} />
-        )}
-      </Panel>
+        </Panel>
+      )}
+      {isEmpty && <EmptyNote>No waste findings in this range yet.</EmptyNote>}
     </>
   )
 }
@@ -143,8 +134,4 @@ function YieldRows({
       ))}
     </>
   )
-}
-
-function FixesRows({ data }: { data: MenubarPayload }) {
-  return <FindingRows findings={data.optimize.topFindings} empty="No fixes in this range yet." />
 }
