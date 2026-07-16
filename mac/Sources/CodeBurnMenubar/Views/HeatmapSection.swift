@@ -1709,12 +1709,12 @@ private struct PlanInsight: View {
                     message: "CodeBurn will read your Claude Code credentials once. macOS will ask permission. After that, the live quota bar shows next to the Claude tab and updates automatically."
                 ) { Task { await store.bootstrapSubscription() } }
             case .bootstrapping:
-                PlanLoadingView()
+                PlanLoadingView(message: "Reading Claude credentials...")
             case .loading:
                 if let usage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanLoadingView()
+                    PlanLoadingView(message: "Reading Claude credentials...")
                 }
             case .noCredentials:
                 PlanNoCredentialsView(
@@ -1722,12 +1722,12 @@ private struct PlanInsight: View {
                     message: "Sign in with Claude Code first: open `claude` in your terminal and type `/login`. Then click Try Again."
                 ) { Task { await store.bootstrapSubscription() } }
             case .failed:
-                PlanFailedView(error: store.subscriptionError)
+                PlanFailedView(error: store.subscriptionError) { Task { await store.refreshSubscription() } }
             case .transientFailure:
                 if let usage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanFailedView(error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying.")
+                    PlanFailedView(error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying.") { Task { await store.refreshSubscription() } }
                 }
             case let .terminalFailure(reason):
                 PlanReconnectView(
@@ -1739,7 +1739,7 @@ private struct PlanInsight: View {
                 if let usage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanLoadingView()
+                    PlanLoadingView(message: "Reading Claude credentials...")
                 }
             }
         }
@@ -1847,10 +1847,12 @@ private struct PlanInsight: View {
 // MARK: - Plan empty/loading/failure states
 
 private struct PlanLoadingView: View {
+    let message: String
+
     var body: some View {
         VStack(spacing: 8) {
             ProgressView().scaleEffect(0.8)
-            Text("Reading Claude credentials...")
+            Text(message)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
         }
@@ -1888,14 +1890,14 @@ private struct PlanNoCredentialsView: View {
 }
 
 private struct PlanFailedView: View {
-    @Environment(AppStore.self) private var store
     let error: String?
+    let onRetry: () -> Void
 
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 18))
-                .foregroundStyle(Theme.brandAccent)
+                .foregroundStyle(.red)
             Text("Couldn't load plan data")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.primary)
@@ -1907,12 +1909,10 @@ private struct PlanFailedView: View {
                     .frame(maxWidth: 280)
                     .lineLimit(3)
             }
-            Button("Retry") {
-                Task { await store.refreshSubscription() }
-            }
+            Button("Retry", action: onRetry)
             .controlSize(.small)
             .buttonStyle(.borderedProminent)
-            .tint(Theme.brandAccent)
+            .tint(.red)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 14)
@@ -2004,12 +2004,12 @@ private struct CodexPlanInsight: View {
                     message: "CodeBurn will read your Codex CLI credentials once. After that, the live quota bar shows next to the Codex tab and updates automatically."
                 ) { Task { await store.bootstrapCodex() } }
             case .bootstrapping:
-                PlanLoadingView()
+                PlanLoadingView(message: "Reading Codex CLI credentials...")
             case .loading:
                 if let usage = store.codexUsage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanLoadingView()
+                    PlanLoadingView(message: "Reading Codex CLI credentials...")
                 }
             case .noCredentials:
                 PlanNoCredentialsView(
@@ -2017,12 +2017,12 @@ private struct CodexPlanInsight: View {
                     message: "Sign in with Codex first: run `codex login` in your terminal. Then click Try Again."
                 ) { Task { await store.bootstrapCodex() } }
             case .failed:
-                PlanFailedView(error: store.codexError)
+                PlanFailedView(error: store.codexError) { Task { await store.refreshCodex() } }
             case .transientFailure:
                 if let usage = store.codexUsage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanFailedView(error: store.codexError ?? "ChatGPT temporarily unreachable — retrying.")
+                    PlanFailedView(error: store.codexError ?? "ChatGPT temporarily unreachable — retrying.") { Task { await store.refreshCodex() } }
                 }
             case let .terminalFailure(reason):
                 PlanReconnectView(
@@ -2034,7 +2034,7 @@ private struct CodexPlanInsight: View {
                 if let usage = store.codexUsage {
                     loadedBody(usage: usage)
                 } else {
-                    PlanLoadingView()
+                    PlanLoadingView(message: "Reading Codex CLI credentials...")
                 }
             }
         }
