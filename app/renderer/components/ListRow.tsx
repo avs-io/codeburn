@@ -7,6 +7,8 @@ export { seriesColorForModel } from '../lib/modelSeries'
  * title + sub line `.lx`, an optional right-aligned `.val`. When `onClick` is
  * provided the row becomes a keyboard-operable button and shows the trailing
  * chevron; without it the row is inert and the chevron is omitted (honest).
+ * Pass `expanded` on an interactive row to reflect its open/closed state
+ * (`aria-expanded`, which also rotates the chevron).
  */
 export function ListRow({
   no,
@@ -16,6 +18,7 @@ export function ListRow({
   value,
   valueClass,
   onClick,
+  expanded,
 }: {
   no?: ReactNode
   dotColor?: string
@@ -24,6 +27,7 @@ export function ListRow({
   value?: ReactNode
   valueClass?: string
   onClick?: () => void
+  expanded?: boolean
 }) {
   const dot: CSSProperties | undefined = dotColor ? { background: dotColor } : undefined
   const interactive = onClick !== undefined
@@ -39,6 +43,7 @@ export function ListRow({
     <div
       className={interactive ? 'li li-clickable' : 'li'}
       {...(interactive ? { role: 'button', tabIndex: 0, onClick, onKeyDown } : {})}
+      {...(interactive && expanded !== undefined ? { 'aria-expanded': expanded } : {})}
     >
       {no !== undefined && <span className="no">{no}</span>}
       {dotColor !== undefined && <span className="mdot" style={dot} />}

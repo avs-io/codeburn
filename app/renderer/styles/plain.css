@@ -402,6 +402,16 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .li-clickable { cursor: pointer; border-radius: 7px; }
 .li-clickable:hover, .li-clickable:focus-visible { background: var(--hover); outline: none; }
 .li-clickable:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+.li .chev { transition: transform 140ms ease; }
+.li-clickable[aria-expanded="true"] .chev { transform: rotate(90deg); }
+
+/* Spend: a project row's inline session sub-list (indented, TUI-style). */
+.spend-proj-detail { display: flex; flex-direction: column; padding: 2px 0 8px 27px; }
+.spend-proj-session { display: grid; grid-template-columns: 54px minmax(0, 1fr) auto auto; align-items: baseline; column-gap: 10px; padding: 4px 0; font-size: 11px; color: var(--mut); font-variant-numeric: tabular-nums; }
+.spend-proj-session + .spend-proj-session { border-top: 1px solid var(--line2); }
+.spend-proj-session .sps-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.spend-proj-session .sps-cost { color: var(--ink); font-family: var(--mono); }
+.spend-proj-empty { padding: 4px 0 8px 27px; font-size: 11px; color: var(--mut2); }
 
 /* Models: grouped task lens. */
 .models-by-task { min-width: 660px; }
@@ -661,6 +671,11 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 /* Sessions */
 .sessions-list-view { display: flex; width: 100%; flex-direction: column; gap: 10px; }
 .sessions-toolbar { display: flex; align-items: center; align-self: flex-start; flex-wrap: wrap; gap: 8px; }
+.session-provider-filter { align-self: flex-start; flex-wrap: wrap; }
+.session-provider-filter button { display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 5px; background: transparent; padding: 4px 9px; font: inherit; font-size: 11.5px; color: var(--mut); white-space: nowrap; cursor: pointer; }
+.session-provider-filter button:hover { color: var(--ink); }
+.session-provider-filter button.on { color: var(--ink); font-weight: 560; }
+.session-provider-filter button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 .sessions-search { min-width: 240px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); font: inherit; font-size: 12px; }
 .sessions-search::placeholder { color: var(--mut2); }
 .sessions-search:focus-visible { border-color: var(--accent); outline: 1px solid var(--accent); outline-offset: 1px; }

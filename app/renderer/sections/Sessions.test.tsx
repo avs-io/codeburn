@@ -229,4 +229,45 @@ describe('Sessions', () => {
     render(<Sessions period="week" provider="all" />)
     expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
   })
+
+  it('lifts provider quick-filter clicks to the app callback with the internal id', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue(rows)
+    const onProviderChange = vi.fn()
+    const detected = [
+      { id: 'claude', label: 'Claude' },
+      { id: 'codex', label: 'Codex' },
+    ]
+    render(<Sessions period="30days" provider="all" detectedProviders={detected} onProviderChange={onProviderChange} />)
+    await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
+
+    const filter = screen.getByRole('group', { name: /provider/i })
+    expect(within(filter).getAllByRole('button')).toHaveLength(3)
+
+    await user.click(within(filter).getByRole('button', { name: 'Codex' }))
+    expect(onProviderChange).toHaveBeenCalledWith('codex')
+
+    await user.click(within(filter).getByRole('button', { name: 'All' }))
+    expect(onProviderChange).toHaveBeenLastCalledWith('all')
+  })
+
+  it('renders quick-filter buttons only for cost>0 providers and presses the active one', async () => {
+    getSessions.mockResolvedValue(rows)
+    // Mirror App.tsx: detectedProviders are built by dropping cost=0 entries.
+    const providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 12 },
+      { id: 'codex', label: 'Codex', cost: 4 },
+      { id: 'gemini', label: 'Gemini', cost: 0 },
+    ]
+    const detected = providerDetails.filter(p => p.cost > 0).map(({ id, label }) => ({ id, label }))
+    render(<Sessions period="30days" provider="codex" detectedProviders={detected} onProviderChange={() => {}} />)
+    await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
+
+    const filter = screen.getByRole('group', { name: /provider/i })
+    expect(within(filter).getByRole('button', { name: 'Claude' })).toBeInTheDocument()
+    expect(within(filter).getByRole('button', { name: 'Codex' })).toBeInTheDocument()
+    expect(within(filter).queryByRole('button', { name: 'Gemini' })).not.toBeInTheDocument()
+    expect(within(filter).getByRole('button', { name: 'Codex' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(filter).getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'false')
+  })
 })

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MenubarPayload, SpendFlow } from '../lib/types'
@@ -327,5 +328,59 @@ describe('Spend', () => {
     expect(opusStop?.getAttribute('stop-color')).toBe('var(--s-opus)')
     const otherNode = container.querySelector('[data-testid="sankey-node"][data-node-id="__other__"]')
     expect(otherNode?.getAttribute('fill')).toBe('var(--s-other)')
+  })
+
+  it('expands a project row inline to reveal its sessions, one open row at a time', async () => {
+    const user = userEvent.setup()
+    const payload = makePayload(new Date())
+    payload.current.topProjects[0].sessionDetails = [
+      {
+        cost: 120.5, savingsUSD: 0, calls: 40, inputTokens: 0, outputTokens: 0, date: '2026-07-09',
+        models: [
+          { name: 'claude-opus-4', cost: 100, savingsUSD: 0 },
+          { name: 'claude-haiku-4', cost: 20.5, savingsUSD: 0 },
+        ],
+      },
+      {
+        cost: 44.25, savingsUSD: 0, calls: 12, inputTokens: 0, outputTokens: 0, date: '2026-07-05',
+        models: [{ name: 'gpt-5.5-codex', cost: 44.25, savingsUSD: 0 }],
+      },
+    ]
+    payload.current.topProjects[1].sessionDetails = [
+      {
+        cost: 9.9, savingsUSD: 0, calls: 3, inputTokens: 0, outputTokens: 0, date: '2026-07-02',
+        models: [{ name: 'claude-sonnet-5', cost: 9.9, savingsUSD: 0 }],
+      },
+    ]
+    getOverview.mockResolvedValue(payload)
+    getSpendFlow.mockResolvedValue(makeFlow())
+
+    render(<Spend period="week" provider="all" />)
+
+    const first = await screen.findByRole('button', { name: /codeburn/ })
+    const second = screen.getByRole('button', { name: /agentseal-dash/ })
+    expect(first).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('region', { name: 'codeburn sessions' })).not.toBeInTheDocument()
+
+    await user.click(first)
+    expect(first).toHaveAttribute('aria-expanded', 'true')
+    const detail = screen.getByRole('region', { name: 'codeburn sessions' })
+    expect(within(detail).getByText('Jul 9')).toBeInTheDocument()
+    expect(within(detail).getByText('$120.50')).toBeInTheDocument()
+    expect(within(detail).getByText('claude-opus-4')).toBeInTheDocument()
+    expect(within(detail).getByText('Jul 5')).toBeInTheDocument()
+    expect(within(detail).getByText('$44.25')).toBeInTheDocument()
+
+    // Expanding another project collapses the first (single open row).
+    await user.click(second)
+    expect(second).toHaveAttribute('aria-expanded', 'true')
+    expect(first).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('region', { name: 'codeburn sessions' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('region', { name: 'agentseal-dash sessions' })).getByText('$9.90')).toBeInTheDocument()
+
+    // Clicking the open row collapses it in place.
+    await user.click(second)
+    expect(second).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('region', { name: 'agentseal-dash sessions' })).not.toBeInTheDocument()
   })
 })

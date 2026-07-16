@@ -1,3 +1,5 @@
+import { Fragment, useState } from 'react'
+
 import { CliErrorPanel, CliErrorText } from '../components/CliErrorPanel'
 import { EmptyNote } from '../components/EmptyState'
 import { ListRow } from '../components/ListRow'
@@ -10,6 +12,14 @@ import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, localDateKey } from '../lib/period'
 import type { CliError, DateRange, MenubarPayload, Period, SpendFlow } from '../lib/types'
+
+type Project = MenubarPayload['current']['topProjects'][number]
+
+/** Date-only CLI strings ("2026-07-11") formatted at local noon so the calendar day never rolls across time zones. */
+function formatProjectDay(date: string): string {
+  const d = new Date(`${date}T12:00:00`)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
 
 const SPEND_CHART_DAYS = 15
 
@@ -140,21 +150,7 @@ function SpendPage({
         <Panel title="Daily spend by model" className="spend-chart-panel">
           {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} /> : <EmptyNote>No model spend in this range yet.</EmptyNote>}
         </Panel>
-        <Panel title="By project" right={projects.length ? `top ${projects.length}` : undefined} className="spend-scroll">
-          {projects.length ? (
-            projects.map((project, i) => (
-              <ListRow
-                key={project.name}
-                no={String(i + 1).padStart(2, '0')}
-                title={project.name}
-                sub={`${project.sessions.toLocaleString('en-US')} ${project.sessions === 1 ? 'session' : 'sessions'}`}
-                value={formatUsd(project.cost)}
-              />
-            ))
-          ) : (
-            <EmptyNote>No project spend in this range yet.</EmptyNote>
-          )}
-        </Panel>
+        <ProjectBreakdown projects={projects} />
       </div>
 
       <Panel title="Cost flow · model → project" right="model → project flow for this range" bodyStyle={{ overflowX: 'auto' }}>
@@ -175,6 +171,50 @@ function SpendPage({
         )}
       </div>
     </>
+  )
+}
+
+function ProjectBreakdown({ projects }: { projects: Project[] }) {
+  const [expanded, setExpanded] = useState<string | null>(null)
+
+  return (
+    <Panel title="By project" right={projects.length ? `top ${projects.length}` : undefined} className="spend-scroll">
+      {projects.length ? (
+        projects.map((project, i) => {
+          const open = expanded === project.name
+          return (
+            <Fragment key={project.name}>
+              <ListRow
+                no={String(i + 1).padStart(2, '0')}
+                title={project.name}
+                sub={`${project.sessions.toLocaleString('en-US')} ${project.sessions === 1 ? 'session' : 'sessions'}`}
+                value={formatUsd(project.cost)}
+                expanded={open}
+                onClick={() => setExpanded(current => current === project.name ? null : project.name)}
+              />
+              {open && (
+                <div className="spend-proj-detail" role="region" aria-label={`${project.name} sessions`}>
+                  {project.sessionDetails.length ? (
+                    project.sessionDetails.map((session, j) => (
+                      <div className="spend-proj-session" key={`${session.date}-${j}`}>
+                        <span className="sps-date">{formatProjectDay(session.date)}</span>
+                        <span className="sps-model">{session.models[0]?.name ?? '—'}</span>
+                        <span className="sps-calls">{session.calls.toLocaleString('en-US')} calls</span>
+                        <span className="sps-cost">{formatUsd(session.cost)}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="spend-proj-empty">No session detail for this project.</div>
+                  )}
+                </div>
+              )}
+            </Fragment>
+          )
+        })
+      ) : (
+        <EmptyNote>No project spend in this range yet.</EmptyNote>
+      )}
+    </Panel>
   )
 }
 

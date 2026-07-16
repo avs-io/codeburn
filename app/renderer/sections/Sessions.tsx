@@ -3,6 +3,7 @@ import { Fragment, useEffect, useMemo, useState } from 'react'
 import { CliErrorPanel } from '../components/CliErrorPanel'
 import { EmptyNote } from '../components/EmptyState'
 import { Panel } from '../components/Panel'
+import { ProviderLogo } from '../components/ProviderLogo'
 import { SegTabs } from '../components/SegTabs'
 import { StaleBanner } from '../components/StaleBanner'
 import { Stat } from '../components/Stat'
@@ -62,11 +63,15 @@ export function Sessions({
   provider,
   range = null,
   refreshToken = 0,
+  detectedProviders = [],
+  onProviderChange = () => {},
 }: {
   period: Period
   provider: string
   range?: DateRange | null
   refreshToken?: number
+  detectedProviders?: Array<{ id: string; label: string }>
+  onProviderChange?: (value: string) => void
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [query, setQuery] = useState('')
@@ -158,6 +163,30 @@ export function Sessions({
   return (
     <div className="sessions-list-view">
       {report.error && <StaleBanner error={report.error} />}
+      {detectedProviders.length > 0 && (
+        <div className="seg session-provider-filter" role="group" aria-label="Filter sessions by provider">
+          <button
+            type="button"
+            className={provider === 'all' ? 'on' : undefined}
+            aria-pressed={provider === 'all'}
+            onClick={() => onProviderChange('all')}
+          >
+            All
+          </button>
+          {detectedProviders.map(entry => (
+            <button
+              key={entry.id}
+              type="button"
+              className={provider === entry.id ? 'on' : undefined}
+              aria-pressed={provider === entry.id}
+              onClick={() => onProviderChange(entry.id)}
+            >
+              <ProviderLogo provider={entry.id} size={14} />
+              {entry.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="sessions-toolbar">
         <input
           className="sessions-search"
