@@ -273,7 +273,11 @@ private struct ClaudeSettingsTab: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Button("Refresh Now") {
-                    Task { await store.refreshSubscription() }
+                    if let delegate = NSApp.delegate as? AppDelegate {
+                        delegate.refreshSubscriptionNow()
+                    } else {
+                        Task { await store.refreshSubscription() }
+                    }
                 }
             }
         }

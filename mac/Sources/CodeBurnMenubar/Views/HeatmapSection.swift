@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private let trendChartHeight: CGFloat = 90
@@ -1724,14 +1725,14 @@ private struct PlanInsight: View {
             case .failed:
                 PlanFailedView(
                     error: store.subscriptionError
-                ) { Task { await store.refreshSubscription() } }
+                ) { refreshSubscriptionThroughAppDelegate() }
             case .transientFailure:
                 if let usage {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
                         error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying."
-                    ) { Task { await store.refreshSubscription() } }
+                    ) { refreshSubscriptionThroughAppDelegate() }
                 }
             case let .terminalFailure(reason):
                 PlanReconnectView(
@@ -1746,6 +1747,14 @@ private struct PlanInsight: View {
                     PlanLoadingView(message: "Reading Claude credentials...")
                 }
             }
+        }
+    }
+
+    private func refreshSubscriptionThroughAppDelegate() {
+        if let delegate = NSApp.delegate as? AppDelegate {
+            delegate.refreshSubscriptionNow()
+        } else {
+            Task { await store.refreshSubscription() }
         }
     }
 

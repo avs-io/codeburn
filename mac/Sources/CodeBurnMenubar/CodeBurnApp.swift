@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AppKit
 import Observation
@@ -12,6 +13,25 @@ private let statusItemWidth: CGFloat = NSStatusItem.variableLength
 private let popoverWidth: CGFloat = 360
 private let popoverHeight: CGFloat = 660
 private let menubarTitleFontSize: CGFloat = 13
+
+enum SubscriptionRefreshBackoff {
+    static let initialDelaySeconds: TimeInterval = TimeInterval(refreshIntervalSeconds)
+    static let maxJitterSeconds: TimeInterval = 5
+
+    static func delay(
+        failureCount: Int,
+        cadence: TimeInterval,
+        jitterUnit: Double
+    ) -> TimeInterval {
+        guard cadence > 0 else { return 0 }
+
+        let exponent = min(max(failureCount, 1) - 1, 10)
+        let exponential = min(cadence, initialDelaySeconds * pow(2, Double(exponent)))
+        let normalizedJitter = min(max(jitterUnit, 0), 1)
+        let jitter = normalizedJitter * min(maxJitterSeconds, cadence)
+        return min(cadence, exponential + jitter)
+    }
+}
 
 @main
 struct CodeBurnApp: App {
@@ -436,28 +456,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     fileprivate var lastSubscriptionRefreshAt: Date?
     fileprivate var lastCodexRefreshAt: Date?
+    private var claudeQuotaFailureCount = 0
+    private var nextClaudeQuotaRefreshAt: Date?
 
     @discardableResult
-    private func refreshLiveQuotaProgressIfDue(force: Bool = false) async -> Bool {
+    private func refreshLiveQuotaProgressIfDue(
+        force: Bool = false,
+        forceClaude: Bool = false,
+        forceCodex: Bool = false
+    ) async -> Bool {
         let cadence = SubscriptionRefreshCadence.current
-        if !force && cadence == .manual { return false }
+        let autoRefreshAllowed = cadence != .manual
+        if !force && !forceClaude && !forceCodex && !autoRefreshAllowed { return false }
 
         let now = Date()
-        let threshold = force ? 0 : TimeInterval(cadence.rawValue)
-        let shouldRefreshClaude = force || now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast) >= threshold
-        let shouldRefreshCodex = force || now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast) >= threshold
+        let threshold = TimeInterval(cadence.rawValue)
+        let claudeDue = autoRefreshAllowed && (
+            nextClaudeQuotaRefreshAt.map { now >= $0 } ??
+            now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast) >= threshold
+        )
+        let shouldRefreshClaude = force || forceClaude || claudeDue
+        let shouldRefreshCodex = force || forceCodex || (
+            autoRefreshAllowed && now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast) >= threshold
+        )
         guard shouldRefreshClaude || shouldRefreshCodex else { return false }
+
+        if shouldRefreshClaude {
+            // The cadence anchor represents the start of an attempt, even if
+            // the provider fails. Failures get their own shorter backoff below.
+            lastSubscriptionRefreshAt = now
+        }
 
         switch (shouldRefreshClaude, shouldRefreshCodex) {
         case (true, true):
             async let claude = refreshClaudeQuotaSingleFlight()
             async let codex = refreshCodexQuotaSingleFlight()
-            if await claude { lastSubscriptionRefreshAt = Date() }
-            if await codex { lastCodexRefreshAt = Date() }
+            let claudeSucceeded = await claude
+            let codexSucceeded = await codex
+            finishClaudeQuotaRefresh(
+                succeeded: claudeSucceeded,
+                attemptedAt: now,
+                cadence: threshold
+            )
+            if codexSucceeded { lastCodexRefreshAt = Date() }
         case (true, false):
-            if await refreshClaudeQuotaSingleFlight() {
-                lastSubscriptionRefreshAt = Date()
-            }
+            let succeeded = await refreshClaudeQuotaSingleFlight()
+            finishClaudeQuotaRefresh(succeeded: succeeded, attemptedAt: now, cadence: threshold)
         case (false, true):
             if await refreshCodexQuotaSingleFlight() {
                 lastCodexRefreshAt = Date()
@@ -466,6 +510,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             break
         }
         return true
+    }
+
+    private func finishClaudeQuotaRefresh(
+        succeeded: Bool,
+        attemptedAt: Date,
+        cadence: TimeInterval
+    ) {
+        guard !succeeded else {
+            claudeQuotaFailureCount = 0
+            nextClaudeQuotaRefreshAt = nil
+            return
+        }
+
+        claudeQuotaFailureCount += 1
+        let delay = SubscriptionRefreshBackoff.delay(
+            failureCount: claudeQuotaFailureCount,
+            cadence: cadence,
+            jitterUnit: Double.random(in: 0...1)
+        )
+        nextClaudeQuotaRefreshAt = attemptedAt.addingTimeInterval(delay)
     }
 
     private func refreshClaudeQuotaSingleFlight() async -> Bool {
@@ -502,12 +566,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let now = Date()
         let claudeElapsed = now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast)
         let codexElapsed = now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast)
-        guard claudeElapsed >= interactiveQuotaRefreshFloorSeconds ||
-              codexElapsed >= interactiveQuotaRefreshFloorSeconds else { return }
+        let refreshClaude = claudeElapsed >= interactiveQuotaRefreshFloorSeconds
+        let refreshCodex = codexElapsed >= interactiveQuotaRefreshFloorSeconds
+        guard refreshClaude || refreshCodex else { return }
 
         Task { [weak self] in
             guard let self else { return }
-            _ = await self.refreshLiveQuotaProgressIfDue(force: true)
+            _ = await self.refreshLiveQuotaProgressIfDue(
+                forceClaude: refreshClaude,
+                forceCodex: refreshCodex
+            )
         }
     }
 
@@ -673,6 +741,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func resetSubscriptionCadenceAnchor() {
         lastSubscriptionRefreshAt = nil
         lastCodexRefreshAt = nil
+        claudeQuotaFailureCount = 0
+        nextClaudeQuotaRefreshAt = nil
     }
 
     private func observeStore() {
