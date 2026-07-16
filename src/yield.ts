@@ -88,12 +88,13 @@ type CommitInfo = {
 type SessionWindow = {
   readonly start: Date
   readonly end: Date
-  readonly index: number
+  readonly sessionId: string
 }
 
 type SessionAttribution = {
   readonly window: SessionWindow | null
   readonly commits: CommitInfo[]
+  lostCandidacy: boolean
 }
 
 /**
@@ -155,26 +156,23 @@ function getCommitsInRange(cwd: string, since: Date, until: Date, mainBranch: st
   })
 }
 
-function sessionWindow(session: SessionSummary, index: number): SessionWindow | null {
+function sessionWindow(session: SessionSummary): SessionWindow | null {
   if (!session.firstTimestamp) return null
 
   const start = new Date(session.firstTimestamp)
   const lastTs = session.lastTimestamp ?? session.firstTimestamp
   const end = new Date(new Date(lastTs).getTime() + 60 * 60 * 1000)
-  return { start, end, index }
-}
-
-function windowsOverlap(left: SessionWindow, right: SessionWindow): boolean {
-  return left.start <= right.end && right.start <= left.end
+  return { start, end, sessionId: session.sessionId }
 }
 
 function attributeCommits(
   sessions: SessionSummary[],
   commits: CommitInfo[],
 ): SessionAttribution[] {
-  const attributions: SessionAttribution[] = sessions.map((session, index) => ({
-    window: sessionWindow(session, index),
+  const attributions: SessionAttribution[] = sessions.map(session => ({
+    window: sessionWindow(session),
     commits: [],
+    lostCandidacy: false,
   }))
 
   for (const commit of commits) {
@@ -193,9 +191,13 @@ function attributeCommits(
       if (candidate.window.start.getTime() !== current.window.start.getTime()) {
         return candidate.window.start < current.window.start ? candidate : current
       }
-      return candidate.window.index < current.window.index ? candidate : current
+      // sessionId, not array position: session order is cache-state dependent.
+      return candidate.window.sessionId < current.window.sessionId ? candidate : current
     }, null)
 
+    for (const candidate of candidates) {
+      if (candidate !== owner) candidate.lostCandidacy = true
+    }
     owner?.commits.push(commit)
   }
 
@@ -205,15 +207,18 @@ function attributeCommits(
 function categorizeSession(
   session: SessionSummary,
   commits: CommitInfo[],
-  hasOverlappingCreditedSession: boolean,
+  lostCandidacy: boolean,
 ): { category: YieldCategory; commitCount: number } {
   if (!session.firstTimestamp) {
     return { category: 'abandoned', commitCount: 0 }
   }
 
   if (commits.length === 0) {
+    // Ambiguous only when this session's window actually contained a commit
+    // that a tighter window won — mere overlap with a credited session is not
+    // enough to withhold the abandoned classification.
     return {
-      category: hasOverlappingCreditedSession ? 'ambiguous' : 'abandoned',
+      category: lostCandidacy ? 'ambiguous' : 'abandoned',
       commitCount: 0,
     }
   }
@@ -252,31 +257,42 @@ export async function computeYield(range: DateRange, cwd: string, provider: stri
     ? getCommitsInRange(cwd, range.start, range.end, getMainBranch(cwd))
     : []
 
+  // Group sessions by resolved repo before attributing: every project entry
+  // whose projectPath is missing (or not a git repo) falls back to the same
+  // cwd and shares one commit list, so attribution must run once per repo or
+  // two such entries could each award the same commit to one of their sessions.
+  type RepoGroup = { commits: CommitInfo[]; sessions: SessionSummary[]; projectNames: string[] }
+  const repoGroups = new Map<string, RepoGroup>()
   for (const project of projects) {
-    // Try project-specific git repo first, fall back to cwd
     const projectCwd = project.projectPath && isGitRepo(project.projectPath)
       ? project.projectPath
       : cwd
 
-    const projectCommits = projectCwd !== cwd && isGitRepo(projectCwd)
-      ? getCommitsInRange(projectCwd, range.start, range.end, getMainBranch(projectCwd))
-      : commits
+    let group = repoGroups.get(projectCwd)
+    if (!group) {
+      group = {
+        commits: projectCwd === cwd
+          ? commits
+          : getCommitsInRange(projectCwd, range.start, range.end, getMainBranch(projectCwd)),
+        sessions: [],
+        projectNames: [],
+      }
+      repoGroups.set(projectCwd, group)
+    }
+    for (const session of project.sessions) {
+      group.sessions.push(session)
+      group.projectNames.push(project.project)
+    }
+  }
 
-    const attributions = attributeCommits(project.sessions, projectCommits)
-    for (const [index, session] of project.sessions.entries()) {
+  for (const group of repoGroups.values()) {
+    const attributions = attributeCommits(group.sessions, group.commits)
+    for (const [index, session] of group.sessions.entries()) {
       const attribution = attributions[index]
-      const attributionWindow = attribution?.window
-      const hasOverlappingCreditedSession = attributionWindow !== undefined && attributionWindow !== null &&
-        attributions.some((other, otherIndex) =>
-          otherIndex !== index &&
-          other.commits.length > 0 &&
-          other.window !== null &&
-          windowsOverlap(attributionWindow, other.window),
-        )
       const { category, commitCount } = categorizeSession(
         session,
         attribution?.commits ?? [],
-        hasOverlappingCreditedSession,
+        attribution?.lostCandidacy ?? false,
       )
 
       summary[category].cost += session.totalCostUSD
@@ -286,7 +302,7 @@ export async function computeYield(range: DateRange, cwd: string, provider: stri
 
       summary.details.push({
         sessionId: session.sessionId,
-        project: project.project,
+        project: group.projectNames[index] ?? session.project,
         cost: session.totalCostUSD,
         category,
         commitCount,
@@ -308,7 +324,7 @@ export function formatYieldSummary(summary: YieldSummary): string {
     `Productive:  ${fmt(productive.cost).padStart(8)} (${pct(productive.cost)}%) - ${productive.sessions} sessions shipped to main`,
     `Reverted:    ${fmt(reverted.cost).padStart(8)} (${pct(reverted.cost)}%) - ${reverted.sessions} sessions were reverted`,
     `Abandoned:   ${fmt(abandoned.cost).padStart(8)} (${pct(abandoned.cost)}%) - ${abandoned.sessions} sessions never committed`,
-    `Ambiguous:   ${fmt(ambiguous.cost).padStart(8)} (${pct(ambiguous.cost)}%) - ${ambiguous.sessions} sessions overlapped credited windows`,
+    `Ambiguous:   ${fmt(ambiguous.cost).padStart(8)} (${pct(ambiguous.cost)}%) - ${ambiguous.sessions} sessions lost commits to concurrent sessions`,
     '',
     'Attribution: timestamp-window based (heuristic)',
     '',

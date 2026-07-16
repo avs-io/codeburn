@@ -118,4 +118,81 @@ describe('yield attribution for overlapping sessions (issue #641)', () => {
     expect(productiveSessions.map(d => d.sessionId)).toEqual(['session-a'])
     expect(summary.ambiguous).toEqual({ cost: 3, sessions: 1 })
   })
+
+  it('classifies a lone session with its commit as productive (single-session pin)', async () => {
+    const session = makeSession({
+      sessionId: 'solo',
+      firstTimestamp: '2026-01-01T10:15:00.000Z',
+      lastTimestamp: '2026-01-01T10:45:00.000Z',
+      totalCostUSD: 2,
+    })
+    parseAllSessionsMock.mockResolvedValue([
+      { project: 'app', projectPath: repoDir, sessions: [session] } as ProjectSummary,
+    ])
+
+    const summary = await computeYield(
+      { start: new Date('2026-01-01T00:00:00.000Z'), end: new Date('2026-01-02T00:00:00.000Z') },
+      repoDir,
+    )
+
+    expect(summary.details).toHaveLength(1)
+    expect(summary.details[0]).toMatchObject({ sessionId: 'solo', category: 'productive', commitCount: 1 })
+    expect(summary.productive).toEqual({ cost: 2, sessions: 1 })
+    expect(summary.ambiguous).toEqual({ cost: 0, sessions: 0 })
+  })
+
+  it('breaks equal-window ties deterministically by sessionId, not array order', async () => {
+    const windowFields = {
+      firstTimestamp: '2026-01-01T10:15:00.000Z',
+      lastTimestamp: '2026-01-01T10:45:00.000Z',
+    }
+    const first = makeSession({ sessionId: 'aaa-session', ...windowFields, totalCostUSD: 1 })
+    const second = makeSession({ sessionId: 'zzz-session', ...windowFields, totalCostUSD: 1 })
+
+    for (const order of [[first, second], [second, first]]) {
+      parseAllSessionsMock.mockResolvedValue([
+        { project: 'app', projectPath: repoDir, sessions: order } as ProjectSummary,
+      ])
+      const summary = await computeYield(
+        { start: new Date('2026-01-01T00:00:00.000Z'), end: new Date('2026-01-02T00:00:00.000Z') },
+        repoDir,
+      )
+      const productive = summary.details.filter(d => d.category === 'productive')
+      expect(productive.map(d => d.sessionId)).toEqual(['aaa-session'])
+      expect(summary.details.find(d => d.sessionId === 'zzz-session')!.category).toBe('ambiguous')
+    }
+  })
+
+  it('holds the single-owner invariant across project entries sharing the cwd fallback', async () => {
+    // Two project entries with no usable projectPath both resolve to the same
+    // cwd and share one commit list; the commit must still be credited once.
+    const sessionX = makeSession({
+      sessionId: 'proj1-session',
+      project: 'proj1',
+      firstTimestamp: '2026-01-01T10:15:00.000Z',
+      lastTimestamp: '2026-01-01T10:45:00.000Z',
+      totalCostUSD: 1,
+    })
+    const sessionY = makeSession({
+      sessionId: 'proj2-session',
+      project: 'proj2',
+      firstTimestamp: '2026-01-01T10:00:00.000Z',
+      lastTimestamp: '2026-01-01T11:00:00.000Z',
+      totalCostUSD: 1,
+    })
+    parseAllSessionsMock.mockResolvedValue([
+      { project: 'proj1', projectPath: undefined, sessions: [sessionX] } as unknown as ProjectSummary,
+      { project: 'proj2', projectPath: undefined, sessions: [sessionY] } as unknown as ProjectSummary,
+    ])
+
+    const summary = await computeYield(
+      { start: new Date('2026-01-01T00:00:00.000Z'), end: new Date('2026-01-02T00:00:00.000Z') },
+      repoDir,
+    )
+
+    const productive = summary.details.filter(d => d.category === 'productive')
+    expect(productive.map(d => d.sessionId)).toEqual(['proj1-session'])
+    expect(productive[0]!.commitCount).toBe(1)
+    expect(summary.details.find(d => d.sessionId === 'proj2-session')!.category).toBe('ambiguous')
+  })
 })
