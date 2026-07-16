@@ -3,23 +3,12 @@ import { act, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { Splash } from './Splash'
+import { mockMatchMedia as mockReducedMotion } from '../lib/testMatchMedia'
 
 function splashEl(): HTMLElement | null {
   return document.querySelector('.splash')
 }
 
-function mockReducedMotion(matches: boolean): void {
-  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
-    matches,
-    media: query,
-    onchange: null,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    addListener: vi.fn(),
-    removeListener: vi.fn(),
-    dispatchEvent: vi.fn(),
-  })) as unknown as typeof window.matchMedia
-}
 
 afterEach(() => {
   vi.useRealTimers()

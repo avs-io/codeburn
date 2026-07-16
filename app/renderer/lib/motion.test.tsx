@@ -6,19 +6,8 @@ import gsap from 'gsap'
 import { motionClass, motionEnabled, reducedMotion } from './motion'
 import { StackedBars } from '../components/StackedBars'
 import type { DailyHistoryEntry } from './types'
+import { mockMatchMedia } from './testMatchMedia'
 
-function mockMatchMedia(matches: boolean): void {
-  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
-    matches,
-    media: query,
-    onchange: null,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    addListener: vi.fn(),
-    removeListener: vi.fn(),
-    dispatchEvent: vi.fn(),
-  })) as unknown as typeof window.matchMedia
-}
 
 function entry(day: number): DailyHistoryEntry {
   return {
