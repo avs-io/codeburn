@@ -219,8 +219,20 @@ describe('Settings', () => {
     await user.click(screen.getByRole('button', { name: 'Plans' }))
     expect(await screen.findByText('Detected subscriptions')).toBeInTheDocument()
     expect(screen.getByText('Max 20x')).toBeInTheDocument()
-    expect(screen.getByText('Not connected: log in with the codex CLI')).toBeInTheDocument()
+    expect(screen.getByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
     expect(mocks.getQuota).toHaveBeenCalledWith(false)
+  })
+
+  it('expands the DetectedRow Connect affordance and forces a keychain refresh', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    await screen.findByText('Detected subscriptions')
+    await user.click(screen.getByRole('button', { name: 'Connect' }))
+    expect(screen.getByText('codex login')).toBeInTheDocument()
+    mocks.getQuota.mockClear()
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true))
   })
 
   it('offers only non-OAuth budget presets; Claude and Codex are excluded', async () => {

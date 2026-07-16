@@ -1,13 +1,12 @@
-import { execFile } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
-import { promisify } from 'node:util'
 
-import { fraction, quotaRequestSignal, readSecureFile, sanitizeError } from './security'
+import { fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, sanitizeError } from './security'
+import type { KeychainOutcome } from './security'
 import type { QuotaProvider, QuotaWindow } from './types'
 
-const execFileAsync = promisify(execFile)
 const ENDPOINT = 'https://api.anthropic.com/api/oauth/usage'
+const KEYCHAIN_SERVICE = 'Claude Code-credentials'
 
 type ClaudeCredential = { accessToken: string; expiresAt?: number; rateLimitTier?: string }
 export type ClaudeDeps = {
@@ -15,7 +14,7 @@ export type ClaudeDeps = {
   credentialPath: string
   readFile: typeof readSecureFile
   now: () => number
-  keychain?: () => Promise<string | null>
+  keychain?: () => Promise<KeychainOutcome>
 }
 
 const defaults: ClaudeDeps = {
@@ -45,18 +44,12 @@ async function credentialFromFile(deps: ClaudeDeps): Promise<ClaudeCredential | 
   return raw ? parseCredential(raw) : null
 }
 
-export async function readClaudeKeychain(): Promise<string | null> {
-  if (process.platform !== 'darwin') return null
-  const args = ['find-generic-password', '-s', 'Claude Code-credentials']
+export async function readClaudeKeychain(): Promise<KeychainOutcome> {
+  // Claude Code has written the item under both `$USER` (2.1.x) and the older
+  // hardcoded "agentseal" account; a user-scoped miss must fall through to the
+  // service-only lookup rather than reporting disconnected.
   const user = process.env.USER
-  const attempts = user ? [[...args, '-a', user, '-w'], [...args, '-w']] : [[...args, '-w']]
-  for (const argv of attempts) {
-    try {
-      const { stdout } = await execFileAsync('/usr/bin/security', argv, { timeout: 10_000, maxBuffer: 64 * 1024 })
-      if (stdout) return stdout
-    } catch { /* File fallback absence is a normal disconnected state. */ }
-  }
-  return null
+  return readKeychainPassword(KEYCHAIN_SERVICE, user ? [user, null] : [null])
 }
 
 function windowOf(label: string, value: unknown): QuotaWindow | null {
@@ -124,8 +117,9 @@ export async function fetchClaudeQuota(options: Partial<ClaudeDeps> & { signal?:
   try {
     let credential = await credentialFromFile(deps)
     if (!credential && options.allowKeychain && process.platform === 'darwin') {
-      const raw = await (deps.keychain ?? readClaudeKeychain)()
-      credential = raw ? parseCredential(raw) : null
+      const outcome = await (deps.keychain ?? readClaudeKeychain)()
+      if (outcome.status === 'accessDenied') return { quota: empty('accessDenied') }
+      credential = outcome.status === 'found' ? parseCredential(outcome.value) : null
     }
     if (!credential) return { quota: empty('disconnected') }
 

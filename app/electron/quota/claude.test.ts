@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { decodeClaudeUsage, fetchClaudeQuota } from './claude'
 
@@ -77,5 +77,39 @@ describe('Claude quota', () => {
     expect(result.quota).not.toHaveProperty('error')
     expect(logged).not.toMatch(/rawbearer|sk-ant-leak|sk-other|eyJabc|\0/)
     expect(logged).toContain('[REDACTED]')
+  })
+})
+
+describe('Claude keychain fallback', () => {
+  const originalPlatform = process.platform
+  beforeAll(() => Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true }))
+  afterAll(() => Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true }))
+
+  it('connects from the keychain when the credential file is absent', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ seven_day: { utilization: 4, resets_at: '2026-07-19T00:00:00Z' } }), { status: 200 }))
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), allowKeychain: true, keychain: vi.fn(async () => ({ status: 'found' as const, value: credential })) })
+    expect(result.quota.connection).toBe('connected')
+    expect(result.quota.planLabel).toBe('Max 20x')
+  })
+
+  it('surfaces accessDenied when macOS blocks the keychain read', async () => {
+    const fetchMock = vi.fn()
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), allowKeychain: true, keychain: vi.fn(async () => ({ status: 'accessDenied' as const })) })
+    expect(result.quota.connection).toBe('accessDenied')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('stays disconnected when the keychain has no matching item', async () => {
+    const fetchMock = vi.fn()
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), allowKeychain: true, keychain: vi.fn(async () => ({ status: 'notFound' as const })) })
+    expect(result.quota.connection).toBe('disconnected')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('never reads the keychain unless allowKeychain is set', async () => {
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: credential }))
+    const result = await fetchClaudeQuota({ fetch: vi.fn(), readFile: vi.fn(async () => null), keychain })
+    expect(result.quota.connection).toBe('disconnected')
+    expect(keychain).not.toHaveBeenCalled()
   })
 })

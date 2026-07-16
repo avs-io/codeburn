@@ -27,7 +27,7 @@ export type QuotaWindow = {
 
 export type QuotaProvider = {
   provider: 'claude' | 'codex'
-  connection: 'connected' | 'disconnected' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
+  connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
   planLabel: string | null

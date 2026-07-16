@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setActiveCurrency } from '../lib/format'
@@ -115,7 +115,7 @@ describe('Plans', () => {
     expect(screen.getByText('92% used · resets in 3d 14h')).toBeInTheDocument()
     expect(container.querySelector('[data-testid="quota-track-5-hour"] i')).toHaveClass('accent')
     expect(container.querySelector('[data-testid="quota-track-Weekly"] i')).toHaveClass('bad')
-    expect(screen.getByText('Connect Codex: log in with the Codex CLI')).toBeInTheDocument()
+    expect(screen.getByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
 
     expect(screen.getByRole('heading', { name: 'Budget plans' })).toBeInTheDocument()
     expect(screen.getByText('Cursor Pro')).toBeInTheDocument()
@@ -193,7 +193,7 @@ describe('Plans', () => {
 
     render(<Plans period="month" />)
 
-    expect(await screen.findByText('Connect Codex: log in with the Codex CLI')).toBeInTheDocument()
+    expect(await screen.findByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Budget plans' })).not.toBeInTheDocument()
   })
 
@@ -241,5 +241,33 @@ describe('Plans', () => {
 
     expect(await screen.findByText('Permission denied')).toBeInTheDocument()
     expect(screen.getByText('permission denied; grant Full Disk Access')).toHaveStyle({ color: 'var(--warn)' })
+  })
+
+  it('expands the Connect affordance and forces a keychain refresh from Refresh', async () => {
+    getPlans.mockResolvedValue(statusWithPlans)
+
+    render(<Plans period="30days" />)
+
+    const connect = await screen.findByRole('button', { name: 'Connect' })
+    expect(screen.getByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
+    fireEvent.click(connect)
+    expect(screen.getByText('codex login')).toBeInTheDocument()
+
+    getQuota.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(getQuota).toHaveBeenCalledWith(true))
+  })
+
+  it('renders the keychain access-denied state with recovery copy and a locked indicator', async () => {
+    getPlans.mockResolvedValue(statusWithPlans)
+    getQuota.mockResolvedValue([
+      { provider: 'claude', connection: 'accessDenied', primary: null, details: [], planLabel: null, footerLines: [] },
+      { provider: 'codex', connection: 'connected', primary: { label: 'Weekly', percent: 0.1, resetsAt: null }, details: [{ label: 'Weekly', percent: 0.1, resetsAt: null }], planLabel: 'Plus', footerLines: [] },
+    ])
+
+    render(<Plans period="30days" />)
+
+    expect(await screen.findByText('Keychain access needed: click Allow when macOS asks, then Refresh.')).toBeInTheDocument()
+    expect(screen.getByText('locked')).toBeInTheDocument()
   })
 })

@@ -208,7 +208,7 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('Need at least two models with usage in this range to compare.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '7', metaKey: true })
-    expect(await screen.findByText('Connect Claude: log in with the Claude CLI')).toBeInTheDocument()
+    expect(await screen.findByText('Not connected. Log in with the Claude CLI.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
     expect((await screen.findAllByText('Settings')).length).toBeGreaterThan(0)

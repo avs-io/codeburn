@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { decodeCodexUsage, fetchCodexQuota } from './codex'
 
@@ -64,5 +64,82 @@ describe('Codex quota', () => {
     expect(saved.OPENAI_API_KEY).toBe('preserve-me')
     expect(saved.tokens).toMatchObject({ access_token: 'new-access', refresh_token: 'new-refresh', id_token: 'new-id', account_id: 'acct_1' })
     expect((fetchMock.mock.calls[0]! as unknown as [string, RequestInit])[1].method).toBe('POST')
+  })
+})
+
+// The CodeBurn menubar caches its Codex OAuth as a Swift CredentialRecord blob.
+const menubarRecord = JSON.stringify({
+  accessToken: 'eyJmenubar.token.sig', refreshToken: 'mb-refresh', idToken: 'mb-id', accountId: 'acct_mb', lastRefresh: 1_234_567,
+})
+
+describe('Codex menubar keychain source', () => {
+  const originalPlatform = process.platform
+  beforeAll(() => Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true }))
+  afterAll(() => Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true }))
+
+  it('resolves quota from the menubar keychain when auth.json is absent, read-only', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ plan_type: 'pro', rate_limit: { primary_window: { used_percent: 10, reset_at: 1_800_000_000, limit_window_seconds: 18_000 } } }), { status: 200 }))
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: menubarRecord }))
+    const writeFile = vi.fn(async () => undefined)
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => null), writeFile, keychain, allowKeychain: true })
+    expect(result.quota.connection).toBe('connected')
+    expect(result.quota.planLabel).toBe('Pro')
+    const init = (fetchMock.mock.calls[0]! as unknown as [string, RequestInit])[1]
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer eyJmenubar.token.sig', 'ChatGPT-Account-Id': 'acct_mb' })
+    expect(writeFile).not.toHaveBeenCalled()
+    expect(keychain).toHaveBeenCalledWith('org.agentseal.codeburn.menubar.codex.oauth.v1')
+  })
+
+  it('re-reads the keychain once on a 401 and adopts a rotated token, never a refresh POST', async () => {
+    const rotated = JSON.stringify({ accessToken: 'eyJrotated.token.sig', refreshToken: 'mb-refresh2', idToken: 'mb-id', accountId: 'acct_mb' })
+    let reads = 0
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: reads++ === 0 ? menubarRecord : rotated }))
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => (init?.headers as Record<string, string>).Authorization === 'Bearer eyJrotated.token.sig'
+      ? new Response(JSON.stringify({ plan_type: 'pro', rate_limit: {} }), { status: 200 })
+      : new Response('', { status: 401 }))
+    const writeFile = vi.fn(async () => undefined)
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => null), writeFile, keychain, allowKeychain: true })
+    expect(result.quota.connection).toBe('connected')
+    expect(fetchMock.mock.calls.every(call => String(call[0]).includes('/wham/usage'))).toBe(true)
+    expect(keychain).toHaveBeenCalledTimes(2)
+    expect(writeFile).not.toHaveBeenCalled()
+  })
+
+  it('returns transientFailure on a keychain 401 with no rotation, never writing back', async () => {
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: menubarRecord }))
+    const fetchMock = vi.fn(async (_url: string) => new Response('', { status: 401 }))
+    const writeFile = vi.fn(async () => undefined)
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => null), writeFile, keychain, allowKeychain: true })
+    expect(result.quota.connection).toBe('transientFailure')
+    expect(fetchMock.mock.calls.every(call => String(call[0]).includes('/wham/usage'))).toBe(true)
+    expect(writeFile).not.toHaveBeenCalled()
+  })
+
+  it('surfaces accessDenied when the menubar keychain is blocked and no file exists', async () => {
+    const keychain = vi.fn(async () => ({ status: 'accessDenied' as const }))
+    const fetchMock = vi.fn()
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => null), keychain, allowKeychain: true })
+    expect(result.quota.connection).toBe('accessDenied')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('prefers the menubar keychain over ~/.codex/auth.json and keeps it read-only', async () => {
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: menubarRecord }))
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ plan_type: 'plus', rate_limit: {} }), { status: 200 }))
+    const writeFile = vi.fn(async () => undefined)
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => JSON.stringify(auth)), writeFile, keychain, allowKeychain: true, now: () => now })
+    expect(result.quota.connection).toBe('connected')
+    const init = (fetchMock.mock.calls[0]! as unknown as [string, RequestInit])[1]
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer eyJmenubar.token.sig' })
+    expect(writeFile).not.toHaveBeenCalled()
+  })
+
+  it('falls through to ~/.codex/auth.json when the keychain has no menubar item', async () => {
+    const keychain = vi.fn(async () => ({ status: 'notFound' as const }))
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ plan_type: 'plus', rate_limit: {} }), { status: 200 }))
+    const result = await fetchCodexQuota({ fetch: fetchMock as unknown as typeof fetch, readFile: vi.fn(async () => JSON.stringify(auth)), keychain, allowKeychain: true, now: () => now })
+    expect(result.quota.connection).toBe('connected')
+    const init = (fetchMock.mock.calls[0]! as unknown as [string, RequestInit])[1]
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer eyJaccess.token.sig' })
   })
 })

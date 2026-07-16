@@ -1,13 +1,19 @@
 import os from 'node:os'
 import path from 'node:path'
 
-import { atomicWriteSecureFile, fraction, quotaRequestSignal, readSecureFile, sanitizeError } from './security'
+import { atomicWriteSecureFile, fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, sanitizeError } from './security'
+import type { KeychainOutcome } from './security'
 import type { QuotaProvider, QuotaWindow } from './types'
 
 const USAGE_ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage'
 const TOKEN_ENDPOINT = 'https://auth.openai.com/oauth/token'
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const EIGHT_DAYS = 8 * 24 * 60 * 60_000
+// The CodeBurn menubar caches its ChatGPT-mode Codex OAuth here as a
+// `CredentialRecord` JSON blob (accessToken/refreshToken/idToken/accountId/…),
+// account "default". Same brand, same machine, already consented — preferred
+// over any OpenAI-owned storage.
+const MENUBAR_KEYCHAIN_SERVICE = 'org.agentseal.codeburn.menubar.codex.oauth.v1'
 
 type AuthDoc = Record<string, any> & {
   auth_mode?: string
@@ -18,26 +24,92 @@ type AuthDoc = Record<string, any> & {
 export type CodexDeps = {
   fetch: typeof fetch
   authPath: string
+  openaiAuthPath: string
   readFile: typeof readSecureFile
   writeFile: typeof atomicWriteSecureFile
+  keychain: (service: string) => Promise<KeychainOutcome>
   now: () => number
 }
 
 const defaults: CodexDeps = {
   fetch: globalThis.fetch,
   authPath: path.join(os.homedir(), '.codex', 'auth.json'),
+  openaiAuthPath: path.join(os.homedir(), 'Library', 'Application Support', 'com.openai.codex', 'auth.json'),
   readFile: readSecureFile,
   writeFile: atomicWriteSecureFile,
+  keychain: service => readKeychainPassword(service, ['default', null]),
   now: Date.now,
+}
+
+/** A resolved Codex credential plus how much of its lifecycle we own. Only the
+ * Codex CLI's own auth.json is `writable` (we may rotate + write it back); the
+ * menubar keychain and OpenAI app-support copies are read-only. */
+type CodexSource = {
+  name: 'menubarKeychain' | 'authFile' | 'openaiAppSupport'
+  auth: AuthDoc
+  writable: boolean
+  reread: () => Promise<AuthDoc | null>
 }
 
 function empty(connection: QuotaProvider['connection']): QuotaProvider {
   return { provider: 'codex', connection, primary: null, details: [], planLabel: null, footerLines: [] }
 }
 
-async function readAuth(deps: CodexDeps): Promise<AuthDoc | null> {
-  const raw = await deps.readFile(deps.authPath, 64 * 1024)
+async function readAuth(deps: CodexDeps, filePath: string = deps.authPath): Promise<AuthDoc | null> {
+  const raw = await deps.readFile(filePath, 64 * 1024)
   return raw ? JSON.parse(raw) as AuthDoc : null
+}
+
+// The menubar stores a Swift `CredentialRecord` (camelCase, Date fields as
+// numbers) rather than the CLI's snake_case auth.json. Normalize to AuthDoc and
+// mark it chatgpt-mode (the menubar only ever caches ChatGPT subscriptions).
+function authFromMenubarRecord(raw: string): AuthDoc | null {
+  let record: Record<string, unknown>
+  try { record = JSON.parse(raw) as Record<string, unknown> } catch { return null }
+  const access = typeof record.accessToken === 'string' ? record.accessToken : ''
+  if (!access) return null
+  return {
+    auth_mode: 'chatgpt',
+    tokens: {
+      access_token: access,
+      refresh_token: typeof record.refreshToken === 'string' ? record.refreshToken : undefined,
+      id_token: typeof record.idToken === 'string' ? record.idToken : undefined,
+      account_id: typeof record.accountId === 'string' ? record.accountId : undefined,
+    },
+  }
+}
+
+async function discoverSource(deps: CodexDeps, allowKeychain: boolean): Promise<CodexSource | 'accessDenied' | null> {
+  let denied = false
+  // (a) CodeBurn menubar's own cached Codex OAuth. Read-only: the menubar owns
+  // rotation, so we never write it back and never proactively refresh it.
+  if (allowKeychain && process.platform === 'darwin') {
+    const outcome = await deps.keychain(MENUBAR_KEYCHAIN_SERVICE)
+    if (outcome.status === 'accessDenied') denied = true
+    else if (outcome.status === 'found') {
+      const auth = authFromMenubarRecord(outcome.value)
+      if (auth) {
+        return {
+          name: 'menubarKeychain', auth, writable: false,
+          reread: async () => {
+            const next = await deps.keychain(MENUBAR_KEYCHAIN_SERVICE)
+            return next.status === 'found' ? authFromMenubarRecord(next.value) : null
+          },
+        }
+      }
+    }
+  }
+  // (b) The Codex CLI's own ~/.codex/auth.json. We own rotation + write-back.
+  const fileAuth = await readAuth(deps)
+  if (fileAuth) return { name: 'authFile', auth: fileAuth, writable: true, reread: () => readAuth(deps) }
+  // (c) com.openai.codex App Support, only if it holds a plaintext auth JSON
+  // with a usable token. Tokens encrypted via "Codex Safe Storage" have no
+  // plaintext access_token here, so they fall through — we never decrypt.
+  const openaiAuth = await readAuth(deps, deps.openaiAuthPath).catch(() => null)
+  if (openaiAuth?.tokens?.access_token) {
+    return { name: 'openaiAppSupport', auth: openaiAuth, writable: false, reread: () => readAuth(deps, deps.openaiAuthPath).catch(() => null) }
+  }
+  return denied ? 'accessDenied' : null
 }
 
 function labelForSeconds(value: unknown): string {
@@ -136,28 +208,39 @@ async function usage(auth: AuthDoc, deps: CodexDeps, signal?: AbortSignal): Prom
 
 export type CodexResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 
-export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: AbortSignal } = {}): Promise<CodexResult> {
+export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: AbortSignal; allowKeychain?: boolean } = {}): Promise<CodexResult> {
   const deps = { ...defaults, ...options }
   try {
-    let auth = await readAuth(deps)
-    if (!auth) return { quota: empty('disconnected') }
+    const discovered = await discoverSource(deps, Boolean(options.allowKeychain))
+    if (discovered === 'accessDenied') return { quota: empty('accessDenied') }
+    if (!discovered) return { quota: empty('disconnected') }
+    const source = discovered
+    let auth = source.auth
     if (auth.auth_mode !== 'chatgpt') return { quota: empty('terminalFailure') }
     if (!auth.tokens?.access_token) return { quota: empty('disconnected') }
 
-    const refreshedAt = typeof auth.last_refresh === 'string' ? Date.parse(auth.last_refresh) : NaN
-    if (!Number.isFinite(refreshedAt) || deps.now() - refreshedAt > EIGHT_DAYS) {
-      const next = await refresh(auth, deps, options.signal)
-      if (next) auth = next
+    // Proactive staleness refresh only for the source whose rotation we own.
+    if (source.writable) {
+      const refreshedAt = typeof auth.last_refresh === 'string' ? Date.parse(auth.last_refresh) : NaN
+      if (!Number.isFinite(refreshedAt) || deps.now() - refreshedAt > EIGHT_DAYS) {
+        const next = await refresh(auth, deps, options.signal)
+        if (next) auth = next
+      }
     }
     let response = await usage(auth, deps, options.signal)
     if (!response) return { quota: empty('disconnected') }
     if (response.status === 401) {
-      const reread = await readAuth(deps)
-      if (reread?.tokens?.access_token && reread.tokens.access_token !== auth.tokens?.access_token) auth = reread
-      else {
+      const reread = await source.reread()
+      if (reread?.tokens?.access_token && reread.tokens.access_token !== auth.tokens?.access_token) {
+        auth = reread
+      } else if (source.writable) {
         const next = await refresh(reread ?? auth, deps, options.signal)
         if (!next) return { quota: empty('transientFailure') }
         auth = next
+      } else {
+        // Read-only source: the owner (menubar) rotates tokens on its own
+        // cadence, so re-read once and otherwise wait for the next poll.
+        return { quota: empty('transientFailure') }
       }
       response = await usage(auth, deps, options.signal)
       if (!response) return { quota: empty('transientFailure') }

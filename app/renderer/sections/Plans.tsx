@@ -1,6 +1,7 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 
 import { CliErrorPanel } from '../components/CliErrorPanel'
+import { ConnectAffordance } from '../components/ConnectAffordance'
 import { Panel } from '../components/Panel'
 import { SectionSkeleton } from '../components/Skeleton'
 import type { Section } from '../components/Sidebar'
@@ -62,14 +63,18 @@ function manualPlanSummaries(status: StatusJson): JsonPlanSummary[] {
 }
 
 export function Plans({ period, refreshToken = 0, onNavigate }: { period: Period; refreshToken?: number; onNavigate?: (section: Section, pane?: SettingsPane) => void }) {
-  // Force a fresh fetch (bypassing QuotaService's 2-min cache) only when the
-  // user hits refresh; the steady 30s poll keeps serving cached quota.
-  const lastForcedToken = useRef(refreshToken)
+  // Force a fresh fetch (bypassing QuotaService's 2-min cache, and its keychain
+  // guard) when the user hits ⌘R or clicks Refresh in the Connect affordance;
+  // the steady 30s poll keeps serving cached quota.
+  const [reconnectNonce, setReconnectNonce] = useState(0)
+  const lastForced = useRef(`${refreshToken}:${reconnectNonce}`)
   const quota = usePolled<QuotaProvider[]>(() => {
-    const force = refreshToken !== lastForcedToken.current
-    lastForcedToken.current = refreshToken
+    const key = `${refreshToken}:${reconnectNonce}`
+    const force = key !== lastForced.current
+    lastForced.current = key
     return codeburn.getQuota(force)
-  }, [refreshToken])
+  }, [refreshToken, reconnectNonce])
+  const reconnect = () => setReconnectNonce(value => value + 1)
   const budgetReport = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken])
   const manualPlans = budgetReport.data ? manualPlanSummaries(budgetReport.data) : []
 
@@ -84,14 +89,14 @@ export function Plans({ period, refreshToken = 0, onNavigate }: { period: Period
       </div>
       <div className={motionClass('body', 'section-fade')}>
         {budgetReport.data && budgetReport.error && <StaleBanner error={budgetReport.error} />}
-        {renderQuota(quota.data, quota.error)}
+        {renderQuota(quota.data, quota.error, reconnect)}
         {renderBudgetPlans(budgetReport.data, budgetReport.error, manualPlans)}
       </div>
     </>
   )
 }
 
-function renderQuota(data: QuotaProvider[] | null, error: ReturnType<typeof usePolled<QuotaProvider[]>>['error']) {
+function renderQuota(data: QuotaProvider[] | null, error: ReturnType<typeof usePolled<QuotaProvider[]>>['error'], onReconnect: () => void) {
   if (!data) {
     if (error) {
       return (
@@ -111,7 +116,7 @@ function renderQuota(data: QuotaProvider[] | null, error: ReturnType<typeof useP
     )
   }
 
-  return data.map(provider => <QuotaPanel key={provider.provider} quota={provider} />)
+  return data.map(provider => <QuotaPanel key={provider.provider} quota={provider} onReconnect={onReconnect} />)
 }
 
 function renderBudgetPlans(data: StatusJson | null, error: ReturnType<typeof usePolled<StatusJson>>['error'], plans: JsonPlanSummary[]) {
@@ -133,7 +138,7 @@ function renderBudgetPlans(data: StatusJson | null, error: ReturnType<typeof use
   )
 }
 
-function QuotaPanel({ quota }: { quota: QuotaProvider }) {
+function QuotaPanel({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
   const providerName = quota.provider === 'claude' ? 'Claude' : 'Codex'
   return (
     <Panel
@@ -141,19 +146,22 @@ function QuotaPanel({ quota }: { quota: QuotaProvider }) {
       title={<span className="quota-title">{providerName}{quota.planLabel ? <small>{quota.planLabel}</small> : null}</span>}
       right={<ConnectionIndicator connection={quota.connection} />}
     >
-      <QuotaContent quota={quota} providerName={providerName} />
+      <QuotaContent quota={quota} onReconnect={onReconnect} />
     </Panel>
   )
 }
 
 function ConnectionIndicator({ connection }: { connection: QuotaProvider['connection'] }) {
-  const label = connection === 'transientFailure' ? 'waiting' : connection === 'terminalFailure' ? 'error' : connection
+  const label = connection === 'transientFailure' ? 'waiting'
+    : connection === 'terminalFailure' ? 'error'
+    : connection === 'accessDenied' ? 'locked'
+    : connection
   return <span className={`quota-connection quota-connection-${connection}`}><i />{label}</span>
 }
 
-function QuotaContent({ quota, providerName }: { quota: QuotaProvider; providerName: string }) {
-  if (quota.connection === 'disconnected') {
-    return <p className="quota-connection-note">Connect {providerName}: log in with the {providerName} CLI</p>
+function QuotaContent({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
+  if (quota.connection === 'disconnected' || quota.connection === 'accessDenied') {
+    return <ConnectAffordance provider={quota.provider} connection={quota.connection} onRefresh={onReconnect} />
   }
   if (quota.connection === 'loading') return <p className="quota-connection-note">Loading quota…</p>
   if (quota.connection === 'stale' || quota.connection === 'transientFailure') {

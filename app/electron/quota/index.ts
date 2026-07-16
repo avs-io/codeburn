@@ -13,7 +13,7 @@ type Blocked = Partial<Record<ProviderName, string>>
 type FetchResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 type QuotaDeps = {
   claude: (options: { signal: AbortSignal; allowKeychain: boolean }) => Promise<FetchResult>
-  codex: (options: { signal: AbortSignal }) => Promise<FetchResult>
+  codex: (options: { signal: AbortSignal; allowKeychain: boolean }) => Promise<FetchResult>
   statePath: string
   readFile: typeof readSecureFile
   writeFile: typeof atomicWriteSecureFile
@@ -54,11 +54,11 @@ export class QuotaService {
     this.cache = null
   }
 
-  async getQuota(options: { force?: boolean; allowClaudeKeychain?: boolean } = {}): Promise<QuotaProvider[]> {
+  async getQuota(options: { force?: boolean; allowKeychain?: boolean } = {}): Promise<QuotaProvider[]> {
     if (options.force) this.invalidate()
     if (!options.force && this.cache && this.deps.now() - this.cache.at < this.deps.refreshMs) return this.cache.value
     if (this.flight) return this.flight
-    this.flight = this.fetchAll(Boolean(options.allowClaudeKeychain)).finally(() => { this.flight = null })
+    this.flight = this.fetchAll(Boolean(options.allowKeychain)).finally(() => { this.flight = null })
     return this.flight
   }
 
@@ -77,15 +77,20 @@ export class QuotaService {
     catch (error) { console.warn(`Quota backoff state not saved: ${sanitizeError(error)}`) }
   }
 
-  private async fetchAll(allowClaudeKeychain: boolean): Promise<QuotaProvider[]> {
+  private async fetchAll(allowKeychain: boolean): Promise<QuotaProvider[]> {
     const startingGenerations = { ...this.generations }
     const prior = this.cache?.value ?? []
     const blocked = await this.readBlocked()
     const run = async (provider: ProviderName): Promise<QuotaProvider> => {
       const retainOnFailure = (next: QuotaProvider): QuotaProvider => {
-        if (next.connection !== 'transientFailure') return next
         const previous = prior.find(item => item.provider === provider)
-        return previous?.connection === 'connected' ? { ...previous, connection: 'transientFailure' } : next
+        if (previous?.connection !== 'connected') return next
+        // Keychain-only credentials are invisible to a background (keychain-less)
+        // poll; keep showing the live connection rather than flapping to
+        // disconnected. A forced refresh re-reads the keychain and reveals truth.
+        if (!allowKeychain && (next.connection === 'disconnected' || next.connection === 'accessDenied')) return previous
+        if (next.connection === 'transientFailure') return { ...previous, connection: 'transientFailure' }
+        return next
       }
       const until = blocked[provider] ? Date.parse(blocked[provider]!) : NaN
       if (Number.isFinite(until) && until > this.deps.now()) return retainOnFailure(unavailable(provider, 'transientFailure'))
@@ -93,8 +98,8 @@ export class QuotaService {
       const controller = new AbortController()
       this.controllers[provider] = controller
       const result = provider === 'claude'
-        ? await this.deps.claude({ signal: controller.signal, allowKeychain: allowClaudeKeychain })
-        : await this.deps.codex({ signal: controller.signal })
+        ? await this.deps.claude({ signal: controller.signal, allowKeychain })
+        : await this.deps.codex({ signal: controller.signal, allowKeychain })
       if (generation !== this.generations[provider] || controller.signal.aborted) return unavailable(provider, 'disconnected')
       if (result.retryAfterSeconds !== undefined) {
         blocked[provider] = new Date(this.deps.now() + result.retryAfterSeconds * 1000).toISOString()
@@ -115,4 +120,9 @@ export class QuotaService {
 }
 
 export const quotaService = new QuotaService()
-export const getQuota = (options: { force?: boolean } = {}): Promise<QuotaProvider[]> => quotaService.getQuota(options)
+// Keychain reads can raise a one-time macOS permission dialog, so only attempt
+// them on a user-initiated forced refresh (the Connect / Refresh affordance).
+// Background polls skip the keychain and lean on retainOnFailure to hold a
+// live connection steady between forced refreshes.
+export const getQuota = (options: { force?: boolean } = {}): Promise<QuotaProvider[]> =>
+  quotaService.getQuota({ force: options.force, allowKeychain: Boolean(options.force) })

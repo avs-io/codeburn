@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { Hint } from '../components/Hint'
 import { CliErrorText, cliErrorDisplay } from '../components/CliErrorPanel'
+import { ConnectAffordance } from '../components/ConnectAffordance'
 import { Dropdown } from '../components/Dropdown'
 import { Panel } from '../components/Panel'
 import { ProviderLogo } from '../components/ProviderLogo'
@@ -299,22 +300,29 @@ function planSummaries(status: StatusJson): JsonPlanSummary[] {
   return status.plan ? [status.plan] : []
 }
 
-function DetectedRow({ quota }: { quota: QuotaProvider }) {
+function DetectedRow({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
   const name = quota.provider === 'claude' ? 'Claude' : 'Codex'
   return <div className="about-row">
     <ProviderLogo provider={quota.provider} />
     <span className="tx">{name}</span>
-    {quota.connection === 'disconnected'
-      ? <span className="r set-status">Not connected: log in with the {quota.provider} CLI</span>
+    {quota.connection === 'disconnected' || quota.connection === 'accessDenied'
+      ? <div className="r set-status"><ConnectAffordance provider={quota.provider} connection={quota.connection} onRefresh={onReconnect} /></div>
       : <span className="r set-status"><span className="set-dot ok" />{quota.planLabel ?? 'Connected'}</span>}
   </div>
 }
 
 function PlansPane({ period, refreshToken, onNavigate }: { period: Period; refreshToken: number; onNavigate?: (section: Section) => void }) {
   const [nonce, setNonce] = useState(0)
-  // Match Plans.tsx: steady poll serves cached quota (force=false). The detected
-  // list is read-only, so no manual force is needed here.
-  const quota = usePolled<QuotaProvider[]>(() => codeburn.getQuota(false), [refreshToken])
+  // Steady poll serves cached quota (force=false); the Connect affordance's
+  // Refresh forces a keychain-allowed fetch via the same path as Plans.tsx.
+  const [reconnectNonce, setReconnectNonce] = useState(0)
+  const lastForced = useRef(`${refreshToken}:${reconnectNonce}`)
+  const quota = usePolled<QuotaProvider[]>(() => {
+    const key = `${refreshToken}:${reconnectNonce}`
+    const force = key !== lastForced.current
+    lastForced.current = key
+    return codeburn.getQuota(force)
+  }, [refreshToken, reconnectNonce])
   const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce])
   const [presetId, setPresetId] = useState(MANUAL_PLAN_PRESETS[0]!.id)
   const configured = plans.data ? planSummaries(plans.data) : []
@@ -336,7 +344,7 @@ function PlansPane({ period, refreshToken, onNavigate }: { period: Period; refre
     <div className="card">
       <div className="about-sec set-last-sec">
         <div className="about-sec-h">Detected subscriptions</div>
-        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : !quota.data ? <p className="set-cap">Detecting subscriptions…</p> : quota.data.length === 0 ? <p className="set-cap">No detectable subscriptions.</p> : quota.data.map(provider => <DetectedRow key={provider.provider} quota={provider} />)}
+        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : !quota.data ? <p className="set-cap">Detecting subscriptions…</p> : quota.data.length === 0 ? <p className="set-cap">No detectable subscriptions.</p> : quota.data.map(provider => <DetectedRow key={provider.provider} quota={provider} onReconnect={() => setReconnectNonce(value => value + 1)} />)}
       </div>
     </div>
     <div className="card">
