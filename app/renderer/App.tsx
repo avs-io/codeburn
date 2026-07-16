@@ -126,7 +126,12 @@ export function App() {
     // providers map keys (lowercased display names) for older CLIs.
     const found = details
       ? details.filter(entry => entry.cost > 0).map(entry => ({ id: entry.id, label: entry.label }))
-      : Object.entries(overview.data.current.providers).filter(([, value]) => value > 0).map(([key]) => ({ id: key, label: providerName(key) }))
+      : Object.entries(overview.data.current.providers)
+          // Fallback map keys are lowercased display names; ones with spaces
+          // ("grok build") cannot round-trip as --provider, so exclude them
+          // rather than offer a filter that is guaranteed to error.
+          .filter(([key, value]) => value > 0 && /^[a-z0-9-]+$/.test(key))
+          .map(([key]) => ({ id: key, label: providerName(key) }))
     setDetectedProviders(current => {
       const next = [...current]
       for (const item of found) if (!next.some(entry => entry.id === item.id)) next.push(item)
