@@ -1,7 +1,7 @@
 import { useEffect, type MouseEvent, type ReactNode } from 'react'
 
 import { version } from '../../package.json'
-import flameLogo from '../assets/flame.png'
+import { FlameMark } from './FlameMark'
 import { codeburn } from '../lib/ipc'
 
 export type SocialLink = {
@@ -39,7 +39,7 @@ export function AboutModal({ socials, onClose }: { socials: SocialLink[]; onClos
         <button className="about-modal-close" type="button" aria-label="Close About" onClick={onClose}>×</button>
         <div className="about-modal-grid">
           <div className="about-modal-hero">
-            <img className="about-modal-logo" src={flameLogo} alt="" />
+            <span className="about-modal-logo" aria-hidden="true"><FlameMark size={52} /></span>
             <div className="about-modal-name" id="about-modal-title">CodeBurn</div>
             <div className="about-modal-version">v{version}</div>
             <div className="about-modal-tagline">Know where every token goes, across every AI coding tool.</div>
