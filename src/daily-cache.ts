@@ -5,7 +5,13 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 11: kiro cost accounting changed (metered credits pass through
+// Bumped to 12: CodeWhale support adds historical usage that earlier rollups
+// did not contain. Both the CodeWhale branch and the kiro credit-pricing
+// change (below) claimed v11 independently, so v12 is the first version that
+// contains both; raising MIN_SUPPORTED_VERSION forces the one-time
+// re-hydration for days finalized at either v11.
+//
+// v11: kiro cost accounting changed (metered credits pass through
 // the session cache instead of being re-priced from estimated tokens), so
 // days finalized at v10 carry token-estimated kiro costs that were off by up
 // to 16× per model. Raising MIN_SUPPORTED_VERSION forces the one-time full
@@ -20,8 +26,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 11
-const MIN_SUPPORTED_VERSION = 11
+export const DAILY_CACHE_VERSION = 12
+const MIN_SUPPORTED_VERSION = 12
 const DAILY_CACHE_FILENAME = 'daily-cache.json'
 
 export type DailyEntry = {
