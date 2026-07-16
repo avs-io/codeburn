@@ -5,6 +5,22 @@ Electron desktop app **without a paid Apple Developer account**. There is no
 CI automation for this yet (unlike the CLI and menubar release processes in
 `../RELEASING.md`) — packaging is run by hand on a maintainer's machine.
 
+## Prerequisite on the target machine: the codeburn CLI
+
+The desktop app does not bundle the CLI — every screen gets its data by
+spawning `codeburn`, resolved from the persisted path file, Homebrew/node
+version-manager locations, or `PATH` (`electron/cli.ts`). On a machine
+without it, the app launches into its "CLI not found" state until the user
+runs:
+
+```sh
+npm install -g codeburn
+```
+
+Bundling `dist/cli.js` into the app (`extraResources` + spawning it with
+Electron's own binary via `ELECTRON_RUN_AS_NODE`) is the known path to a
+zero-dependency install; not implemented yet.
+
 ## Build
 
 ```sh
