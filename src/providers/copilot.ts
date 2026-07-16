@@ -189,6 +189,18 @@ type AssistantMessageData = {
   toolRequests?: ToolRequest[]
 }
 
+type SessionShutdownData = {
+  modelMetrics: Record<string, {
+    usage: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+      reasoningTokens: number
+    }
+  }>
+}
+
 type SubagentSelectedData = {
   agentName: string
   agentDisplayName?: string
@@ -200,6 +212,7 @@ type CopilotEvent =
   | { type: 'session.model_change'; data: ModelChangeData; timestamp?: string }
   | { type: 'user.message'; data: UserMessageData; timestamp?: string }
   | { type: 'assistant.message'; data: AssistantMessageData; timestamp?: string }
+  | { type: 'session.shutdown'; data: SessionShutdownData; timestamp?: string }
   | { type: 'subagent.selected'; data: SubagentSelectedData; timestamp?: string }
 
 type ChatJournalPathSegment = string | number
@@ -815,6 +828,46 @@ function createJsonlParser(
             userMessage: pendingUserMessage,
           }
           pendingUserMessage = ''
+        }
+
+        if (event.type === 'session.shutdown') {
+          if (isTranscript) continue
+
+          for (const [model, metrics] of Object.entries(event.data.modelMetrics)) {
+            const { usage } = metrics
+            const inputTokens = Math.max(0, usage.inputTokens - usage.cacheReadTokens - usage.cacheWriteTokens)
+            const costUSD = calculateCost(
+              model,
+              inputTokens,
+              usage.reasoningTokens,
+              usage.cacheWriteTokens,
+              usage.cacheReadTokens,
+              0,
+            )
+            const dedupKey = `copilot:shutdown:${sessionId}:${model}`
+            if (seenKeys.has(dedupKey)) continue
+            seenKeys.add(dedupKey)
+
+            yield {
+              provider: 'copilot',
+              sessionId,
+              model,
+              inputTokens,
+              outputTokens: 0,
+              cacheCreationInputTokens: usage.cacheWriteTokens,
+              cacheReadInputTokens: usage.cacheReadTokens,
+              cachedInputTokens: usage.cacheReadTokens,
+              reasoningTokens: usage.reasoningTokens,
+              webSearchRequests: 0,
+              costUSD,
+              tools: [],
+              bashCommands: [],
+              timestamp: event.timestamp ?? '',
+              speed: 'standard' as const,
+              deduplicationKey: dedupKey,
+              userMessage: '',
+            }
+          }
         }
       }
     },
