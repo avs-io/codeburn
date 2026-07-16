@@ -10,7 +10,10 @@
     "build": "npm run build:electron && npm run build:renderer",
     "dev": "npm run build:electron && concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"wait-on tcp:127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "package": "npm run build && electron-builder --mac",
+    "package:arm64": "npm run build && electron-builder --mac --arm64",
+    "package:x64": "npm run build && electron-builder --mac --x64"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
@@ -30,10 +33,35 @@
     "concurrently": "^10.0.3",
     "cross-env": "^10.1.0",
     "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vite": "^6.4.3",
     "vitest": "^3.2.7",
     "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "org.agentseal.codeburn-desktop",
+    "productName": "CodeBurn",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/electron/**/*",
+      "dist/renderer/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] },
+        { "target": "zip", "arch": ["arm64", "x64"] }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "dmg": {}
   }
 }

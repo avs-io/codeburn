@@ -53,12 +53,16 @@ Supported M1 periods are `today`, `week`, `30days`, `month`, and `all`. Provider
 - Plans: plan pacing from `status --format json`.
 - Settings: device identity, nearby scan results, paired-device usage, and M2 visual affordances.
 
+## Packaging
+
+`npm run package` produces an ad-hoc-signed macOS `.dmg`/`.zip` (arm64 and x64) via `electron-builder`, no paid Apple Developer account required. See `DISTRIBUTION.md` for build instructions, artifact locations, and the Gatekeeper first-open story.
+
 ## M2 Backlog
 
 - Deliver a self-contained app that bundles the CodeBurn engine and auto-updates itself with Electron `autoUpdater`.
 - Ship end-user installs via `.dmg` and `install.sh`; end users should not need npm.
 - Keep npm as a separate CLI-user channel at the same version as the desktop app.
-- Add `electron-builder` packaging plus macOS code signing and notarization.
+- Add macOS code signing with a paid Developer ID and notarization (ad-hoc packaging exists today; see `DISTRIBUTION.md`).
 - Add a `codeburn desktop` launcher subcommand.
 - Implement in-app pairing, approve, pull, and visibility mutations currently shown as M2 affordances.
 - Build the Models Compare sheet.
