@@ -529,10 +529,19 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .ov-coach-tx { font-size: 12.5px; color: var(--mut); flex: 1; line-height: 1.45; }
 .ov-coach-tx .num { color: var(--ink); font-weight: 600; }
 .ov-coach-cta { white-space: nowrap; color: var(--accent-text); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent-text) 42%, transparent); text-underline-offset: 2px; font-size: var(--fs-meta); font-weight: var(--fw-medium); border: 0; background: none; cursor: pointer; }
-.ov-anomalies { display: flex; align-items: flex-start; gap: 14px; padding: 9px 13px; }
-.ov-anomaly-label { flex: 0 0 auto; color: var(--mut2); font-size: 10px; font-weight: 620; letter-spacing: .06em; line-height: 1.5; text-transform: uppercase; }
-.ov-anomaly-list { display: flex; min-width: 0; flex: 1; flex-wrap: wrap; gap: 5px 20px; color: var(--mut); font-size: 11.5px; line-height: 1.35; }
-.ov-anomaly-list strong { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+.ov-signals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; align-items: stretch; }
+.ov-signal-group { min-width: 0; padding: 12px 16px; }
+.ov-signal-group + .ov-signal-group { border-left: 1px solid var(--line2); }
+.ov-signal-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.ov-signal-head svg { width: 13px; height: 13px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ov-signal-head span { font-size: var(--fs-label); font-weight: var(--fw-strong); letter-spacing: .04em; text-transform: uppercase; }
+.ov-signal-group.wins .ov-signal-head { color: var(--ok); }
+.ov-signal-group.improvements .ov-signal-head { color: var(--accent-text); }
+.ov-signal-group.risks .ov-signal-head { color: var(--warn); }
+.ov-signal-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.ov-signal { display: flex; align-items: baseline; gap: 8px; font-size: var(--fs-meta); color: var(--mut); line-height: 1.35; }
+.ov-signal > span:first-child { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ov-signal-trailing { flex: 0 0 auto; color: var(--ink); font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .ov-stats3 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; align-items: stretch; }
 .ov-stats3 > * { min-width: 0; padding: 14px 16px; }
 .ov-stats3 > * + * { border-left: 1px solid var(--line2); }
@@ -652,13 +661,14 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
   .ov-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .ov-kpi:nth-child(3) { border-right: 0; }
   .ov-kpi:nth-child(-n+3) { border-bottom: 1px solid var(--line2); }
-  .ov-insight-band, .ov-analytics-row, .ov-body-grid, .ov-hero-split, .ov-stats3 { grid-template-columns: 1fr; }
+  .ov-insight-band, .ov-analytics-row, .ov-body-grid, .ov-hero-split, .ov-stats3, .ov-signals { grid-template-columns: 1fr; }
   .ov-main-column, .ov-side-column { display: contents; }
   .ov-models-widget { order: 1; }
   .ov-activities-widget { order: 2; }
   .ov-chart-widget { order: 3; }
   .ov-sessions-widget { order: 4; }
   .ov-hero-split > * + *, .ov-stats3 > * + * { border-top: 1px solid var(--line2); border-left: 0; }
+  .ov-signal-group + .ov-signal-group { border-top: 1px solid var(--line2); border-left: 0; }
 }
 @media (max-width: 600px) {
   .ov-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -666,7 +676,6 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
   .ov-kpi:nth-child(even) { border-right: 0; }
   .ov-kpi:nth-child(-n+4) { border-bottom: 1px solid var(--line2); }
   .ov-coach { align-items: flex-start; }
-  .ov-anomalies { flex-direction: column; gap: 5px; }
 }
 
 /* Sessions */

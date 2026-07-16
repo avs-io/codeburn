@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Polled } from '../hooks/usePolled'
 import { setActiveCurrency } from '../lib/format'
-import type { ActReportJson, MenubarPayload, YieldJsonReport } from '../lib/types'
-import { Overview, OverviewContent, localDateKey } from './Overview'
+import type { ActReportJson, DailyHistoryEntry, MenubarPayload, YieldJsonReport } from '../lib/types'
+import { Overview, OverviewContent, deriveSignals, localDateKey } from './Overview'
 
 function polled(data: MenubarPayload): Polled<MenubarPayload> {
   return { data, error: null, loading: false, lastSuccessAt: Date.now(), refresh: vi.fn() }
@@ -147,6 +147,30 @@ function makePayload(now: Date): MenubarPayload {
   }
 }
 
+function mkDay(date: string, cost: number): DailyHistoryEntry {
+  return { date, cost, savingsUSD: 0, calls: 10, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, topModels: [] }
+}
+
+/** A payload with an explicit history + current overrides for deriveSignals tests. */
+function signalsPayload(now: Date, over: {
+  current?: Partial<MenubarPayload['current']>
+  daily?: DailyHistoryEntry[]
+  optimize?: MenubarPayload['optimize']
+}): MenubarPayload {
+  const base = makePayload(now)
+  return {
+    ...base,
+    current: { ...base.current, ...over.current },
+    optimize: over.optimize ?? { findingCount: 0, savingsUSD: 0, topFindings: [] },
+    history: { daily: over.daily ?? [] },
+  }
+}
+
+/** N consecutive days ending today; `cost(i)` sets each day's spend (i = oldest→0). */
+function consecutiveDays(now: Date, count: number, cost: (index: number) => number): DailyHistoryEntry[] {
+  return Array.from({ length: count }, (_, i) => mkDay(localDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (count - 1 - i))), cost(i)))
+}
+
 describe('Overview', () => {
   beforeEach(() => {
     setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
@@ -253,7 +277,7 @@ describe('Overview', () => {
     expect(screen.queryByText('Nearest limit')).not.toBeInTheDocument()
   })
 
-  it('renders efficiency, cost-per-outcome, and real anomaly widgets', async () => {
+  it('renders efficiency, cost-per-outcome, and the weekday-spike risk signal', async () => {
     const now = new Date()
     const payload = makePayload(now)
     const today = payload.history.daily.at(-1)
@@ -268,8 +292,10 @@ describe('Overview', () => {
     expect(outcome).not.toBeNull()
     expect(within(outcome as HTMLElement).getByText('$25.00')).toBeInTheDocument()
     expect(within(outcome as HTMLElement).getByText('$40.00')).toBeInTheDocument()
-    const anomalies = screen.getByLabelText('Spend anomalies')
-    expect(anomalies).toHaveTextContent(/Today's spend is 10× your typical/)
+    // The weekday-spike anomaly is absorbed into the Signals card as a risk.
+    const signals = screen.getByLabelText('Coaching signals')
+    const risks = within(signals).getByText('Risks').closest('.ov-signal-group') as HTMLElement
+    expect(within(risks).getByText(/Today's spend is 10× your typical/)).toBeInTheDocument()
   })
 
   it('uses an honest empty state when no realized savings exist', async () => {
@@ -437,14 +463,16 @@ describe('Overview', () => {
     expect(within(rows[1] as HTMLElement).getAllByText('—')).toHaveLength(2)
   })
 
-  it('suppresses the week-over-week anomaly and MTD card for a custom range', async () => {
+  it('suppresses the week-over-week signal and MTD card for a custom range', async () => {
     const now = new Date()
     const overview = polled(makePayload(now))
 
     const { rerender } = render(<OverviewContent period="30days" provider="all" overview={overview} />)
-    // Baseline (no range): the MTD card and a week-over-week signal are present.
+    // Baseline (no range): the MTD card, the coach pacing line, and the
+    // week-over-week Signals entry are all present.
     expect(await screen.findByText('Month to date')).toBeInTheDocument()
     expect(screen.getAllByText(/than last week/).length).toBeGreaterThan(0)
+    expect(screen.getByText(/vs last 7 days/)).toBeInTheDocument()
 
     const from = localDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2))
     const to = localDateKey(now)
@@ -453,6 +481,8 @@ describe('Overview', () => {
     expect(screen.queryByText('Month to date')).not.toBeInTheDocument()
     expect(screen.queryByText('Projected month')).not.toBeInTheDocument()
     expect(screen.queryByText(/than last week/)).toBeNull()
+    // The week-over-week Signals entry is suppressed under a custom range too.
+    expect(screen.queryByText(/vs last 7 days|vs prior 7 days/)).toBeNull()
     expect(screen.getByText(/is the biggest driver in this range/)).toBeInTheDocument()
   })
 
@@ -482,6 +512,156 @@ describe('Overview', () => {
     render(<OverviewContent period="30days" provider="all" overview={overview} />)
 
     expect(await screen.findByRole('status')).toHaveTextContent('Refresh failed, showing last good data · codeburn exited 1')
+  })
+
+  it('groups current-driven signals into wins and improvements', () => {
+    const now = new Date()
+    const wins = deriveSignals(signalsPayload(now, {
+      current: {
+        cacheHitPercent: 85,
+        oneShotRate: 0.82,
+        localModelSavings: { totalUSD: 15, calls: 4, byModel: [], byProvider: [] },
+      },
+      optimize: {
+        findingCount: 2,
+        savingsUSD: 30,
+        topFindings: [
+          { title: 'Trim CLAUDE.md preamble', impact: 'high', savingsUSD: 12 },
+          { title: 'Route trivial edits to Haiku', impact: 'medium', savingsUSD: 8 },
+        ],
+      },
+    }), now, false)
+    expect(wins.wins.map(s => s.text)).toEqual([
+      'Cache hit at 85%, most prompts reuse cache',
+      '82% one-shot, edits land first try',
+      '$15.00 saved via local models',
+    ])
+    expect(wins.improvements).toEqual([
+      { text: 'Trim CLAUDE.md preamble', trailing: '$12.00' },
+      { text: 'Route trivial edits to Haiku', trailing: '$8.00' },
+    ])
+    expect(wins.risks).toEqual([])
+  })
+
+  it('flags low cache-hit, low one-shot, and heavy retry tax as improvements', () => {
+    const now = new Date()
+    const { improvements } = deriveSignals(signalsPayload(now, {
+      current: {
+        cacheHitPercent: 40,
+        oneShotRate: 0.4,
+        cost: 100,
+        retryTax: { totalUSD: 30, retries: 5, editTurns: 10, byModel: [] },
+      },
+    }), now, false)
+    expect(improvements.map(s => s.text)).toEqual([
+      'Cache hit only 40%, paying for cold prompts',
+      '40% one-shot, lots of iteration',
+      'Retry tax is 30% of spend',
+    ])
+  })
+
+  it('does not treat a zero cache-hit (no data) as a cold-prompt improvement', () => {
+    const now = new Date()
+    const { improvements } = deriveSignals(signalsPayload(now, {
+      current: { cacheHitPercent: 0, oneShotRate: 0.6 },
+    }), now, false)
+    expect(improvements).toEqual([])
+  })
+
+  it('derives streak and a week-over-week drop as wins from history', () => {
+    const now = new Date()
+    // 14 consecutive active days; prior 7 at $20, recent 7 at $5 → spend down 75%.
+    const daily = consecutiveDays(now, 14, i => (i < 7 ? 20 : 5))
+    const { wins } = deriveSignals(signalsPayload(now, {
+      current: { cacheHitPercent: 60, oneShotRate: 0.6 },
+      daily,
+    }), now, false)
+    expect(wins.map(s => s.text)).toEqual([
+      'Spend down 75% vs last 7 days',
+      '14-day usage streak',
+    ])
+  })
+
+  it('reports weekday spike, week-over-week rise, and month overrun as risks', () => {
+    const now = new Date(2026, 6, 15) // Jul 15 2026
+    // June total = $5 (prior-month baseline); July: prior 7 low, recent 7 high.
+    const daily = [mkDay('2026-06-11', 5), ...consecutiveDays(now, 14, i => (i < 7 ? 2 : 20))]
+    const { risks } = deriveSignals(signalsPayload(now, {
+      current: { cacheHitPercent: 60, oneShotRate: 0.6 },
+      daily,
+    }), now, false)
+    expect(risks).toHaveLength(3)
+    expect(risks[0].text).toMatch(/Today's spend is 10× your typical/)
+    expect(risks[1].text).toBe('Spend up 900% vs prior 7 days')
+    expect(risks[2].text).toMatch(/^On pace for .* this month, \+\d+% vs last$/)
+  })
+
+  it('suppresses week-over-week and projection risks under a custom range, keeping the weekday spike', () => {
+    const now = new Date(2026, 6, 15)
+    const daily = [mkDay('2026-06-11', 5), ...consecutiveDays(now, 14, i => (i < 7 ? 2 : 20))]
+    const payload = signalsPayload(now, { current: { cacheHitPercent: 60, oneShotRate: 0.6 }, daily })
+    const { risks } = deriveSignals(payload, now, true)
+    expect(risks).toHaveLength(1)
+    expect(risks[0].text).toMatch(/Today's spend is 10× your typical/)
+  })
+
+  it('caps each group at three signals', () => {
+    const now = new Date()
+    // Five wins would qualify (cache, one-shot, week-down, streak, local); cap keeps 3.
+    const daily = consecutiveDays(now, 14, i => (i < 7 ? 20 : 5))
+    const { wins } = deriveSignals(signalsPayload(now, {
+      current: {
+        cacheHitPercent: 85,
+        oneShotRate: 0.82,
+        localModelSavings: { totalUSD: 15, calls: 4, byModel: [], byProvider: [] },
+      },
+      daily,
+    }), now, false)
+    expect(wins).toHaveLength(3)
+    expect(wins.map(s => s.text)).toEqual([
+      'Cache hit at 85%, most prompts reuse cache',
+      '82% one-shot, edits land first try',
+      'Spend down 75% vs last 7 days',
+    ])
+  })
+
+  it('renders the three-column Signals card with optimize findings under Improvements', async () => {
+    const now = new Date()
+    const payload = signalsPayload(now, {
+      current: {
+        cacheHitPercent: 85,
+        oneShotRate: 0.82,
+        localModelSavings: { totalUSD: 15, calls: 4, byModel: [], byProvider: [] },
+      },
+      optimize: {
+        findingCount: 1,
+        savingsUSD: 12,
+        topFindings: [{ title: 'Trim CLAUDE.md preamble', impact: 'high', savingsUSD: 12 }],
+      },
+    })
+
+    render(<OverviewContent period="30days" provider="all" overview={polled(payload)} />)
+
+    const signals = await screen.findByLabelText('Coaching signals')
+    const wins = within(signals).getByText('Wins').closest('.ov-signal-group') as HTMLElement
+    expect(within(wins).getByText(/Cache hit at 85%/)).toBeInTheDocument()
+    const improvements = within(signals).getByText('Improvements').closest('.ov-signal-group') as HTMLElement
+    expect(within(improvements).getByText('Trim CLAUDE.md preamble')).toBeInTheDocument()
+    expect(within(improvements).getByText('$12.00')).toBeInTheDocument()
+  })
+
+  it('renders no Signals card when every group is empty', async () => {
+    const now = new Date()
+    const payload = signalsPayload(now, {
+      current: { cacheHitPercent: 60, oneShotRate: 0.6 },
+      daily: [],
+      optimize: { findingCount: 0, savingsUSD: 0, topFindings: [] },
+    })
+
+    render(<OverviewContent period="30days" provider="all" overview={polled(payload)} />)
+
+    expect(await screen.findByText('Daily spend')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Coaching signals')).not.toBeInTheDocument()
   })
 
   it('renders section costs in the active non-USD currency (rate applied once, symbol swapped)', async () => {

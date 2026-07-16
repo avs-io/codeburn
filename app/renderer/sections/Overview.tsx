@@ -127,13 +127,47 @@ function CostPerOutcome({ outcome }: { outcome: Polled<YieldJsonReport> }) {
   )
 }
 
-type Anomaly = { lead: string; value: string; tail: string }
+export type Signal = { text: string; trailing?: string }
+export type SignalGroups = { wins: Signal[]; improvements: Signal[]; risks: Signal[] }
 
-function deriveAnomalies(data: MenubarPayload, now: Date, includeWeekOverWeek = true): Anomaly[] {
-  const anomalies: Anomaly[] = []
+/**
+ * Client-side port of the menubar's FindingsSection rule set
+ * (mac/Sources/CodeBurnMenubar/Views/FindingsSection.swift:133-205). Thresholds
+ * mirror the Swift; the desktop-only weekday-spike anomaly is absorbed as a risk.
+ * Week-over-week and month-projection rules are suppressed for a custom range.
+ */
+export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: boolean): SignalGroups {
+  const daily = data.history.daily
+  const current = data.current
+  const wins: Signal[] = []
+  const improvements: Signal[] = []
+  const risks: Signal[] = []
+
+  const streak = streakDays(daily, now)
+
+  // Week-over-week: mean of the last 7 active entries vs the prior 7 (matches the
+  // coach's pacing line). Needs >= 14 entries for both windows to exist.
+  let weekDelta: number | null = null
+  if (daily.length >= 14) {
+    const recent14 = daily.slice(-14)
+    const weekNow = mean(recent14.slice(-7).map(day => day.cost))
+    const weekPrior = mean(recent14.slice(0, 7).map(day => day.cost))
+    if (weekPrior > 0) weekDelta = (weekNow - weekPrior) / weekPrior * 100
+  }
+
+  // Month projection vs previous calendar month's total.
   const todayKey = localDateKey(now)
-  const today = data.history.daily.find(day => day.date === todayKey)
-  const sameWeekdayCosts = data.history.daily
+  const monthPrefix = todayKey.slice(0, 7)
+  const mtd = daily.filter(day => day.date.startsWith(monthPrefix)).reduce((sum, day) => sum + day.cost, 0)
+  const medianDaily = median(daily.slice(-7).map(day => day.cost))
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+  const projectedMonth = mtd + medianDaily * Math.max(0, daysInMonth - now.getDate())
+  const prevPrefix = localDateKey(new Date(now.getFullYear(), now.getMonth() - 1, 1)).slice(0, 7)
+  const prevMonthTotal = daily.filter(day => day.date.startsWith(prevPrefix)).reduce((sum, day) => sum + day.cost, 0)
+
+  // Weekday spike: today vs the mean of prior same-weekday entries.
+  const today = daily.find(day => day.date === todayKey)
+  const sameWeekdayCosts = daily
     .filter(day => {
       if (day.date === todayKey) return false
       const [year, month, date] = day.date.split('-').map(Number)
@@ -141,38 +175,97 @@ function deriveAnomalies(data: MenubarPayload, now: Date, includeWeekOverWeek = 
     })
     .map(day => day.cost)
   const typicalWeekday = mean(sameWeekdayCosts)
+
+  // ————— Wins —————
+  if (current.cacheHitPercent >= 80) {
+    wins.push({ text: `Cache hit at ${Math.round(current.cacheHitPercent)}%, most prompts reuse cache` })
+  }
+  if (current.oneShotRate !== null && current.oneShotRate >= 0.75) {
+    wins.push({ text: `${Math.round(current.oneShotRate * 100)}% one-shot, edits land first try` })
+  }
+  if (!rangeActive && weekDelta !== null && weekDelta < -10) {
+    wins.push({ text: `Spend down ${Math.round(Math.abs(weekDelta))}% vs last 7 days` })
+  }
+  if (streak >= 5) {
+    wins.push({ text: `${streak}-day usage streak` })
+  }
+  if (current.localModelSavings.totalUSD > 0) {
+    wins.push({ text: `${formatUsd(current.localModelSavings.totalUSD)} saved via local models` })
+  }
+
+  // ————— Improvements —————
+  for (const finding of data.optimize.topFindings.slice(0, 3)) {
+    improvements.push({ text: finding.title, trailing: formatUsd(finding.savingsUSD) })
+  }
+  if (current.cacheHitPercent > 0 && current.cacheHitPercent < 50) {
+    improvements.push({ text: `Cache hit only ${Math.round(current.cacheHitPercent)}%, paying for cold prompts` })
+  }
+  if (current.oneShotRate !== null && current.oneShotRate < 0.5) {
+    improvements.push({ text: `${Math.round(current.oneShotRate * 100)}% one-shot, lots of iteration` })
+  }
+  // Retry-tax share is not a menubar rule; the threshold is the point where the
+  // efficiency scorecard's retry penalty saturates (retrySpendFraction * 4 == 1).
+  const retryShare = current.retryTax.totalUSD / Math.max(current.cost, 1e-9)
+  if (retryShare >= 0.25) {
+    improvements.push({ text: `Retry tax is ${Math.round(retryShare * 100)}% of spend` })
+  }
+
+  // ————— Risks —————
   if (today && typicalWeekday > 0 && today.cost > typicalWeekday * 1.8) {
     const ratio = today.cost / typicalWeekday
     const weekday = now.toLocaleString('en-US', { weekday: 'long' })
-    anomalies.push({ lead: "Today's spend is ", value: `${ratio.toFixed(1).replace(/\.0$/, '')}×`, tail: ` your typical ${weekday}.` })
+    risks.push({ text: `Today's spend is ${ratio.toFixed(1).replace(/\.0$/, '')}× your typical ${weekday}` })
+  }
+  if (!rangeActive && weekDelta !== null && weekDelta > 25) {
+    risks.push({ text: `Spend up ${Math.round(weekDelta)}% vs prior 7 days` })
+  }
+  if (!rangeActive && prevMonthTotal > 0 && projectedMonth > prevMonthTotal * 1.3) {
+    const overPct = Math.round((projectedMonth - prevMonthTotal) / prevMonthTotal * 100)
+    risks.push({ text: `On pace for ${formatUsd(projectedMonth)} this month, +${overPct}% vs last` })
   }
 
-  if (includeWeekOverWeek && data.history.daily.length >= 14) {
-    const recent14 = data.history.daily.slice(-14)
-    const currentWeek = mean(recent14.slice(-7).map(day => day.cost))
-    const priorWeek = mean(recent14.slice(0, 7).map(day => day.cost))
-    if (priorWeek > 0) {
-      const change = (currentWeek - priorWeek) / priorWeek * 100
-      if (Math.abs(change) >= 25) {
-        anomalies.push({ lead: 'Spend is ', value: `${Math.round(Math.abs(change))}%`, tail: ` ${change >= 0 ? 'higher' : 'lower'} than last week.` })
-      }
-    }
-  }
-
-  if (data.current.cacheHitPercent < 50) {
-    anomalies.push({ lead: 'Cache hit is low (', value: `${Math.round(data.current.cacheHitPercent)}%`, tail: '). More of your context is uncached.' })
-  }
-  return anomalies.slice(0, 3)
+  return { wins: wins.slice(0, 3), improvements: improvements.slice(0, 3), risks: risks.slice(0, 3) }
 }
 
-function AnomalyCallouts({ anomalies }: { anomalies: Anomaly[] }) {
-  if (!anomalies.length) return null
+const SIGNAL_GROUPS = [
+  {
+    key: 'wins' as const,
+    label: 'Wins',
+    icon: <><circle cx="12" cy="12" r="9" /><polyline points="8 12 11 15 16 9" /></>,
+  },
+  {
+    key: 'improvements' as const,
+    label: 'Improvements',
+    icon: <><polyline points="7 17 17 7" /><polyline points="9 7 17 7 17 15" /></>,
+  },
+  {
+    key: 'risks' as const,
+    label: 'Risks',
+    icon: <><path d="M12 4 21 19 3 19Z" /><line x1="12" y1="10" x2="12" y2="14" /><line x1="12" y1="16.5" x2="12" y2="16.6" /></>,
+  },
+]
+
+function SignalsCard({ signals }: { signals: SignalGroups }) {
+  const groups = SIGNAL_GROUPS.filter(group => signals[group.key].length > 0)
+  if (!groups.length) return null
   return (
-    <div className="ov-card ov-anomalies" aria-label="Spend anomalies">
-      <span className="ov-anomaly-label">Anomalies</span>
-      <div className="ov-anomaly-list">
-        {anomalies.map((anomaly, index) => <div key={`${anomaly.value}-${index}`}>{anomaly.lead}<strong>{anomaly.value}</strong>{anomaly.tail}</div>)}
-      </div>
+    <div className="ov-card ov-signals" aria-label="Coaching signals">
+      {groups.map(group => (
+        <div className={`ov-signal-group ${group.key}`} key={group.key}>
+          <div className="ov-signal-head">
+            <svg viewBox="0 0 24 24" aria-hidden="true">{group.icon}</svg>
+            <span>{group.label}</span>
+          </div>
+          <ul className="ov-signal-list">
+            {signals[group.key].map((signal, index) => (
+              <li className="ov-signal" key={`${signal.text}-${index}`}>
+                <span title={signal.text}>{signal.text}</span>
+                {signal.trailing && <span className="ov-signal-trailing">{signal.trailing}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
     </div>
   )
 }
@@ -504,7 +597,7 @@ export function OverviewContent({
   const applied = saved > 0 ? (actReport.data?.totals.measuredActions ?? 0) : 0
   const localSaved = data.current.localModelSavings.totalUSD
   // A custom range has no meaningful "vs last week" or month-to-date baseline.
-  const anomalies = deriveAnomalies(data, now, !rangeActive)
+  const signals = deriveSignals(data, now, rangeActive)
   return (
     <div className="ov-dashboard">
       {error && <StaleBanner error={error} />}
@@ -544,9 +637,9 @@ export function OverviewContent({
           </div>
           <button className="ov-coach-cta" type="button" onClick={() => onNavigate?.('optimize')}>Review →</button>
         </div>
-
-        <AnomalyCallouts anomalies={anomalies} />
       </div>
+
+      <SignalsCard signals={signals} />
 
       <div className="ov-analytics-row">
         <CostPerOutcome outcome={yieldReport} />
