@@ -90,6 +90,17 @@ The tag is for human reference and to anchor the GitHub Release. No workflow run
 npm view codeburn version
 ```
 
+### 5b. Bump the Homebrew Tap
+
+The tap at `getagentseal/homebrew-codeburn` does not update itself — bump it
+every CLI release or it drifts (issue #716 sat six versions behind):
+
+```bash
+curl -sLO "https://registry.npmjs.org/codeburn/-/codeburn-<version>.tgz"
+shasum -a 256 codeburn-<version>.tgz
+# edit Formula/codeburn.rb in the tap: url version + sha256, commit, push
+```
+
 ### 6. Create a GitHub Release
 
 Use the GitHub CLI to create a release with notes from the changelog:
