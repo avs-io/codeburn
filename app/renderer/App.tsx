@@ -26,7 +26,7 @@ import { Compare } from './sections/Compare'
 import { Plans } from './sections/Plans'
 import { Settings, type SettingsPane } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
-import type { DateRange, MenubarPayload, Period, TelemetryStatus } from './lib/types'
+import type { DateRange, MenubarPayload, ModelReportRow, Period, TelemetryStatus } from './lib/types'
 
 // Bucket raw dollar amounts before they leave the machine: telemetry carries
 // coarse ranges, never exact spend.
@@ -39,20 +39,60 @@ function costBucket(usd: number): string {
   return '1k+'
 }
 
+// Bucket occurrence counts (MCP-server / skill invocations) the same way costBucket
+// coarsens dollars: telemetry carries usage magnitude, never an exact tally.
+function countBucket(n: number): string {
+  if (n < 10) return '1-10'
+  if (n < 100) return '10-100'
+  if (n < 1000) return '100-1k'
+  return '1k+'
+}
+
+/** Map each model to its dominant task category from the default models report.
+ * `topCategory` is computed only in that view (not `--by-task`). The overview's
+ * `topModels[].name` is the provider display name — for Claude that's exactly
+ * `modelDisplayName`, so we key on both it and the raw `model` id and take the
+ * highest-cost row per key (rows arrive cost-descending). */
+export function topCategoryByModel(rows: ModelReportRow[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const row of rows) {
+    if (!row.topCategory) continue
+    if (!map.has(row.modelDisplayName)) map.set(row.modelDisplayName, row.topCategory)
+    if (!map.has(row.model)) map.set(row.model, row.topCategory)
+  }
+  return map
+}
+
 /** The once-per-day anonymous aggregate (main process dedups by calendar day). */
-function usageSnapshotProps(payload: MenubarPayload): Record<string, unknown> {
+export function usageSnapshotProps(payload: MenubarPayload, modelCategories?: Map<string, string>): Record<string, unknown> {
   return {
     period: payload.current.label,
     providerCount: Object.keys(payload.current.providers).length,
     costBucket: costBucket(payload.current.cost),
-    models: (payload.current.topModels ?? []).slice(0, 8).map(model => ({
-      name: model.name,
-      costBucket: costBucket(model.cost),
-    })),
+    // Each top model with its coarse cost bucket, and — when the once-daily
+    // by-model report joins — its dominant task category (a single name string,
+    // never an array, so the sanitizer keeps it). This is the model x purpose cross.
+    models: (payload.current.topModels ?? []).slice(0, 8).map(model => {
+      const entry: Record<string, unknown> = { name: model.name, costBucket: costBucket(model.cost) }
+      const topCategory = modelCategories?.get(model.name)
+      if (topCategory) entry.topCategory = topCategory
+      return entry
+    }),
+    // Aggregate task categories (the "purpose" dimension across all models).
     categories: (payload.current.topActivities ?? []).slice(0, 12).map(activity => ({
       name: activity.name,
       // Task-completion signal: share of turns resolved in one shot, 2dp.
       oneShotRate: activity.oneShotRate == null ? -1 : Math.round(activity.oneShotRate * 100) / 100,
+    })),
+    // MCP servers and skills by name + bucketed usage. Names are config identifiers
+    // (like model names), never args/paths/descriptions. Skills are measured in turns.
+    mcpServers: (payload.current.mcpServers ?? []).slice(0, 12).map(server => ({
+      name: server.name,
+      callBucket: countBucket(server.calls),
+    })),
+    skills: (payload.current.skills ?? []).slice(0, 12).map(skill => ({
+      name: skill.name,
+      callBucket: countBucket(skill.turns),
     })),
   }
 }
@@ -216,10 +256,25 @@ function AppMain() {
 
   // Once-per-day anonymous usage aggregate, only from the canonical view
   // (all providers, standard period, no config scope) so buckets are stable.
+  // Gated to the first qualifying render per calendar day so the extra by-model
+  // report fetch runs at most once/day, not on every poll (main also dedups the
+  // event). The fetch enriches each model with its dominant task category; if it
+  // fails we still emit the snapshot, just without the model x category cross.
+  const snapshotDayRef = useRef<string | null>(null)
   useEffect(() => {
     if (!overview.data || provider !== 'all' || customRange || claudeConfigSource) return
-    trackEvent('usage_snapshot', usageSnapshotProps(overview.data))
-  }, [overview.data, provider, customRange, claudeConfigSource, trackEvent])
+    const today = localDateKey(new Date())
+    if (snapshotDayRef.current === today) return
+    snapshotDayRef.current = today
+    const payload = overview.data
+    void (async () => {
+      let modelCategories: Map<string, string> | undefined
+      try {
+        modelCategories = topCategoryByModel(await codeburn.getModels(period, 'all', false))
+      } catch { /* degrade: emit the snapshot without per-model topCategory */ }
+      trackEvent('usage_snapshot', usageSnapshotProps(payload, modelCategories))
+    })()
+  }, [overview.data, provider, customRange, claudeConfigSource, period, trackEvent])
 
   useEffect(() => {
     let saved: string | null = null
