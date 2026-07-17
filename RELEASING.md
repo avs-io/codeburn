@@ -2,7 +2,7 @@
 
 This document describes the actual steps a maintainer takes to cut a CLI or macOS menubar release. CLI releases are run by hand with `npm publish`; macOS menubar releases are automated by `.github/workflows/release-menubar.yml` when a `mac-v*` tag is pushed.
 
-The Electron desktop app (`app/`) is not part of either flow yet — it has no version tag pattern or CI automation. See `app/DISTRIBUTION.md` for how to build and distribute it as an ad-hoc-signed, non-notarized macOS build.
+The Electron desktop app (`app/`) has no CI automation yet, but it is released manually under `desktop-v<version>` tags: build the artifacts on a macOS host (see `app/DISTRIBUTION.md`) and `gh release upload desktop-v<version> … --clobber` them onto the release. See `app/DISTRIBUTION.md` for how to build and distribute it as an ad-hoc-signed, non-notarized macOS build (plus unsigned Windows and Linux builds).
 
 ## Versioning
 

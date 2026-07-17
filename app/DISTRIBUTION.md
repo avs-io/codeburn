@@ -69,6 +69,23 @@ npm --prefix app run package:win      # Windows NSIS installer, x64
 npm --prefix app run package:linux    # Linux AppImage, x64
 ```
 
+The Linux targets and arches can be widened by calling `electron-builder`
+directly, all from the same macOS host:
+
+```sh
+cd app
+npx electron-builder --linux AppImage deb        # x64 AppImage + deb
+npx electron-builder --linux AppImage deb --x64  # force x64 on an arm64 mac
+npx electron-builder --linux AppImage deb --arm64
+npx electron-builder --linux rpm --x64           # rpm; needs `brew install rpm` (rpmbuild)
+```
+
+The `rpm` target is the only one with an extra prerequisite — `fpm` (bundled by
+electron-builder) shells out to `rpmbuild`, so `brew install rpm` must be present
+or the build fails with "executable rpmbuild is required". It emits
+`codeburn-desktop-<version>.x86_64.rpm`, the name the website's Fedora/RHEL
+download links.
+
 `package` runs `npm run stage-cli` (rebuilds the root CLI and stages the
 self-contained bundle into `app/build/cli`; see "The bundled CLI" above), then
 `npm run build` (compiles `electron/` with `tsc`, builds the renderer with
