@@ -6,6 +6,7 @@ import Foundation
 /// failures to the UI.
 enum CodexSubscriptionService {
     private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    private static let resetCreditsURL = URL(string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")!
     private static let usageBlockedUntilKey = "codeburn.codex.usage.blockedUntil"
 
     enum FetchError: Error, LocalizedError {
@@ -110,8 +111,12 @@ enum CodexSubscriptionService {
         switch http.statusCode {
         case 200:
             clearUsageBlock()
+            // Companion fetch, strictly best-effort: any failure yields nil and
+            // the Plan view simply omits the row. This endpoint must never be
+            // able to break the quota display.
+            let resetCredits = await fetchResetCredits(token: token)
             do {
-                return try decodeUsage(data: data)
+                return try decodeUsage(data: data, resetCredits: resetCredits)
             } catch {
                 // Do not log the response body — it's user-account data from
                 // chatgpt.com and is readable by other local users via
@@ -178,7 +183,63 @@ enum CodexSubscriptionService {
         }
     }
 
-    private static func decodeUsage(data: Data) throws -> CodexUsage {
+    private static func fetchResetCredits(token: String) async -> CodexUsage.ResetCredits? {
+        var request = URLRequest(url: resetCreditsURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 4
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("CodeBurn", forHTTPHeaderField: "User-Agent")
+        // The Codex desktop clients send this beta gate header on this
+        // endpoint; keep parity so chatgpt.com routes us the same response
+        // shape. If the endpoint ever rejects us anyway, the row just hides.
+        request.setValue("codex-1", forHTTPHeaderField: "OpenAI-Beta")
+        if let accountId = try? CodexCredentialStore.currentRecord()?.accountId, !accountId.isEmpty {
+            request.setValue(accountId, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            return nil
+        }
+        return parseResetCredits(data: data)
+    }
+
+    /// Internal (not private) so tests can drive it with fixture payloads.
+    /// Returns nil on any unexpected shape — the caller treats nil as
+    /// "feature unavailable", never as an error.
+    static func parseResetCredits(data: Data, now: Date = Date()) -> CodexUsage.ResetCredits? {
+        struct CreditDTO: Decodable {
+            let status: String?
+            let expires_at: String?
+        }
+        struct ResponseDTO: Decodable {
+            let credits: [CreditDTO]?
+            let available_count: Int?
+        }
+        guard let root = try? JSONDecoder().decode(ResponseDTO.self, from: data),
+              let count = root.available_count, count >= 0 else {
+            return nil
+        }
+        let nextExpiry = (root.credits ?? [])
+            .filter { ($0.status ?? "").lowercased() == "available" }
+            .compactMap { $0.expires_at.flatMap(parseISO8601) }
+            .filter { $0 > now }
+            .min()
+        return CodexUsage.ResetCredits(availableCount: count, nextExpiresAt: nextExpiry)
+    }
+
+    /// chatgpt.com serializes these timestamps as ISO-8601, sometimes with
+    /// fractional seconds and sometimes without; accept both.
+    private static func parseISO8601(_ raw: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: raw) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+    }
+
+    private static func decodeUsage(data: Data, resetCredits: CodexUsage.ResetCredits? = nil) throws -> CodexUsage {
         let root = try JSONDecoder().decode(UsageDTO.self, from: data)
         let additional: [CodexUsage.AdditionalLimit] = (root.additional_rate_limits ?? []).compactMap { dto in
             guard let name = dto.limit_name, !name.isEmpty else { return nil }
@@ -194,6 +255,7 @@ enum CodexSubscriptionService {
             secondary: makeWindow(root.rate_limit?.secondary_window),
             additionalLimits: additional,
             creditsBalance: root.credits?.balance,
+            resetCredits: resetCredits,
             fetchedAt: Date()
         )
     }
