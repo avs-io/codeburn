@@ -570,9 +570,21 @@ export type ScanProgressEvent =
   | { kind: 'tick'; provider: string; done: number; total: number }
   | { kind: 'done' }
 
+/** Update-availability status from the main process (app/electron/updates.ts). */
+export type UpdateStatus = {
+  currentVersion: string
+  latestVersion: string | null
+  updateAvailable: boolean
+  tag: string | null
+}
+
 export interface CodeburnBridge {
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
+  /** Read the cached update-availability status (launch + 24h background check). */
+  getUpdateStatus(): Promise<UpdateStatus>
+  /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
+  onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
   getQuota(force?: boolean): Promise<QuotaProvider[]>
   getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null): Promise<MenubarPayload>
   getPlans(period: Period): Promise<StatusJson>

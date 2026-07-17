@@ -64,6 +64,7 @@ const CHANNELS = [
   'codeburn:telemetrySetEnabled',
   'codeburn:telemetryOnboarded',
   'codeburn:telemetryTrack',
+  'codeburn:getUpdateStatus',
 ] as const
 
 const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = [

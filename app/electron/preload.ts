@@ -61,6 +61,13 @@ const bridge = {
     ipcRenderer.on('codeburn:progress', listener)
     return () => { ipcRenderer.removeListener('codeburn:progress', listener) }
   },
+  // Update availability: a one-shot read plus a push for the launch + 24h checks.
+  getUpdateStatus: () => invoke('codeburn:getUpdateStatus'),
+  onUpdateStatus: (cb: (status: unknown) => void) => {
+    const listener = (_e: unknown, status: unknown) => cb(status)
+    ipcRenderer.on('codeburn:update', listener)
+    return () => { ipcRenderer.removeListener('codeburn:update', listener) }
+  },
   platform: process.platform,
 }
 

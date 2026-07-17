@@ -4,9 +4,12 @@ import path from 'node:path'
 import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
+import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
 
 // Initialized in bootstrap() once Electron paths exist; stays null under tests.
 let telemetryInstance: Telemetry | null = null
+// The once-per-launch + 24h update-availability checker. Null under tests.
+let updateChecker: UpdateChecker | null = null
 
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
@@ -26,6 +29,8 @@ const WARMUP_TIMEOUT_MS = 10 * 60_000
 const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
 // IPC channel carrying cold-start scan-progress events to the splash.
 export const PROGRESS_CHANNEL = 'codeburn:progress'
+// IPC channel pushing update-availability status to open windows (launch + 24h).
+export const UPDATE_CHANNEL = 'codeburn:update'
 
 /** Line-buffer a spawn's stderr and forward each parsed scan-progress event. */
 export function makeProgressReader(emit: (event: unknown) => void): (chunk: string) => void {
@@ -49,6 +54,14 @@ function broadcastProgress(event: unknown): void {
     if (!win.isDestroyed()) win.webContents.send(PROGRESS_CHANNEL, event)
   }
 }
+
+function broadcastUpdateStatus(status: UpdateStatus): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(UPDATE_CHANNEL, status)
+  }
+}
+
+const NO_UPDATE_STATUS: UpdateStatus = { currentVersion: '', latestVersion: null, updateAvailable: false, tag: null }
 
 function providerArgs(provider: string | undefined): string[] {
   return provider && provider !== 'all' ? ['--provider', provider] : []
@@ -136,6 +149,8 @@ type Deps = {
   emitProgress?: (event: unknown) => void
   /** Consent-gated anonymous telemetry; absent under tests unless injected. */
   telemetry?: TelemetryBridge | null
+  /** Cached update-availability status; absent under tests unless injected. */
+  getUpdateStatus?: () => Promise<UpdateStatus>
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -145,7 +160,7 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * shell) and returns a result envelope. Pure + injectable so the wiring is
  * unit-testable without launching Electron.
  */
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance }): Record<string, Handler> {
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS) }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
   const telemetry = deps.telemetry ?? null
   // Flips true after the first overview fetch succeeds. Until then, every
@@ -277,6 +292,9 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       telemetry?.track(String(name ?? ''), props)
       return { ok: true, value: true }
     },
+    // One-shot read of the cached update-availability status. The check itself
+    // runs in the background (launch + 24h); this returns whatever is known.
+    'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
   }
 }
 
@@ -475,6 +493,14 @@ function bootstrap(): void {
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
+
+    // Update availability: check once at launch, then every 24h, pushing each
+    // result to any open window. Never downloads/installs (unsigned builds);
+    // errors are swallowed inside the checker as a silent no-op.
+    updateChecker = createUpdateChecker({ currentVersion: app.getVersion() })
+    const runUpdateCheck = () => { void updateChecker?.check().then(broadcastUpdateStatus) }
+    runUpdateCheck()
+    setInterval(runUpdateCheck, 24 * 60 * 60 * 1000)
   })
 
   app.on('window-all-closed', () => {

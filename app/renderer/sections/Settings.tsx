@@ -8,6 +8,8 @@ import { Panel } from '../components/Panel'
 import { ProviderLogo } from '../components/ProviderLogo'
 import type { Section } from '../components/Sidebar'
 import { usePolled } from '../hooks/usePolled'
+import { releasePageUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
+import { version as appVersion } from '../../package.json'
 import { readDailyBudget } from '../lib/budget'
 import { formatConverted, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
@@ -138,6 +140,13 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   const [budgetKind, setBudgetKind] = useState<'off' | 'usd' | 'tokens'>(() => readDailyBudget()?.kind ?? 'off')
   const [budgetInput, setBudgetInput] = useState(() => { const budget = readDailyBudget(); return budget ? String(budget.value) : '' })
   const [budgetError, setBudgetError] = useState('')
+  const update = useUpdateStatus()
+  const version = update?.currentVersion || appVersion
+  const updateNote = update?.updateAvailable && update.latestVersion
+    ? `Update available: ${update.latestVersion}`
+    : update?.latestVersion
+    ? 'Up to date'
+    : ''
 
   useEffect(() => {
     if (theme === 'system') document.documentElement.removeAttribute('data-theme')
@@ -186,7 +195,7 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
             <div className="about-row"><span className="tx">Active config<small>Applies to the overview data. Manage config folders with the codeburn CLI.</small></span><span className="r"><span className="set-cap">{activeConfigLabel}</span></span></div>
           </div>
         )}
-        <div className="about-sec set-last-sec">
+        <div className="about-sec">
           <div className="about-sec-h">Display</div>
           <div className="about-row"><label className="tx" htmlFor="settings-currency">Currency</label><span className="r">
             {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => void codeburn.setCurrency(value).then(finishCurrency)} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
@@ -196,6 +205,10 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
           <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>How often data auto-refreshes. Manual updates only on ⌘R.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
           {budgetError && <p className="set-action-msg error">{budgetError}</p>}
+        </div>
+        <div className="about-sec set-last-sec">
+          <div className="about-sec-h">About</div>
+          <div className="about-row"><span className="tx">Version {version}{updateNote && <small>{updateNote}</small>}</span><span className="r">{update?.updateAvailable && update.tag ? <button className="set-text-button" onClick={() => { void codeburn.openExternal(releasePageUrl(update.tag!)) }}>Download</button> : null}</span></div>
         </div>
       </div>
     </section>

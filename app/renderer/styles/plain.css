@@ -305,6 +305,9 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .budget-banner.exceeded { color: var(--bad); border-left-color: var(--bad); }
 .budget-banner > span { flex: 1; }
 .budget-banner .set-text-button { color: var(--mut); }
+.update-banner { display: flex; align-items: center; gap: 10px; padding: 6px 16px; font-size: 12px; font-weight: 550; color: var(--ok); border-left: 3px solid var(--ok); border-bottom: 1px solid var(--line); line-height: 1.4; }
+.update-banner > span { flex: 1; }
+.update-banner > .set-text-button { color: var(--mut); }
 
 /* Settings */
 .body.set-body { align-self: stretch; align-items: stretch; justify-content: flex-start; width: auto; height: 100%; min-height: 0; max-width: none; margin: 0; padding: 0; overflow: hidden; flex-direction: row; gap: 0; }
