@@ -2107,10 +2107,29 @@ private struct CodexPlanInsight: View {
                     )
                 }
             }
+            // Limit-reset credits the account is holding. Hidden at zero so
+            // plans that never receive these grants see no extra row.
+            if let resets = usage.resetCredits, resets.availableCount > 0 {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Limit resets")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(resetCreditsLabel(resets))
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 8)
+    }
+
+    private func resetCreditsLabel(_ resets: CodexUsage.ResetCredits) -> String {
+        let count = "\(resets.availableCount) available"
+        guard let next = resets.nextExpiresAt else { return count }
+        return "\(count) · next expires \(relativeReset(next))"
     }
 
     private func relativeReset(_ date: Date) -> String {

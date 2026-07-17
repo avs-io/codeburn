@@ -68,11 +68,20 @@ struct CodexUsage: Sendable, Equatable {
         let secondary: Window?
     }
 
+    /// Account-level limit-reset credits: grants that restore a rate-limit
+    /// window early, each with its own expiry. Only what the popover renders —
+    /// the available count and the soonest expiry among available credits.
+    struct ResetCredits: Sendable, Equatable {
+        let availableCount: Int
+        let nextExpiresAt: Date?
+    }
+
     let plan: PlanType
     let primary: Window?
     let secondary: Window?
     let additionalLimits: [AdditionalLimit]
     let creditsBalance: Double?
+    let resetCredits: ResetCredits?
     let fetchedAt: Date
 
     static func planType(from raw: String?) -> PlanType {
