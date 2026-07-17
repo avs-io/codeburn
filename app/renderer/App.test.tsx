@@ -2,10 +2,11 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { App, overviewMemoKey } from './App'
+import { App, overviewMemoKey, topCategoryByModel, usageSnapshotProps } from './App'
+import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
-import type { DateRange, MenubarPayload, OptimizeJsonReport, SpendFlow } from './lib/types'
+import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
 
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
@@ -622,5 +623,106 @@ describe('currency correctness', () => {
     // Memo purged and the active view force-refreshed so the new currency lands fast.
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(false)
+  })
+})
+
+describe('usage_snapshot telemetry props', () => {
+  // The renderer builds these props; the main-process sanitizer (sanitizeProps)
+  // is the last gate before the wire. Test the composition, which is what ships.
+  function enrichedPayload(): MenubarPayload {
+    const p = overviewPayload()
+    p.current.cost = 42
+    p.current.topModels = [
+      { name: 'claude-opus-4-8', cost: 30, savingsUSD: 0, savingsBaselineModel: '', calls: 400 },
+      { name: 'M'.repeat(80), cost: 0.5, savingsUSD: 0, savingsBaselineModel: '', calls: 2 },
+    ]
+    p.current.topActivities = [
+      { name: 'coding', cost: 20, savingsUSD: 0, turns: 100, oneShotRate: 0.6123 },
+      { name: 'debugging', cost: 10, savingsUSD: 0, turns: 40, oneShotRate: null },
+    ]
+    p.current.mcpServers = [
+      { name: 'context7', calls: 5 },
+      { name: 'S'.repeat(80), calls: 250 },
+      { name: 'shadcn', calls: 1500 },
+    ]
+    p.current.skills = [
+      { name: 'graphify', turns: 3, cost: 0 },
+      { name: 'council', turns: 150, cost: 0 },
+    ]
+    // A path-like project name that MUST NEVER reach telemetry: the snapshot never
+    // reads topProjects, and this guards against a future field accidentally doing so.
+    p.current.topProjects = [{
+      name: '/Users/torukmakto/secret-client/private-repo',
+      cost: 42, savingsUSD: 0, sessions: 1, avgCostPerSession: 42, sessionDetails: [],
+    }]
+    return p
+  }
+
+  it('includes MCP servers and skills as names + bucketed usage', () => {
+    const props = sanitizeProps(usageSnapshotProps(enrichedPayload()))
+
+    const mcp = props.mcpServers as Array<{ name: string; callBucket: string }>
+    expect(mcp.map(m => [m.name.slice(0, 8), m.callBucket])).toEqual([
+      ['context7', '1-10'],
+      ['SSSSSSSS', '100-1k'],
+      ['shadcn', '1k+'],
+    ])
+
+    const skills = props.skills as Array<{ name: string; callBucket: string }>
+    // Skills are measured in turns; buckets mirror the count scale.
+    expect(skills).toEqual([
+      { name: 'graphify', callBucket: '1-10' },
+      { name: 'council', callBucket: '100-1k' },
+    ])
+  })
+
+  it('truncates over-long names at the 64-char sanitizer cap', () => {
+    const props = sanitizeProps(usageSnapshotProps(enrichedPayload()))
+    const mcp = props.mcpServers as Array<{ name: string }>
+    const models = props.models as Array<{ name: string }>
+    expect(mcp[1]!.name.length).toBe(64)
+    expect(models[1]!.name.length).toBe(64)
+  })
+
+  it('never leaks a filesystem path or project name', () => {
+    const serialized = JSON.stringify(sanitizeProps(usageSnapshotProps(enrichedPayload())))
+    expect(serialized).not.toContain('/Users/')
+    expect(serialized).not.toContain('secret-client')
+    expect(serialized).not.toContain('private-repo')
+  })
+
+  function modelRow(over: Partial<ModelReportRow> & Pick<ModelReportRow, 'model' | 'modelDisplayName'>): ModelReportRow {
+    return {
+      provider: 'claude', providerDisplayName: 'Claude', category: null,
+      inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalTokens: 0,
+      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null, ...over,
+    }
+  }
+
+  it('crosses each top model with its dominant task category when the report joins', () => {
+    // The overview model name is the display/short name; for Claude that equals
+    // modelDisplayName, which is how the by-model report row joins back.
+    const rows = [
+      modelRow({ model: 'claude-opus-4-20260101', modelDisplayName: 'claude-opus-4-8', topCategory: 'coding' }),
+    ]
+    const props = sanitizeProps(usageSnapshotProps(enrichedPayload(), topCategoryByModel(rows)))
+    const models = props.models as Array<Record<string, unknown>>
+    expect(models[0]).toEqual({ name: 'claude-opus-4-8', costBucket: '10-50', topCategory: 'coding' })
+    // A model the report has no category for carries name + costBucket only, never a fabricated cross.
+    expect(Object.keys(models[1]!).sort()).toEqual(['costBucket', 'name'])
+  })
+
+  it('still emits a valid snapshot without topCategory when the by-model fetch fails', () => {
+    // The graceful-degradation path: usageSnapshotProps is called with no category map.
+    const props = sanitizeProps(usageSnapshotProps(enrichedPayload()))
+    const models = props.models as Array<Record<string, unknown>>
+    for (const m of models) expect(Object.keys(m).sort()).toEqual(['costBucket', 'name'])
+    // Everything else the snapshot carries is intact.
+    expect((props.mcpServers as unknown[]).length).toBe(3)
+    expect((props.skills as unknown[]).length).toBe(2)
+    expect(props.categories).toEqual([
+      { name: 'coding', oneShotRate: 0.61 },
+      { name: 'debugging', oneShotRate: -1 },
+    ])
   })
 })
