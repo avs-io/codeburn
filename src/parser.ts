@@ -25,6 +25,7 @@ import {
   reconcileFile,
   saveCache,
 } from './session-cache.js'
+import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -1587,6 +1588,7 @@ async function scanProjectDirs(
   // caller (parseAllSessions) can persist partial progress. A run killed
   // mid-scan then resumes from a warm cache instead of re-parsing from zero.
   onFileParsed?: () => Promise<void>,
+  readOnly = false,
 ): Promise<ProjectSummary[]> {
   const section = getOrCreateProviderSection(diskCache, 'claude')
   const allDiscoveredFiles = new Set<string>()
@@ -1604,10 +1606,11 @@ async function scanProjectDirs(
       const fp = await fingerprintFile(filePath)
       if (!fp) continue
 
-      const action = reconcileFile(fp, section.files[filePath])
-      if (action.action === 'unchanged') {
+      const cached = section.files[filePath]
+      const action = reconcileFile(fp, cached)
+      if (cached && (readOnly || action.action === 'unchanged')) {
         unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
-      } else {
+      } else if (!readOnly) {
         changedFiles.push({ filePath, info: { dirName, fp, source } })
       }
     }
@@ -1615,6 +1618,16 @@ async function scanProjectDirs(
     await discoverProgress.tick(dirsDone)
   }
   discoverProgress.finish()
+
+  if (readOnly) {
+    for (const [filePath, cached] of Object.entries(section.files)) {
+      if (allDiscoveredFiles.has(filePath)) continue
+      const dirName = cached.canonicalProjectName
+        ?? cached.turns[0]?.calls[0]?.project
+        ?? basename(dirname(filePath))
+      unchangedFiles.push({ filePath, dirName, cached })
+    }
+  }
 
   // Pre-seed dedup set from cached (unchanged) files
   for (const { cached } of unchangedFiles) {
@@ -1671,7 +1684,7 @@ async function scanProjectDirs(
   }
   parseProgress.finish()
 
-  if (dirs.length > 0) {
+  if (!readOnly && dirs.length > 0) {
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
         delete section.files[cachedPath]
@@ -2151,12 +2164,14 @@ async function parseProviderSources(
   seenKeys: Set<string>,
   diskCache: SessionCache,
   dateRange?: DateRange,
+  readOnly = false,
 ): Promise<ProjectSummary[]> {
   const provider = await getProvider(providerName)
   if (!provider) return []
 
   const section = getOrCreateProviderSection(diskCache, providerName)
   const allDiscoveredFiles = new Set<string>()
+  const servedSources = [...sources]
 
   type SourceInfo = { source: SessionSource; fp: NonNullable<Awaited<ReturnType<typeof fingerprintFile>>> }
   const unchangedSources: Array<{ source: SessionSource; cached: CachedFile }> = []
@@ -2169,7 +2184,7 @@ async function parseProviderSources(
     // comes from a live API fetch in createSessionParser. There's nothing to
     // fingerprint or incrementally cache, so re-fetch every run with a synthetic
     // fingerprint (mtime=now so the date-range filter below never excludes it).
-    if (provider.network) {
+    if (provider.network && !readOnly) {
       changedSources.push({ source, fp: { dev: 0, ino: 0, mtimeMs: Date.now(), sizeBytes: 0 } })
       continue
     }
@@ -2182,10 +2197,23 @@ async function parseProviderSources(
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (action.action === 'unchanged' && cached && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))) {
+    if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       unchangedSources.push({ source, cached })
-    } else {
+    } else if (!readOnly) {
       changedSources.push({ source, fp })
+    }
+  }
+
+  if (readOnly) {
+    for (const [path, cached] of Object.entries(section.files)) {
+      if (allDiscoveredFiles.has(path)) continue
+      servedSources.push({
+        provider: providerName,
+        path,
+        project: cached.turns[0]?.calls[0]?.project ?? providerName,
+      })
+      allDiscoveredFiles.add(path)
+      unchangedSources.push({ source: servedSources[servedSources.length - 1]!, cached })
     }
   }
 
@@ -2292,12 +2320,12 @@ async function parseProviderSources(
 
   // Stamp the durable flag into the cache section so the orphan-bootstrap in
   // parseAllSessions can fast-check without a getProvider() round-trip.
-  if (provider.durableSources && !section.durable) {
+  if (!readOnly && provider.durableSources && !section.durable) {
     section.durable = true
     ;(diskCache as { _dirty?: boolean })._dirty = true
   }
 
-  if (sources.length > 0 && !provider.durableSources) {
+  if (!readOnly && sources.length > 0 && !provider.durableSources) {
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
         delete section.files[cachedPath]
@@ -2308,7 +2336,7 @@ async function parseProviderSources(
 
   // 90-day age-out for durable providers: remove entries whose newest call is
   // older than 90 days so the cache doesn't grow unboundedly over time.
-  if (provider.durableSources) {
+  if (!readOnly && provider.durableSources) {
     const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
       const newestTs = cachedFile.turns
@@ -2327,7 +2355,7 @@ async function parseProviderSources(
   // Uses seenKeys (shared across providers) for cross-provider dedup.
   const sessionMap = new Map<string, { project: string; projectPath?: string; turns: ClassifiedTurn[] }>()
 
-  for (const source of sources) {
+  for (const source of servedSources) {
     const cachedFile = section.files[source.path]
     if (!cachedFile) continue
 
@@ -2595,21 +2623,59 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   // If another live process is already hydrating, wait for it, then reload the
   // now-warm cache instead of double-parsing. Never a correctness gate: on any
   // doubt it proceeds unlocked.
-  const hydration = await beginColdHydration(!isCacheComplete(diskCache))
-  if (hydration.waited) diskCache = await loadCache()
+  if (!isCacheComplete(diskCache)) {
+    const hydration = await beginColdHydration(true)
+    if (hydration.waited) diskCache = await loadCache()
+    const isCold = !isCacheComplete(diskCache)
+    try {
+      return await runParse(key, diskCache, dateRange, providerFilter, { isCold })
+    } finally {
+      await hydration.release()
+    }
+  }
 
-  // Cold = this run finishes a genuine (possibly resumed) full parse. A warm run
-  // reconciles an already-complete corpus. Drives the splash's cold-only reveal
-  // and the daily backfill's "don't finalize partial history" guard.
-  const isCold = !isCacheComplete(diskCache)
+  // A complete cache refresh is a strict read/reconcile/parse/save transaction.
+  // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
+  // exactly this complete snapshot and never mutate or invalidate the holder.
+  const priorSnapshot = diskCache
+  const refresh = await acquireCacheRefreshLock()
+  if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
+    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true })
+  }
+  if (refresh.outcome === 'completed-by-other') {
+    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
+  }
+
   try {
-    return await runParse(key, diskCache, dateRange, providerFilter, isCold)
+    // Reload only after ownership is canonical; this closes the lost-update
+    // window between the pre-gate read and the holder's completed publication.
+    diskCache = await loadCache()
+    return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle })
+  } catch (err) {
+    if (!(err instanceof RefreshFenceLostError) && !(err instanceof RefreshPublicationUnavailableError)) throw err
+    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
   } finally {
-    await hydration.release()
+    await refresh.handle.release()
   }
 }
 
-async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRange, providerFilter?: string, isCold = false): Promise<ProjectSummary[]> {
+class RefreshFenceLostError extends Error {}
+class RefreshPublicationUnavailableError extends Error {}
+
+type RunParseOptions = {
+  isCold?: boolean
+  readOnly?: boolean
+  refreshLock?: RefreshLockHandle
+}
+
+async function runParse(
+  key: string,
+  diskCache: SessionCache,
+  dateRange?: DateRange,
+  providerFilter?: string,
+  options: RunParseOptions = {},
+): Promise<ProjectSummary[]> {
+  const { isCold = false, readOnly = false, refreshLock } = options
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -2630,6 +2696,7 @@ async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRa
   // never races the final save below.
   let lastSaveAt = Date.now()
   const saveProgress = async (): Promise<void> => {
+    if (!isCold || readOnly) return
     if (!(diskCache as { _dirty?: boolean })._dirty) return
     if (Date.now() - lastSaveAt < PROGRESS_SAVE_THROTTLE_MS) return
     lastSaveAt = Date.now()
@@ -2651,7 +2718,7 @@ async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRa
   if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'start' })
   let claudeProjects: ProjectSummary[] = []
   try {
-    claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress)
+    claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
     if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
   } catch (err) {
     if (!isPermissionError(err)) throw err
@@ -2663,7 +2730,7 @@ async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRa
   for (const [providerName, sources] of providerGroups) {
     emitScanProgress({ kind: 'provider', provider: providerName, state: 'start' })
     try {
-      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange)
+      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, readOnly)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'done', files: sources.length })
       otherProjects.push(...projects)
     } catch (err) {
@@ -2692,7 +2759,7 @@ async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRa
     // constant — both checks are O(1) and avoid a getProvider() dynamic-import
     // round-trip for every unprocessed provider in the disk cache.
     if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
-    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange)
+    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, readOnly)
     otherProjects.push(...projects)
   }
 
@@ -2703,9 +2770,15 @@ async function runParse(key: string, diskCache: SessionCache, dateRange?: DateRa
   // on is durable. A run killed before here never reaches this, so its throttled
   // partial saves keep `complete: false` and the next launch resumes cold.
   const wasComplete = isCacheComplete(diskCache)
-  if (!wasComplete) diskCache.complete = true
-  if ((diskCache as { _dirty?: boolean })._dirty || !wasComplete) {
-    try { await saveCache(diskCache) } catch {}
+  if (!readOnly && !wasComplete) diskCache.complete = true
+  if (!readOnly && ((diskCache as { _dirty?: boolean })._dirty || !wasComplete)) {
+    try {
+      const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
+      if (!published) throw new RefreshFenceLostError()
+    } catch (err) {
+      if (err instanceof RefreshFenceLostError) throw err
+      if (refreshLock) throw new RefreshPublicationUnavailableError()
+    }
   }
   sessionHydrationComplete = true
 
