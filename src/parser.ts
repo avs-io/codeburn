@@ -1,4 +1,5 @@
-import { existsSync } from 'fs'
+import { createReadStream, existsSync } from 'fs'
+import { createHash } from 'crypto'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
@@ -1595,7 +1596,7 @@ async function scanProjectDirs(
 
   type FileInfo = { dirName: string; fp: NonNullable<Awaited<ReturnType<typeof fingerprintFile>>>; source?: SessionSourceMetadata }
   const unchangedFiles: Array<{ filePath: string; dirName: string; source?: SessionSourceMetadata; cached: CachedFile }> = []
-  const changedFiles: Array<{ filePath: string; info: FileInfo }> = []
+  const changedFiles: Array<{ filePath: string; info: FileInfo; cached?: CachedFile }> = []
 
   const discoverProgress = createScanProgress('scanning claude project dirs', dirs.length)
   let dirsDone = 0
@@ -1611,7 +1612,7 @@ async function scanProjectDirs(
       if (cached && (readOnly || action.action === 'unchanged')) {
         unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
       } else if (!readOnly) {
-        changedFiles.push({ filePath, info: { dirName, fp, source } })
+        changedFiles.push({ filePath, info: { dirName, fp, source }, cached })
       }
     }
     dirsDone++
@@ -1642,24 +1643,77 @@ async function scanProjectDirs(
   const progressTotal = changedFiles.length
   let filesDone = 0
   emitScanProgress({ kind: 'tick', provider: 'claude', done: 0, total: progressTotal })
-  for (const { filePath, info } of changedFiles) {
+  for (const { filePath, info, cached } of changedFiles) {
     delete section.files[filePath]
 
     try {
-      const tracker = { lastCompleteLineOffset: 0 }
-      const entries = await parseClaudeEntries(filePath, tracker)
-      if (!entries) { filesDone++; await parseProgress.tick(filesDone); continue }
+      let tracker = { lastCompleteLineOffset: 0 }
+      let parsed: Awaited<ReturnType<typeof parseClaudeEntries>> | undefined
+      let retainedTurns: CachedTurn[] = []
+      let incremental = false
 
-      const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds)
-      const cwd = extractCanonicalCwd(entries)
+      if (
+        cached?.checkpoint
+        && info.fp.sizeBytes > cached.fingerprint.sizeBytes
+        && await matchesClaudeCheckpointPrefix(filePath, cached)
+      ) {
+        tracker = { lastCompleteLineOffset: cached.checkpoint.parsedBytes }
+        const suffix = await parseClaudeEntries(filePath, tracker, cached.checkpoint.parsedBytes)
+        retainedTurns = cached.checkpoint.parsedBytes === 0
+          ? []
+          : cached.turns.slice(0, firstOpenTurnMatchesCachedLast(suffix.entries, cached) ? -1 : undefined)
+
+        // A repeated streaming id may update the provisional turn (which was
+        // deliberately dropped), but an id from a retained turn would make a
+        // boundary-only replay non-deterministic. Full parse that rare shape.
+        if (!suffixSupersedesRetainedTurn(suffix.entries, retainedTurns)) {
+          parsed = suffix
+          incremental = true
+        }
+      }
+
+      if (!parsed) {
+        tracker = { lastCompleteLineOffset: 0 }
+        parsed = await parseClaudeEntries(filePath, tracker)
+        retainedTurns = []
+      }
+
+      if (!parsed.hasLines || parsed.entries.length === 0) {
+        if (!incremental) { filesDone++; await parseProgress.tick(filesDone); continue }
+      }
+
+      for (const turn of retainedTurns) {
+        for (const call of turn.calls) seenMsgIds.add(call.deduplicationKey)
+      }
+      const newTurns = groupIntoTurns(dedupeStreamingMessageIds(parsed.entries), seenMsgIds)
+      const turns = [...retainedTurns, ...newTurns.map(parsedTurnToCachedTurn)]
+      const cwd = incremental && cached?.canonicalCwd
+        ? undefined
+        : extractCanonicalCwd(parsed.entries)
       const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+      const checkpointOffset = parsed.checkpointOffset
+      // A checkpoint is an optimization, not a correctness requirement. If its
+      // hash cannot be read, keep the full parse and let the next refresh take
+      // the normal full-parse path rather than caching a failure marker.
+      const prefixSha256 = await sha256FilePrefix(filePath, checkpointOffset).catch(() => undefined)
+      const incrementalInventory = extractMcpInventory(parsed.entries)
       section.files[filePath] = {
         fingerprint: info.fp,
         lastCompleteLineOffset: tracker.lastCompleteLineOffset,
-        canonicalCwd: canonical?.path,
-        canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
-        mcpInventory: extractMcpInventory(entries),
-        turns: turns.map(parsedTurnToCachedTurn),
+        checkpoint: prefixSha256
+          ? { parsedBytes: checkpointOffset, prefixSha256, version: 1 }
+          : undefined,
+        canonicalCwd: incremental ? cached?.canonicalCwd ?? canonical?.path : canonical?.path,
+        canonicalProjectName: incremental
+          ? cached?.canonicalProjectName
+            ?? (canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined)
+          : canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
+        // extractMcpInventory returns sorted names, so a sorted union keeps
+        // the incremental result deep-equal to a from-scratch parse.
+        mcpInventory: incremental
+          ? Array.from(new Set([...(cached?.mcpInventory ?? []), ...incrementalInventory])).sort()
+          : incrementalInventory,
+        turns,
         agentType: await readAgentType(filePath),
       }
       ;(diskCache as { _dirty?: boolean })._dirty = true
@@ -1984,19 +2038,88 @@ function cachedTurnToClassified(turn: CachedTurn): ClassifiedTurn {
 async function parseClaudeEntries(
   filePath: string,
   tracker: { lastCompleteLineOffset: number },
-): Promise<JournalEntry[] | null> {
+  startByteOffset = 0,
+): Promise<{ entries: JournalEntry[]; checkpointOffset: number; hasLines: boolean }> {
   const entries: JournalEntry[] = []
   let hasLines = false
+  let nextLineStart = startByteOffset
+  let openTurnStart: number | undefined
   for await (const line of readSessionLines(filePath, undefined, {
     largeLineAsBuffer: true,
+    startByteOffset,
     byteOffsetTracker: tracker,
   })) {
     hasLines = true
+    // The tracker advances before a yielded complete line. Empty lines are not
+    // yielded, so using the preceding yielded boundary is conservative: a
+    // checkpoint may re-read harmless blank lines but can never begin mid-line.
+    const lineStart = nextLineStart
+    nextLineStart = tracker.lastCompleteLineOffset
     const entry = parseJsonlLine(line)
-    if (entry) entries.push(compactEntry(entry))
+    if (!entry) continue
+    const compacted = compactEntry(entry)
+    entries.push(compacted)
+    if (compacted.type === 'user' && getUserMessageText(compacted).trim()) {
+      openTurnStart = lineStart
+    }
   }
-  if (!hasLines || entries.length === 0) return null
-  return entries
+  return { entries, checkpointOffset: openTurnStart ?? startByteOffset, hasLines }
+}
+
+async function sha256FilePrefix(filePath: string, byteLength: number): Promise<string> {
+  const hash = createHash('sha256')
+  if (byteLength === 0) return hash.digest('hex')
+  await new Promise<void>((resolvePromise, reject) => {
+    const stream = createReadStream(filePath, { start: 0, end: byteLength - 1 })
+    stream.on('data', chunk => hash.update(chunk))
+    stream.on('end', resolvePromise)
+    stream.on('error', reject)
+  })
+  return hash.digest('hex')
+}
+
+/** Exported for the parity suite's load-bearing-guard assertion. */
+export async function matchesClaudeCheckpointPrefix(
+  filePath: string,
+  cached: CachedFile,
+  validatePrefixHash = true,
+): Promise<boolean> {
+  const checkpoint = cached.checkpoint
+  if (!checkpoint || checkpoint.version !== 1) return false
+  if (!validatePrefixHash) return true
+  try {
+    return await sha256FilePrefix(filePath, checkpoint.parsedBytes) === checkpoint.prefixSha256
+  } catch {
+    return false
+  }
+}
+
+function firstOpenTurnMatchesCachedLast(entries: JournalEntry[], cached: CachedFile): boolean {
+  const last = cached.turns.at(-1)
+  if (!last) return false
+  const suffixKeys = new Set<string>()
+  for (const entry of entries) {
+    const call = parseApiCall(entry)
+    if (call) suffixKeys.add(call.deduplicationKey)
+    for (const advisorCall of parseAdvisorCalls(entry)) suffixKeys.add(advisorCall.deduplicationKey)
+  }
+  // The checkpoint suffix contains the whole provisional turn. A cached last
+  // turn belongs to that suffix iff at least one of its calls is re-observed;
+  // this avoids guessing from timestamps or identical adjacent user messages.
+  return last.calls.some(call => suffixKeys.has(call.deduplicationKey))
+}
+
+function suffixSupersedesRetainedTurn(entries: JournalEntry[], retained: CachedTurn[]): boolean {
+  const retainedKeys = new Set(retained.flatMap(turn => turn.calls.map(call => call.deduplicationKey)))
+  for (const entry of entries) {
+    const id = getMessageId(entry)
+    if (!id) continue
+    if (retainedKeys.has(id)) return true
+    for (const key of retainedKeys) {
+      if (key.startsWith(`${id}:advisor:`)) return true
+    }
+  }
+  return false
 }
 
 function getOrCreateProviderSection(cache: SessionCache, provider: string): ProviderSection {

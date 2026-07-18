@@ -53,9 +53,27 @@ export type FileFingerprint = {
   sizeBytes: number
 }
 
+export type ClaudeParseCheckpoint = {
+  /**
+   * Byte boundary immediately before Claude's current (therefore still
+   * mutable) turn. `groupIntoTurns` closes a turn only when the next non-empty
+   * user record arrives, while `dedupeStreamingMessageIds` lets later records
+   * replace an assistant message by id. Re-reading from this boundary therefore
+   * includes every record that can still change the cached result; if the
+   * suffix references an id in an earlier retained turn, the parser falls back
+   * to a full parse instead of trying to serialize parser/dedup state.
+   */
+  parsedBytes: number
+  prefixSha256: string
+  version: 1
+}
+
 export type CachedFile = {
   fingerprint: FileFingerprint
   lastCompleteLineOffset?: number
+  // Claude scanProjectDirs entries only. Other providers intentionally retain
+  // their existing cache and refresh behaviour.
+  checkpoint?: ClaudeParseCheckpoint
   canonicalCwd?: string
   canonicalProjectName?: string
   mcpInventory: string[]
@@ -94,11 +112,14 @@ export type SessionCache = {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
+// v6: Claude JSONL entries carry a prefix-validated turn-boundary checkpoint.
+// Older caches take one full parse before incremental refresh is available.
+//
 // v5: kiro joined the costUSD pass-through allowlist (credit-based pricing).
 // Cached kiro entries from v4 carry costUSD: undefined and would keep being
 // re-priced from estimated tokens forever, since historical session files
 // never change. Bump forces a one-time re-parse so metered credit costs land.
-export const CACHE_VERSION = 5
+export const CACHE_VERSION = 6
 
 // The cache filename is version-suffixed so different binaries (e.g. an old
 // launchd menubar on a prior release and a newer desktop app) each own a
@@ -243,6 +264,16 @@ function validateFingerprint(fp: unknown): fp is FileFingerprint {
   return isNum(f['dev']) && isNum(f['ino']) && isNum(f['mtimeMs']) && isNum(f['sizeBytes'])
 }
 
+function validateClaudeParseCheckpoint(checkpoint: unknown): checkpoint is ClaudeParseCheckpoint {
+  if (!checkpoint || typeof checkpoint !== 'object') return false
+  const c = checkpoint as Record<string, unknown>
+  return c['version'] === 1
+    && isNum(c['parsedBytes'])
+    && (c['parsedBytes'] as number) >= 0
+    && typeof c['prefixSha256'] === 'string'
+    && /^[0-9a-f]{64}$/.test(c['prefixSha256'] as string)
+}
+
 function validateUsage(u: unknown): u is CachedUsage {
   if (!u || typeof u !== 'object') return false
   const o = u as Record<string, unknown>
@@ -287,6 +318,7 @@ function validateCachedFile(f: unknown): f is CachedFile {
   const o = f as Record<string, unknown>
   return validateFingerprint(o['fingerprint'])
     && isOptionalNum(o['lastCompleteLineOffset'])
+    && (o['checkpoint'] === undefined || validateClaudeParseCheckpoint(o['checkpoint']))
     && isOptionalString(o['canonicalCwd'])
     && isOptionalString(o['canonicalProjectName'])
     && isStringArray(o['mcpInventory'])
