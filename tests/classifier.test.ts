@@ -79,11 +79,11 @@ describe('classifyTurn — Skill subCategory', () => {
     expect(c.subCategory).toBeUndefined()
   })
 
-  it('does not attach subCategory when category is not general (e.g. Skill alongside Edit promotes to coding)', () => {
+  it('attaches subCategory without changing the category when Skill fires alongside Edit', () => {
     const turn = makeTurn([makeCall({ tools: ['Skill', 'Edit'], skills: ['init'] })])
     const c = classifyTurn(turn)
     expect(c.category).toBe('coding')
-    expect(c.subCategory).toBeUndefined()
+    expect(c.subCategory).toBe('init')
   })
 
   it('does not attach subCategory for non-Skill general turns', () => {

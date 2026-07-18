@@ -208,10 +208,8 @@ export function classifyTurn(turn: ParsedTurn): ClassifiedTurn {
 
   const result: ClassifiedTurn = { ...turn, category, retries: countRetries(turn), hasEdits: turnHasEdits(turn) }
 
-  if (category === 'general') {
-    const skills = getAllSkills(turn)
-    if (skills.length > 0) result.subCategory = skills[0]
-  }
+  const skills = getAllSkills(turn)
+  if (skills.length > 0) result.subCategory = skills[0]
 
   return result
 }

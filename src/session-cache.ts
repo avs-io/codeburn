@@ -142,7 +142,7 @@ export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
 // re-parse, which lands the flag too, and durable orphans now survive
 // fingerprint changes (the carry-forward in getOrCreateProviderSection).
 export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
-  claude: 'advisor-usage-v1',
+  claude: 'advisor-usage-v1-skills',
   cline: 'worktree-project-grouping-v1',
   codewhale: 'aggregate-session-v1-est-cost',
   // Bump when the Codex parser changes attribution so unchanged, already-cached
