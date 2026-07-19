@@ -71,7 +71,7 @@ type RepoIdentity = {
 
 function canonicalPath(path: string): string {
   try {
-    return realpathSync(path)
+    return realpathSync.native(path)
   } catch {
     return path
   }
@@ -110,6 +110,9 @@ function resolveRepoIdentity(
       // common-dir as a realpath but the main worktree's as ".git" relative to
       // its (possibly symlinked) path, so both must be canonicalized to collapse
       // to one key.
+      // Accepted residual: moving the main repo after `git worktree add` leaves
+      // Git's linked-worktree metadata stale, so its worktrees may not unify;
+      // that is Git-state staleness, not a grouping bug.
       identity = { key: canonicalPath(resolve(dir, commonDir)), gitDir: dir }
     }
   }
