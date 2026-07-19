@@ -62,3 +62,12 @@ This agent-and-position-scoped key relies on the store invariant that each agent
 2. Test main and subagent wires together with a shared deduplication set.
 3. Preserve malformed-line and retry-only coverage when adding event variants.
 4. Keep fixtures sanitized and rooted in a temporary `KIMI_CODE_HOME`.
+
+## Subagent accounting (verified at source)
+
+Subagent token usage is recorded only in the subagent's own `wire.jsonl`.
+When a subagent completes, the parent's wire receives a `subagent.completed`
+summary event (informational, ignored by this parser), never a `usage.record`
+mirroring the child's tokens (see MoonshotAI/kimi-code,
+`packages/agent-core/src/session/subagent-host.ts`). Summing `usage.record`
+events across all agent wires therefore does not double count.
