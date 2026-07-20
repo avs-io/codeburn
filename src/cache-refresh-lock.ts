@@ -163,6 +163,19 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
   const token = randomBytes(16).toString('hex')
   const body = (): string => JSON.stringify({ pid: process.pid, token, at: clock.wallNow() })
 
+  // In-process serializer for every operation that takes the takeover guard on
+  // behalf of THIS owner (heartbeat tick, publication fence). Without it the
+  // fence can observe its own heartbeat's guard file and read "guard held" as
+  // "displaced", aborting a legitimate publication — fail-safe but it throws
+  // away the parse the lock exists to protect. Cross-process semantics are
+  // untouched: the guard file still arbitrates between processes.
+  let ownerOpTail: Promise<unknown> = Promise.resolve()
+  const serializeOwnerOp = <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = ownerOpTail.then(fn)
+    ownerOpTail = next.catch(() => undefined)
+    return next
+  }
+
   const acquireTakeoverGuard = async (): Promise<'created' | 'exists' | 'unavailable'> => {
     const created = await createExclusive(takeoverPath, body())
     if (created !== 'exists') return created
@@ -203,7 +216,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
     }
   }
 
-  const verifyStillOwner = async (): Promise<boolean> => {
+  const verifyStillOwner = (): Promise<boolean> => serializeOwnerOp(async () => {
     const guard = await acquireTakeoverGuard()
     if (guard !== 'created') return false
     try {
@@ -212,13 +225,13 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
     } finally {
       await retryWindowsMutation(() => unlink(takeoverPath), sleep)
     }
-  }
+  })
 
   const makeHandle = (): RefreshLockHandle => {
     let released = false
     let heartbeatRunning = false
     const heartbeat = setInterval(() => {
-      void (async () => {
+      void serializeOwnerOp(async () => {
         if (released || heartbeatRunning) return
         heartbeatRunning = true
         const guard = await acquireTakeoverGuard()
@@ -234,7 +247,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
           await retryWindowsMutation(() => unlink(takeoverPath), sleep)
           heartbeatRunning = false
         }
-      })()
+      })
     }, heartbeatMs)
     heartbeat.unref()
 

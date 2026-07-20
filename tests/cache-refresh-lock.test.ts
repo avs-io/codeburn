@@ -203,4 +203,19 @@ describe('warm session-cache refresh lock', () => {
     expect(JSON.parse(await readFile(lockPath(dir), 'utf-8')).token).toBe('successor')
     expect(sessionCachePath()).toContain(dir)
   })
+
+  it('the fence never loses to its own heartbeat (in-process serialization)', async () => {
+    // Regression: verifyStillOwner and the heartbeat tick both take the
+    // takeover guard; without in-process serialization the fence could observe
+    // its own heartbeat's guard file and abort a legitimate publication.
+    // At a 1ms heartbeat this raced ~6% of the time before the fix.
+    const dir = await mkdtemp(join(tmpdir(), 'refresh-lock-'))
+    const result = await acquireCacheRefreshLock({ cacheDir: dir, heartbeatMs: 1 })
+    if (result.outcome !== 'acquired') throw new Error(`expected acquired, got ${result.outcome}`)
+    for (let i = 0; i < 300; i++) {
+      expect(await result.handle.verifyStillOwner()).toBe(true)
+    }
+    await result.handle.release()
+    await rm(dir, { recursive: true, force: true })
+  })
 })
