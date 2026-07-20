@@ -387,6 +387,17 @@ describe('reconcileFile', () => {
     expect(reconcileFile(changed, marker)).toEqual({ action: 'modified' })
   })
 
+  it('returns "modified" when the cached offset is stranded beyond the current EOF', () => {
+    // A truncate-then-regrow can leave the resume offset past live bytes; resuming
+    // there would drop the appended tail, so it must fall back to a full re-parse.
+    const cached = makeCachedFile({
+      fingerprint: { dev: 1, ino: 100, mtimeMs: 1000, sizeBytes: 5000 },
+      lastCompleteLineOffset: 9_000_000,
+    })
+    const current: FileFingerprint = { dev: 1, ino: 100, mtimeMs: 2000, sizeBytes: 8000 }
+    expect(reconcileFile(current, cached)).toEqual({ action: 'modified' })
+  })
+
   it('returns "modified" when size shrank', () => {
     const cached = makeCachedFile({
       fingerprint: { dev: 1, ino: 100, mtimeMs: 1000, sizeBytes: 5000 },

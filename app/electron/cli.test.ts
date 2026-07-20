@@ -12,6 +12,7 @@ const originalPathDirs = process.env.CODEBURN_PATH_DIRS
 const originalPathFile = process.env.CODEBURN_CLI_PATH_FILE
 const originalViteUrl = process.env.VITE_DEV_SERVER_URL
 const originalBundled = process.env.CODEBURN_BUNDLED_CLI
+const originalDevRepoRoot = process.env.CODEBURN_DEV_REPO_ROOT
 
 /** Writes an executable node script and points CODEBURN_BIN at it. */
 function fakeBin(name: string, body: string): string {
@@ -19,6 +20,17 @@ function fakeBin(name: string, body: string): string {
   writeFileSync(p, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 })
   chmodSync(p, 0o755)
   process.env.CODEBURN_BIN = p
+  return p
+}
+
+/** Writes the repo CLI under this test's isolated dev-root override. */
+function fakeDevRepoCli(): string {
+  const repoRoot = join(dir, 'dev-repo')
+  const p = join(repoRoot, 'dist', 'cli.js')
+  mkdirSync(dirname(p), { recursive: true })
+  writeFileSync(p, '#!/usr/bin/env node\n', { mode: 0o755 })
+  chmodSync(p, 0o755)
+  process.env.CODEBURN_DEV_REPO_ROOT = repoRoot
   return p
 }
 
@@ -37,6 +49,8 @@ afterEach(() => {
   else process.env.VITE_DEV_SERVER_URL = originalViteUrl
   if (originalBundled === undefined) delete process.env.CODEBURN_BUNDLED_CLI
   else process.env.CODEBURN_BUNDLED_CLI = originalBundled
+  if (originalDevRepoRoot === undefined) delete process.env.CODEBURN_DEV_REPO_ROOT
+  else process.env.CODEBURN_DEV_REPO_ROOT = originalDevRepoRoot
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -46,8 +60,9 @@ describe('resolveCodeburnPath (Vite development)', () => {
     process.env.CODEBURN_PATH_DIRS = ''
     process.env.CODEBURN_CLI_PATH_FILE = join(dir, 'no-persisted-path')
     process.env.VITE_DEV_SERVER_URL = 'http://localhost:5173'
+    const devBin = fakeDevRepoCli()
 
-    expect(resolveCodeburnPath()).toMatch(/dist\/cli\.js$/)
+    expect(resolveCodeburnPath()).toBe(devBin)
   })
 
   it('prefers the repo dev CLI over a persisted-path file (stale global) in dev', () => {
@@ -63,9 +78,10 @@ describe('resolveCodeburnPath (Vite development)', () => {
     writeFileSync(persistedFile, persistedTarget)
     process.env.CODEBURN_CLI_PATH_FILE = persistedFile
     process.env.VITE_DEV_SERVER_URL = 'http://localhost:5173'
+    const devBin = fakeDevRepoCli()
 
     const resolved = resolveCodeburnPath()
-    expect(resolved).toMatch(/dist\/cli\.js$/)
+    expect(resolved).toBe(devBin)
     expect(resolved).not.toBe(persistedTarget)
   })
 
@@ -120,10 +136,10 @@ describe('resolveTarget (bundled CLI in the packaged app)', () => {
     process.env.CODEBURN_CLI_PATH_FILE = join(dir, 'no-persisted-path')
     process.env.CODEBURN_BUNDLED_CLI = bundledEntry('bundled.js')
     process.env.VITE_DEV_SERVER_URL = 'http://localhost:5173'
+    const devBin = fakeDevRepoCli()
 
     const target = resolveTarget()
-    expect(target?.kind).toBe('external')
-    expect(target && target.kind === 'external' ? target.bin : '').toMatch(/dist\/cli\.js$/)
+    expect(target).toEqual({ kind: 'external', bin: devBin })
   })
 
   it('falls through when CODEBURN_BUNDLED_CLI points at a missing file', () => {
@@ -381,6 +397,133 @@ describe('killAll', () => {
     await new Promise(resolve => setTimeout(resolve, 50))
     killAll()
     await expect(pending).rejects.toMatchObject({ kind: 'nonzero' })
+  })
+})
+
+describe('spawnCli concurrency scheduler', () => {
+  // A fake CLI that records each spawn (by subcommand) and then blocks until a
+  // release file named after that subcommand appears, so the test controls
+  // exactly when each child exits and can observe how many run at once.
+  function schedulerBin(startedFile: string, releaseDir: string): void {
+    fakeBin(
+      'sched.js',
+      `const fs = require('fs'); const path = require('path');
+       const cmd = process.argv[2];
+       fs.appendFileSync(${JSON.stringify(startedFile)}, cmd + '\\n');
+       const rel = path.join(${JSON.stringify(releaseDir)}, cmd);
+       const t = setInterval(() => {
+         if (fs.existsSync(rel)) { clearInterval(t); process.stdout.write('{}'); process.exit(0); }
+       }, 5);`,
+    )
+  }
+  function startedList(startedFile: string): string[] {
+    try { return readFileSync(startedFile, 'utf8').split('\n').filter(Boolean) } catch { return [] }
+  }
+  function release(releaseDir: string, cmd: string): void { writeFileSync(join(releaseDir, cmd), '') }
+  async function waitUntil(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error('waitUntil timed out')
+      await new Promise(r => setTimeout(r, 10))
+    }
+  }
+  const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+  // Reset scheduler state so a leaked running slot can never starve the next test.
+  afterEach(() => { killAll() })
+
+  it('runs at most two children at once; a third waits for a freed slot', async () => {
+    const startedFile = join(dir, 'started')
+    const releaseDir = join(dir, 'release'); mkdirSync(releaseDir)
+    schedulerBin(startedFile, releaseDir)
+
+    const p1 = spawnCli(['status'])
+    const p2 = spawnCli(['models'])
+    const p3 = spawnCli(['sessions'])
+    await waitUntil(() => startedList(startedFile).length === 2)
+    await delay(100) // the cap must keep the third from sneaking in
+    expect(startedList(startedFile).sort()).toEqual(['models', 'status'])
+
+    release(releaseDir, 'status') // free one slot
+    await waitUntil(() => startedList(startedFile).includes('sessions'))
+
+    release(releaseDir, 'models'); release(releaseDir, 'sessions')
+    await Promise.all([p1, p2, p3])
+  })
+
+  it('lets a later interactive spawn preempt an earlier queued background one', async () => {
+    const startedFile = join(dir, 'started')
+    const releaseDir = join(dir, 'release'); mkdirSync(releaseDir)
+    schedulerBin(startedFile, releaseDir)
+
+    // Fill both slots so the next two calls must queue.
+    const p1 = spawnCli(['fill1'], { priority: 'background' })
+    const p2 = spawnCli(['fill2'], { priority: 'background' })
+    await waitUntil(() => startedList(startedFile).length === 2)
+
+    // Queue a background first, then an interactive.
+    const pbg = spawnCli(['bg'], { priority: 'background' })
+    const pint = spawnCli(['inter'], { priority: 'interactive' })
+    await delay(50)
+    expect(startedList(startedFile)).not.toContain('bg')
+    expect(startedList(startedFile)).not.toContain('inter')
+
+    // Free exactly one slot: the interactive must take it despite queueing later.
+    release(releaseDir, 'fill1')
+    await waitUntil(() => startedList(startedFile).length === 3)
+    expect(startedList(startedFile)).toContain('inter')
+    expect(startedList(startedFile)).not.toContain('bg')
+
+    release(releaseDir, 'fill2'); release(releaseDir, 'inter'); release(releaseDir, 'bg')
+    await Promise.all([p1, p2, pbg, pint])
+  })
+
+  it('does not spend a slot on a coalesced (same-argv) call', async () => {
+    const startedFile = join(dir, 'started')
+    const releaseDir = join(dir, 'release'); mkdirSync(releaseDir)
+    schedulerBin(startedFile, releaseDir)
+
+    const p1 = spawnCli(['status'])
+    const p2 = spawnCli(['models'])
+    await waitUntil(() => startedList(startedFile).length === 2)
+
+    const p1b = spawnCli(['status'])   // coalesces onto p1's child — no new slot
+    const p3 = spawnCli(['sessions'])  // genuinely new — queued behind the cap
+    await delay(100)
+    expect(startedList(startedFile).length).toBe(2) // still just the two originals
+
+    release(releaseDir, 'status') // frees the slot the coalesced pair shared
+    await waitUntil(() => startedList(startedFile).includes('sessions'))
+
+    release(releaseDir, 'models'); release(releaseDir, 'sessions')
+    const [a, b] = await Promise.all([p1, p1b])
+    expect(a).toEqual(b) // one child served both callers
+    await Promise.all([p2, p3])
+  })
+
+  it('cancels a queued spawn on killAll instead of letting it spawn later', async () => {
+    const startedFile = join(dir, 'started')
+    const releaseDir = join(dir, 'release'); mkdirSync(releaseDir)
+    schedulerBin(startedFile, releaseDir)
+
+    const p1 = spawnCli(['status'])
+    const p2 = spawnCli(['models'])
+    await waitUntil(() => startedList(startedFile).length === 2)
+    const p3 = spawnCli(['sessions']) // queued behind the cap, no child yet
+    await delay(50)
+    expect(startedList(startedFile)).not.toContain('sessions')
+
+    killAll() // reaps the two running AND cancels the queued third
+    // Attach all three rejection handlers synchronously: the queued spawn rejects
+    // at once, so it must not sit unhandled while the killed children settle.
+    await Promise.all([
+      expect(p1).rejects.toMatchObject({ kind: 'nonzero' }),
+      expect(p2).rejects.toMatchObject({ kind: 'nonzero' }),
+      expect(p3).rejects.toMatchObject({ kind: 'nonzero' }),
+    ])
+
+    await delay(50)
+    expect(startedList(startedFile)).not.toContain('sessions') // never spawned
   })
 })
 

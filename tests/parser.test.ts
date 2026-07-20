@@ -455,3 +455,36 @@ describe('(f) durable orphans survive a parse-version bump', () => {
     expect(again).toBe(200)
   })
 })
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (g) Skill attribution is independent of turn category
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(g) skill attribution is independent of turn category', () => {
+  it('puts a Skill + Edit turn in skillBreakdown while preserving coding category', async () => {
+    const synthFile = join(tmpHome, 'synth-skill.txt')
+    await writeFile(synthFile, 'placeholder')
+
+    _synthSources = [{ path: synthFile, project: 'test', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 10, outputTokens: 5,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0.001, tools: ['Skill', 'Edit'], bashCommands: [],
+      skills: ['telemetry-review'],
+      timestamp: '2026-07-18T12:00:00.000Z',
+      speed: 'standard',
+      deduplicationKey: 'synth-skill-edit',
+      userMessage: '', sessionId: 'synth-skill-session',
+    }]
+
+    const projects = await parseAllSessions(undefined, 'test-synthetic')
+    const session = projects.flatMap(project => project.sessions)[0]
+
+    expect(session).toBeDefined()
+    expect(session!.turns[0]!.category).toBe('coding')
+    expect(session!.turns[0]!.subCategory).toBe('telemetry-review')
+    expect(session!.categoryBreakdown.coding.turns).toBe(1)
+    expect(session!.skillBreakdown['telemetry-review']?.turns).toBe(1)
+  })
+})

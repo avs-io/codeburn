@@ -4,7 +4,7 @@
 
 // ————— Period + IPC error contract —————
 
-export type Period = 'today' | 'week' | '30days' | 'month' | 'all'
+export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
 
 export type DateRange = { from: string; to: string }
 
@@ -586,7 +586,9 @@ export interface CodeburnBridge {
   /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
   onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
   getQuota(force?: boolean): Promise<QuotaProvider[]>
-  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null): Promise<MenubarPayload>
+  // `background` (prefetch only) requests background CLI-spawn priority; optional
+  // so an older preload that ignores it degrades to interactive priority.
+  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean): Promise<MenubarPayload>
   getPlans(period: Period): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string

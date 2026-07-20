@@ -1507,6 +1507,7 @@ enum Period: String, CaseIterable, Identifiable {
     case thirtyDays = "30 Days"
     case month = "Month"
     case all = "6 Months"
+    case lifetime = "Lifetime"
 
     var id: String { rawValue }
 
@@ -1518,6 +1519,7 @@ enum Period: String, CaseIterable, Identifiable {
         case .thirtyDays: "30days"
         case .month: "month"
         case .all: "all"
+        case .lifetime: "lifetime"
         }
     }
 
@@ -1530,6 +1532,7 @@ enum Period: String, CaseIterable, Identifiable {
         case .thirtyDays: "30 Days"
         case .month: "Month"
         case .all: "6 Months"
+        case .lifetime: "Lifetime"
         }
     }
 
@@ -1540,6 +1543,7 @@ enum Period: String, CaseIterable, Identifiable {
         case .thirtyDays: "30days"
         case .month: "month"
         case .all: "sixMonths"
+        case .lifetime: "lifetime"
         }
     }
 
@@ -1549,6 +1553,7 @@ enum Period: String, CaseIterable, Identifiable {
         case "week", "sevenDays": self = .sevenDays
         case "month": self = .month
         case "sixMonths", "all": self = .all
+        case "lifetime": self = .lifetime
         default: self = .today
         }
     }
@@ -1569,6 +1574,9 @@ enum Period: String, CaseIterable, Identifiable {
         case .thirtyDays: compact ? "/30d" : " / 30d"
         case .month: compact ? "/mo" : " / mo"
         case .all: compact ? "/6mo" : " / 6mo"
+        // lifetime is a panel-only period (never a menubar metric, see
+        // menubarMetricCases), but the switch must stay exhaustive.
+        case .lifetime: compact ? "/life" : " / life"
         }
     }
 }

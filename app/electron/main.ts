@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult } from './cli'
+import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult, type SpawnPriority } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -13,6 +13,59 @@ let updateChecker: UpdateChecker | null = null
 
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
+
+type QuitTelemetry = Pick<Telemetry, 'trackClose' | 'flush'>
+type BeforeQuitEvent = { preventDefault: () => void }
+type BeforeQuitDeps = {
+  getTelemetry: () => QuitTelemetry | null
+  killAll: () => void
+  quit: () => void
+  timeoutMs?: number
+}
+
+const QUIT_FLUSH_TIMEOUT_MS = 1500
+
+/** Intercept one quit pass, then allow the re-entrant pass after a bounded flush. */
+export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQuitEvent) => void {
+  let flushStarted = false
+  let allowQuit = false
+  let closeTracked = false
+
+  return event => {
+    if (allowQuit) return
+    try { event.preventDefault() } catch { /* keep the quit path moving */ }
+    if (flushStarted) return
+    flushStarted = true
+
+    void (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        try { deps.killAll() } catch { /* child cleanup must not wedge quit */ }
+
+        let telemetry: QuitTelemetry | null = null
+        try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
+
+        let flush: Promise<unknown> = Promise.resolve(false)
+        if (telemetry) {
+          if (!closeTracked) {
+            closeTracked = true
+            try { telemetry.trackClose() } catch { /* flush the existing queue anyway */ }
+          }
+          try { flush = Promise.resolve(telemetry.flush()) } catch { /* use the resolved fallback */ }
+        }
+
+        const timeout = new Promise<void>(resolve => {
+          timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
+        })
+        await Promise.race([flush.catch(() => false), timeout])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        allowQuit = true
+        try { deps.quit() } catch { /* a throwing quit call must not reset the guard */ }
+      }
+    })()
+  }
+}
 
 // Result envelope: handlers never throw across IPC so the structured error
 // `kind` survives contextBridge serialization. preload.ts unwraps it.
@@ -161,7 +214,7 @@ function cliErrorProps(err: unknown, cmd: string | undefined): Record<string, un
 }
 
 type Deps = {
-  spawnCli: (args: string[], opts?: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv }) => Promise<unknown>
+  spawnCli: (args: string[], opts?: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv; priority?: SpawnPriority }) => Promise<unknown>
   spawnCliAction: (args: string[], opts?: { timeoutMs?: number }) => Promise<ActionResult>
   resolveCodeburnPath: () => string | null
   getQuota: typeof getQuota
@@ -221,15 +274,20 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
   ]
 
-  const getOverview: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null) => {
+  // `background` (renderer prefetch only) drops this fetch to background priority
+  // so it yields the CLI's run slots to any interactive poll or click. Optional
+  // and defaulting to interactive, so an older preload that omits it is unchanged.
+  const getOverview: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean) => {
     coldStartBegan ??= Date.now()
+    const priority: SpawnPriority | undefined = background ? 'background' : undefined
     try {
       const args = buildOverviewArgs(period, provider, range, configSource)
-      if (overviewWarmed) return { ok: true, value: await deps.spawnCli(args) }
+      if (overviewWarmed) return { ok: true, value: await deps.spawnCli(args, priority ? { priority } : undefined) }
       const value = await deps.spawnCli(args, {
         timeoutMs: WARMUP_TIMEOUT_MS,
         extraEnv: { CODEBURN_PROGRESS: '1' },
         onStderr: makeProgressReader(emitProgress),
+        ...(priority ? { priority } : {}),
       })
       overviewWarmed = true
       emitProgress({ kind: 'done' })
@@ -485,12 +543,11 @@ function bootstrap(): void {
     win.focus()
   })
 
-  app.on('before-quit', () => {
-    killAll()
-    // Best-effort final beat: session duration + whatever is still queued.
-    telemetryInstance?.trackClose()
-    void telemetryInstance?.flush()
-  })
+  app.on('before-quit', createBeforeQuitHandler({
+    getTelemetry: () => telemetryInstance,
+    killAll,
+    quit: () => app.quit(),
+  }))
 
   void app.whenReady().then(() => {
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
