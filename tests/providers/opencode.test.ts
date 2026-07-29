@@ -823,10 +823,11 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
       db.exec(`ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER`)
       db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER`)
       db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER`)
-      db.exec(`ALTER TABLE session ADD COLUMN model_id TEXT`)
+      // Real OpenCode session schema names this column `model`, not `model_id` (issue #769).
+      db.exec(`ALTER TABLE session ADD COLUMN model TEXT`)
 
       insertSession(db, 'sess-1')
-      db.prepare(`UPDATE session SET cost = 0.15, tokens_input = 5000, tokens_output = 2000, tokens_reasoning = 0, tokens_cache_read = 3000, tokens_cache_write = 1000, model_id = 'claude-sonnet-4-20250514' WHERE id = 'sess-1'`).run()
+      db.prepare(`UPDATE session SET cost = 0.15, tokens_input = 5000, tokens_output = 2000, tokens_reasoning = 0, tokens_cache_read = 3000, tokens_cache_write = 1000, model = 'claude-sonnet-4-20250514' WHERE id = 'sess-1'`).run()
 
       insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
         role: 'assistant', modelID: 'claude-sonnet-4-20250514',

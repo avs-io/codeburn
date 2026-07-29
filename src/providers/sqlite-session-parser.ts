@@ -43,11 +43,20 @@ function tryQuerySessionTokens(db: SqliteDatabase, sessionId: string): {
   cost: number; input: number; output: number; reasoning: number
   cacheRead: number; cacheWrite: number; model: string | undefined
 } | null {
+  // The real OpenCode session table names this column `model`, not `model_id`
+  // (issue #769). Some forks/older schemas may still use `model_id`, so try
+  // the current name first and fall back rather than assuming one or the other.
+  const select = (modelColumn: string) => db.query<SessionTokenRow>(
+    `SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, ${modelColumn} AS model_id FROM session WHERE id = ?`,
+    [sessionId],
+  )
   try {
-    const rows = db.query<SessionTokenRow>(
-      `SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model_id FROM session WHERE id = ?`,
-      [sessionId],
-    )
+    let rows: SessionTokenRow[]
+    try {
+      rows = select('model')
+    } catch {
+      rows = select('model_id')
+    }
     if (rows.length === 0) return null
     const r = rows[0]!
     return {
