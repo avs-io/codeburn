@@ -7,7 +7,8 @@ import { render } from 'ink'
 import stripAnsi from 'strip-ansi'
 import { describe, it, expect, onTestFinished, vi } from 'vitest'
 
-import { DAILY_ACTIVITY_PAGE_SIZE, INTERACTIVE_RENDER_OPTIONS, dailyActivityFooter, getDailyActivityPageSize, getDailyActivityRows, getDashboardMaxWidth, getDashboardScanRange, getLayout, getRefreshIntervalMs, InteractiveDashboard, pageHistoryCursor, scrollHistoryCursor, selectDashboardPeriodProjects, shortProject, showEmptyState } from '../src/dashboard.js'
+import { DAILY_ACTIVITY_PAGE_SIZE, INTERACTIVE_RENDER_OPTIONS, RESIZE_DEBOUNCE_MS, dailyActivityFooter, getDailyActivityPageSize, getDailyActivityRows, getDashboardMaxWidth, getDashboardScanRange, getLayout, getRefreshIntervalMs, InteractiveDashboard, pageHistoryCursor, renderDebouncedInteractive, scrollHistoryCursor, selectDashboardPeriodProjects, shortProject, showEmptyState } from '../src/dashboard.js'
+import { BSU, ESU } from '../src/ink-win.js'
 import { getDateRange } from '../src/cli-date.js'
 import { formatCost } from '../src/format.js'
 import type { ProjectSummary, SessionSummary } from '../src/types.js'
@@ -87,6 +88,36 @@ function makeTurn(timestamp: string, costs: number[]): SessionSummary['turns'][n
       deduplicationKey: `fixture-${timestamp}-${index}`,
     })),
   }
+}
+
+function synchronizedUpdates(writes: string[]): string[] {
+  const updates: string[] = []
+  let current: string | undefined
+  for (const write of writes) {
+    let rest = write
+    while (rest.length > 0) {
+      if (current === undefined) {
+        const start = rest.indexOf(BSU)
+        if (start === -1) break
+        current = ''
+        rest = rest.slice(start + BSU.length)
+      }
+      const end = rest.indexOf(ESU)
+      if (end === -1) {
+        current += rest
+        break
+      }
+      current += rest.slice(0, end)
+      updates.push(stripAnsi(current))
+      current = undefined
+      rest = rest.slice(end + ESU.length)
+    }
+  }
+  return updates
+}
+
+function writeDelta(writes: string[]): string {
+  return stripAnsi(writes.join(''))
 }
 
 // Logic replicated from TopSessions component
@@ -363,6 +394,7 @@ describe('Daily Activity viewport', () => {
       initialPeriod: 'all',
       initialProvider: 'all',
       refreshSeconds: 0,
+      terminalSize: { columns: stdout.columns, rows: stdout.rows },
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
     await app.waitUntilRenderFlush()
@@ -428,6 +460,7 @@ describe('interactive terminal rendering', () => {
         initialProvider: 'all',
         refreshSeconds: 60,
         initialDay,
+        terminalSize: { columns: stdout.columns, rows: stdout.rows },
       }), { stdin, stdout, interactive: true, patchConsole: false })
       onTestFinished(() => {
         app.unmount()
@@ -451,44 +484,41 @@ describe('interactive terminal rendering', () => {
     stdout.columns = 135
     stdout.rows = 50
     const chunks: string[] = []
-    stdout.on('data', chunk => chunks.push(stripAnsi(String(chunk))))
+    stdout.on('data', chunk => chunks.push(String(chunk)))
     const props = {
       initialProjects: [makeProject('proj', [makeSession('s1', 1)])],
       initialPeriod: 'today' as const,
       initialProvider: 'all',
       refreshSeconds: 0,
     }
-    const app = render(React.createElement(InteractiveDashboard, props), {
-      stdin, stdout, interactive: true, patchConsole: false,
-    })
+    const app = renderDebouncedInteractive(stdout, terminalSize => (
+      React.createElement(InteractiveDashboard, { ...props, terminalSize })
+    ), { stdin, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
     await new Promise(resolve => setTimeout(resolve, 20))
     chunks.length = 0
     stdout.columns = 134
     stdout.emit('resize')
-    for (let i = 0; i < 100; i++) {
-      await new Promise(resolve => setTimeout(resolve, 5))
-      const latest = chunks.filter(chunk => chunk.trim()).at(-1) ?? ''
-      const title = latest.split('\n').find(line => line.includes('Daily Activity')) ?? ''
-      if (title.includes('By Project') && !title.includes('By Activity')) break
-    }
+    await new Promise(resolve => setTimeout(resolve, RESIZE_DEBOUNCE_MS - 1))
+    expect(chunks).toEqual([])
+    await new Promise(resolve => setTimeout(resolve, 100))
 
-    let panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
+    expect(synchronizedUpdates(chunks)).toHaveLength(1)
+    let panelTitleLine = writeDelta(chunks).split('\n').find(line => line.includes('Daily Activity')) ?? ''
     expect(panelTitleLine).toContain('By Project')
     expect(panelTitleLine).not.toContain('By Activity')
 
     chunks.length = 0
     stdout.columns = 89
     stdout.emit('resize')
-    for (let i = 0; i < 100; i++) {
-      await new Promise(resolve => setTimeout(resolve, 5))
-      const latest = chunks.filter(chunk => chunk.trim()).at(-1) ?? ''
-      const title = latest.split('\n').find(line => line.includes('Daily Activity')) ?? ''
-      if (!title.includes('By Project')) break
-    }
+    await new Promise(resolve => setTimeout(resolve, RESIZE_DEBOUNCE_MS - 1))
+    expect(chunks).toEqual([])
+    await new Promise(resolve => setTimeout(resolve, 100))
 
-    panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
+    expect(synchronizedUpdates(chunks)).toHaveLength(1)
+    panelTitleLine = writeDelta(chunks).split('\n').find(line => line.includes('Daily Activity')) ?? ''
+    expect(panelTitleLine).toContain('Daily Activity')
     expect(panelTitleLine).not.toContain('By Project')
   })
 
@@ -514,9 +544,9 @@ describe('interactive terminal rendering', () => {
       initialProvider: 'all',
       refreshSeconds: 0,
     }
-    const app = render(React.createElement(InteractiveDashboard, props), {
-      stdin, stdout, debug: true, interactive: true, patchConsole: false,
-    })
+    const app = renderDebouncedInteractive(stdout, terminalSize => (
+      React.createElement(InteractiveDashboard, { ...props, terminalSize })
+    ), { stdin, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
     await app.waitUntilRenderFlush()
@@ -534,6 +564,63 @@ describe('interactive terminal rendering', () => {
     await app.waitUntilRenderFlush()
     frame = frames.filter(chunk => chunk.trim()).at(-1) ?? ''
     expect(frame).not.toContain('[ Today ]')
+  })
+
+  it('writes one final dashboard frame while preserving a scrolled viewport', async () => {
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+    const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+    stdin.isTTY = true
+    stdin.setRawMode = () => stdin
+    stdin.ref = () => stdin
+    stdin.unref = () => stdin
+    stdout.isTTY = true
+    stdout.columns = 100
+    stdout.rows = 12
+    const writes: string[] = []
+    stdout.on('data', chunk => writes.push(String(chunk)))
+    const history = makeSession('history', 20)
+    history.turns = Array.from({ length: 20 }, (_, index) =>
+      makeTurn(`2026-07-${String(index + 1).padStart(2, '0')}T10:00:00Z`, [1]))
+    const projects = [
+      makeProject('project-01', [history]),
+      ...Array.from({ length: 13 }, (_, index) =>
+        makeProject(`project-${String(index + 2).padStart(2, '0')}`, [makeSession(`s-${index}`, 1)])),
+    ]
+    const app = renderDebouncedInteractive(stdout, terminalSize => React.createElement(InteractiveDashboard, {
+      initialProjects: projects,
+      initialPeriod: 'all',
+      initialProvider: 'all',
+      refreshSeconds: 0,
+      terminalSize,
+    }), { stdin, interactive: true, patchConsole: false, alternateScreen: true })
+    onTestFinished(() => app.unmount())
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    for (let i = 0; i < 8; i++) stdin.write('\u001B[6~')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    writes.length = 0
+
+    stdout.columns = 99
+    stdout.rows = 49
+    stdout.emit('resize')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    stdout.columns = 98
+    stdout.rows = 48
+    stdout.emit('resize')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    stdout.columns = 89
+    stdout.rows = 50
+    stdout.emit('resize')
+    await new Promise(resolve => setTimeout(resolve, RESIZE_DEBOUNCE_MS - 1))
+    expect(writes).toEqual([])
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    const frames = synchronizedUpdates(writes)
+    expect(frames).toHaveLength(1)
+    expect(frames[0]).toContain('By Model')
+    expect(frames[0]).toContain('PgUp/PgDn')
+    expect(frames[0].split('\n')).toHaveLength(50)
+    expect(frames[0]).not.toContain('[ 6 Months ]')
   })
 })
 
@@ -594,6 +681,7 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 0,
+      terminalSize: { columns: stdout.columns, rows: stdout.rows },
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
@@ -653,6 +741,7 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 0,
+      terminalSize: { columns: stdout.columns, rows: stdout.rows },
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
@@ -691,6 +780,7 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 60,
+      terminalSize: { columns: stdout.columns, rows: stdout.rows },
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => {
       app.unmount()

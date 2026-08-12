@@ -2,7 +2,7 @@ import { homedir } from 'os'
 import { EventEmitter } from 'node:events'
 
 import React, { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
-import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
+import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -33,7 +33,11 @@ export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
 export const RESIZE_DEBOUNCE_MS = 150
 
-export type DebouncedResizeStream = NodeJS.WriteStream & { dispose(): void }
+export type TerminalSize = { columns: number; rows: number }
+export type DebouncedResizeStream = NodeJS.WriteStream & {
+  dispose(): void
+  onSettledResize(listener: (size: TerminalSize) => void): () => void
+}
 
 export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs: number): DebouncedResizeStream {
   let resizeTimer: ReturnType<typeof setTimeout> | undefined
@@ -41,6 +45,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
   let columns = source.columns
   let rows = source.rows
   const resizeEvents = new EventEmitter()
+  const settledResizeListeners = new Set<(size: TerminalSize) => void>()
 
   const resize = () => {
     if (resizeTimer) clearTimeout(resizeTimer)
@@ -49,7 +54,8 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
       if (disposed) return
       columns = source.columns
       rows = source.rows
-      resizeEvents.emit('resize')
+      const size = { columns, rows }
+      for (const listener of [...settledResizeListeners]) listener(size)
     }, delayMs)
   }
   source.on('resize', resize)
@@ -61,6 +67,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
     if (resizeTimer) clearTimeout(resizeTimer)
     resizeTimer = undefined
     resizeEvents.removeAllListeners()
+    settledResizeListeners.clear()
   }
 
   const listenerMethods = new Set<PropertyKey>([
@@ -71,11 +78,18 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
   stream = new Proxy(source as DebouncedResizeStream, {
     get(target, property) {
       if (property === 'dispose') return dispose
+      if (property === 'onSettledResize') {
+        return (listener: (size: TerminalSize) => void) => {
+          if (disposed) return () => {}
+          settledResizeListeners.add(listener)
+          return () => settledResizeListeners.delete(listener)
+        }
+      }
       if (property === 'columns') return columns
       if (property === 'rows') return rows
       if (property === 'emit') {
         return (event: string | symbol, ...args: unknown[]) => event === 'resize'
-          ? resizeEvents.emit(event, ...args)
+          ? !disposed && resizeEvents.emit(event, ...args)
           : target.emit(event, ...args)
       }
       if (property === 'setMaxListeners') {
@@ -102,7 +116,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
             resizeEvents.removeAllListeners()
             // The source relay is implementation-owned, not part of the
             // facade's public listener set, so preserve it across a global clear.
-            source.on('resize', resize)
+            if (!disposed) source.on('resize', resize)
           } else {
             target.removeAllListeners(event)
           }
@@ -111,6 +125,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
       }
       if (listenerMethods.has(property)) {
         return (event: string | symbol, ...args: unknown[]) => {
+          if (event === 'resize' && disposed) return stream
           const emitter = event === 'resize' ? resizeEvents : target
           Reflect.apply(Reflect.get(emitter, property, emitter) as Function, emitter, [event, ...args])
           return stream
@@ -127,6 +142,47 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
     },
   })
   return stream
+}
+
+function DisposeOnUnmount({ dispose, children }: { dispose: () => void; children: React.ReactNode }) {
+  useLayoutEffect(() => dispose, [dispose])
+  return children
+}
+
+export type DebouncedInteractiveInstance = Instance & {
+  dispose(): void
+  stdout: DebouncedResizeStream
+}
+
+export function renderDebouncedInteractive(
+  source: NodeJS.WriteStream,
+  view: (size: TerminalSize) => React.ReactElement,
+  options: Omit<RenderOptions, 'stdout'> = INTERACTIVE_RENDER_OPTIONS,
+): DebouncedInteractiveInstance {
+  const stdout = createDebouncedResizeStream(source, RESIZE_DEBOUNCE_MS)
+  let size = { columns: stdout.columns, rows: stdout.rows }
+  let unsubscribe = () => {}
+  let disposed = false
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    unsubscribe()
+    stdout.dispose()
+  }
+  const dashboard = () => <DisposeOnUnmount dispose={dispose}>{view(size)}</DisposeOnUnmount>
+  let app: Instance
+  try {
+    app = render(dashboard(), { ...options, stdout })
+  } catch (error) {
+    dispose()
+    throw error
+  }
+  unsubscribe = stdout.onSettledResize(nextSize => {
+    if (disposed) return
+    size = nextSize
+    app.rerender(dashboard())
+  })
+  return Object.assign(app, { dispose, stdout })
 }
 
 export function getDailyActivityPageSize(columnCount: 1 | 2 | 3, projectRows: number, activityRows: number, dayMode = false): number {
@@ -1325,19 +1381,18 @@ const MOUSE_TRACKING_OFF = '\x1b[?1006l\x1b[?1000l'
 function ScrollableViewport({ children, width, rows, lineScroll = true }: { children: React.ReactNode; width: number; rows: number; lineScroll?: boolean }) {
   const height = Math.max(1, rows - 1)
   const contentRef = useRef<DOMElement>(null)
-  const [maxOffset, setMaxOffset] = useState(0)
   const [offset, setOffset] = useState(0)
   // The stdin listener below outlives renders; it reads the current bound
   // through a ref so scrolling never re-subscribes (and never re-emits the
   // tracking enable sequence).
   const maxOffsetRef = useRef(0)
-  maxOffsetRef.current = maxOffset
-
+  // Re-measure after every commit, but keep the bound outside React state.
+  // A terminal-only resize must preserve the reader's exact anchor and must
+  // not schedule a second correction frame; the next scroll input clamps
+  // against this freshly measured bound instead.
   useLayoutEffect(() => {
     if (!contentRef.current) return
-    const nextMaxOffset = Math.max(0, measureElement(contentRef.current).height - height)
-    setMaxOffset(current => current === nextMaxOffset ? current : nextMaxOffset)
-    setOffset(current => Math.min(current, nextMaxOffset))
+    maxOffsetRef.current = Math.max(0, measureElement(contentRef.current).height - height)
   })
 
   // Mouse-wheel scrolling via SGR mouse reporting. Known tradeoff: while
@@ -1358,24 +1413,24 @@ function ScrollableViewport({ children, width, rows, lineScroll = true }: { chil
   }, [])
 
   useInput((_input, key) => {
-    if (lineScroll && key.downArrow) setOffset(current => Math.min(current + 1, maxOffset))
-    else if (lineScroll && key.upArrow) setOffset(current => Math.max(current - 1, 0))
-    else if (key.pageDown) setOffset(current => Math.min(current + height, maxOffset))
-    else if (key.pageUp) setOffset(current => Math.max(current - height, 0))
+    if (lineScroll && key.downArrow) setOffset(current => Math.min(current + 1, maxOffsetRef.current))
+    else if (lineScroll && key.upArrow) setOffset(current => Math.max(Math.min(current, maxOffsetRef.current) - 1, 0))
+    else if (key.pageDown) setOffset(current => Math.min(current + height, maxOffsetRef.current))
+    else if (key.pageUp) setOffset(current => Math.max(Math.min(current, maxOffsetRef.current) - height, 0))
     else if (key.home) setOffset(0)
-    else if (key.end) setOffset(maxOffset)
+    else if (key.end) setOffset(maxOffsetRef.current)
   })
 
   return (
     <Box width={width} height={height} overflowY="hidden">
-      <Box ref={contentRef} flexDirection="column" position="absolute" top={-Math.min(offset, maxOffset)} left={0}>
+      <Box ref={contentRef} flexDirection="column" position="absolute" top={-offset} left={0}>
         {children}
       </Box>
     </Box>
   )
 }
 
-export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay }: {
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, terminalSize }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -1388,9 +1443,10 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   customRange?: DateRange | null
   customRangeLabel?: string
   initialDay?: string
+  terminalSize: TerminalSize
 }) {
   const { exit } = useApp()
-  const { columns, rows } = useWindowSize()
+  const { columns, rows } = terminalSize
   const [period, setPeriod] = useState<Period>(initialPeriod)
   const [projects, setProjects] = useState<ProjectSummary[]>(initialProjects)
   const [durable, setDurable] = useState<DurableOverview | undefined>(initialDurable)
@@ -1795,18 +1851,13 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
-    const stdout = createDebouncedResizeStream(process.stdout, RESIZE_DEBOUNCE_MS)
-    const dashboard = () => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} />
-    )
-    const app = render(
-      dashboard(),
-      { ...INTERACTIVE_RENDER_OPTIONS, stdout },
-    )
+    const app = renderDebouncedInteractive(process.stdout, terminalSize => (
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} terminalSize={terminalSize} />
+    ))
     try {
       await app.waitUntilExit()
     } finally {
-      stdout.dispose()
+      app.dispose()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })

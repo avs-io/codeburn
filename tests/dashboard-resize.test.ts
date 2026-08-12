@@ -4,7 +4,7 @@ import React, { useEffect } from 'react'
 import { render, Text, useWindowSize } from 'ink'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { RESIZE_DEBOUNCE_MS, createDebouncedResizeStream } from '../src/dashboard.js'
+import { RESIZE_DEBOUNCE_MS, createDebouncedResizeStream, renderDebouncedInteractive } from '../src/dashboard.js'
 import { BSU, ESU, stripSyncUpdateEscapes } from '../src/ink-win.js'
 
 function makeTerminal(): PassThrough & NodeJS.WriteStream {
@@ -26,16 +26,6 @@ function ResizeProbe({ windowColumns, onRender }: {
   return React.createElement(Text, null, `size:${windowColumns}x${size.rows}`)
 }
 
-function ResizeTransitionProbe({ onRender }: {
-  onRender: (size: { windowColumns: number; columns: number; rows: number }) => void
-}) {
-  const size = useWindowSize()
-  useEffect(() => {
-    onRender({ windowColumns: size.columns, ...size })
-  }, [size, onRender])
-  return React.createElement(Text, null, `size:${size.columns}x${size.columns}x${size.rows}`)
-}
-
 function LifecycleProbe({ onMount, onCleanup }: { onMount: () => void; onCleanup: () => void }) {
   useWindowSize()
   useEffect(() => {
@@ -51,14 +41,13 @@ describe('interactive dashboard resize stream', () => {
   it('publishes one coherent dimension transition after a resize burst settles', async () => {
     vi.useFakeTimers()
     const terminal = makeTerminal()
-    const stdout = createDebouncedResizeStream(terminal, RESIZE_DEBOUNCE_MS)
     const writes: string[] = []
     terminal.on('data', chunk => writes.push(String(chunk)))
-    const transitions: Array<{ windowColumns: number; columns: number; rows: number }> = []
-    const onRender = (size: { windowColumns: number; columns: number; rows: number }) => transitions.push(size)
-    const probe = () => React.createElement(ResizeTransitionProbe, { onRender })
-    const app = render(probe(), {
-      stdout,
+    const transitions: Array<{ columns: number; rows: number }> = []
+    const app = renderDebouncedInteractive(terminal, size => {
+      transitions.push(size)
+      return React.createElement(Text, null, `size:${size.columns}x${size.rows}`)
+    }, {
       interactive: true,
       patchConsole: false,
       alternateScreen: true,
@@ -80,9 +69,84 @@ describe('interactive dashboard resize stream', () => {
     await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
     await vi.advanceTimersByTimeAsync(100)
 
-    expect(transitions).toEqual([{ windowColumns: 97, columns: 97, rows: 30 }])
-    expect(writes.join('')).not.toContain('size:97x100x24')
-    expect(writes.join('').match(/size:97x97x30/g)).toHaveLength(1)
+    expect(transitions).toEqual([{ columns: 97, rows: 30 }])
+    const frames = writes
+      .map(chunk => stripSyncUpdateEscapes(chunk))
+      .map(chunk => chunk.match(/size:\d+x\d+/g) ?? [])
+      .flat()
+    expect(frames).toEqual(['size:97x30'])
+
+    app.unmount()
+    await vi.runAllTimersAsync()
+    await app.waitUntilExit()
+  })
+
+  it.each([
+    { initial: { columns: 135, rows: 24 }, final: { columns: 132, rows: 30 } },
+    { initial: { columns: 80, rows: 24 }, final: { columns: 160, rows: 12 } },
+    { initial: { columns: 20, rows: 2 }, final: { columns: 10, rows: 1 } },
+  ])('writes only the final frame for $initial → $final', async ({ initial, final }) => {
+    vi.useFakeTimers()
+    const terminal = makeTerminal()
+    terminal.columns = initial.columns
+    terminal.rows = initial.rows
+    const writes: string[] = []
+    terminal.on('data', chunk => writes.push(String(chunk)))
+    const app = renderDebouncedInteractive(terminal, size => (
+      React.createElement(Text, null, `FRAME:${size.columns}x${size.rows}`)
+    ), {
+      interactive: true,
+      patchConsole: false,
+      alternateScreen: true,
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    writes.length = 0
+
+    terminal.columns = Math.max(1, final.columns + 1)
+    terminal.rows = Math.max(1, final.rows - 1)
+    terminal.emit('resize')
+    await vi.advanceTimersByTimeAsync(50)
+    terminal.columns = final.columns
+    terminal.rows = final.rows
+    terminal.emit('resize')
+    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS + 100)
+
+    const frames = writes
+      .map(chunk => stripSyncUpdateEscapes(chunk))
+      .flatMap(chunk => chunk.match(/FRAME:\d+x\d+/g) ?? [])
+    expect(frames).toEqual([`FRAME:${final.columns}x${final.rows}`])
+
+    app.unmount()
+    await vi.runAllTimersAsync()
+    await app.waitUntilExit()
+  })
+
+  it('does not require a post-commit layout correction for the settled resize frame', async () => {
+    vi.useFakeTimers()
+    const terminal = makeTerminal()
+    terminal.columns = 135
+    terminal.rows = 24
+    const writes: string[] = []
+    terminal.on('data', chunk => writes.push(String(chunk)))
+    const app = renderDebouncedInteractive(terminal, size => (
+      React.createElement(Text, null, `FRAME:${size.columns}x${size.rows}`)
+    ), {
+      interactive: true,
+      patchConsole: false,
+      alternateScreen: true,
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    writes.length = 0
+
+    terminal.columns = 132
+    terminal.rows = 30
+    terminal.emit('resize')
+    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS + 100)
+
+    const frames = writes
+      .map(chunk => stripSyncUpdateEscapes(chunk))
+      .flatMap(chunk => chunk.match(/FRAME:\d+x\d+/g) ?? [])
+    expect(frames).toEqual(['FRAME:132x30'])
 
     app.unmount()
     await vi.runAllTimersAsync()
@@ -92,11 +156,11 @@ describe('interactive dashboard resize stream', () => {
   it('does not remount after exit when a source resize is still pending', async () => {
     vi.useFakeTimers()
     const terminal = makeTerminal()
-    const stdout = createDebouncedResizeStream(terminal, RESIZE_DEBOUNCE_MS)
     const onMount = vi.fn()
     const onCleanup = vi.fn()
-    const app = render(React.createElement(LifecycleProbe, { onMount, onCleanup }), {
-      stdout,
+    const app = renderDebouncedInteractive(terminal, () => (
+      React.createElement(LifecycleProbe, { onMount, onCleanup })
+    ), {
       interactive: true,
       patchConsole: false,
     })
@@ -107,62 +171,78 @@ describe('interactive dashboard resize stream', () => {
     app.unmount()
     await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
     await app.waitUntilExit()
-    stdout.dispose()
+    app.dispose()
 
     expect(onMount).toHaveBeenCalledOnce()
     expect(onCleanup).toHaveBeenCalledOnce()
     expect(terminal.listenerCount('resize')).toBe(0)
   })
 
-  it('lets Ink observe one final resize after a terminal resize burst settles', async () => {
-    vi.useFakeTimers()
+  it('removes the source relay when the initial render throws', () => {
+    const terminal = makeTerminal()
+
+    expect(() => renderDebouncedInteractive(terminal, () => {
+      throw new Error('render failed')
+    }, { interactive: true, patchConsole: false })).toThrow('render failed')
+
+    expect(terminal.listenerCount('resize')).toBe(0)
+  })
+
+  it('keeps disposal terminal across later listener mutation and introspection', () => {
     const terminal = makeTerminal()
     const stdout = createDebouncedResizeStream(terminal, RESIZE_DEBOUNCE_MS)
-    const writes: string[] = []
-    terminal.on('data', chunk => writes.push(String(chunk)))
-    const renderedSizes: Array<{ columns: number; rows: number }> = []
-    const onRender = (size: { columns: number; rows: number }) => renderedSizes.push(size)
-    let windowColumns = stdout.columns
-    const probe = () => React.createElement(ResizeProbe, { windowColumns, onRender })
-    const app = render(probe(), {
-      stdout,
+
+    expect(terminal.listenerCount('resize')).toBe(1)
+    stdout.dispose()
+    expect(terminal.listenerCount('resize')).toBe(0)
+
+    stdout.removeAllListeners()
+    stdout.eventNames()
+    stdout.listeners('resize')
+    stdout.rawListeners('resize')
+    stdout.listenerCount('resize')
+    stdout.dispose()
+
+    expect(terminal.listenerCount('resize')).toBe(0)
+
+    const resize = vi.fn()
+    stdout.on('resize', resize)
+    stdout.emit('resize')
+    terminal.emit('resize')
+    expect(resize).not.toHaveBeenCalled()
+    expect(terminal.listenerCount('resize')).toBe(0)
+  })
+
+  it('keeps the mounted component state while applying a settled resize', async () => {
+    vi.useFakeTimers()
+    const terminal = makeTerminal()
+    const mounts = vi.fn()
+    const cleanups = vi.fn()
+    const Stateful = ({ size }: { size: { columns: number; rows: number } }) => {
+      const [cursor] = React.useState(7)
+      useEffect(() => {
+        mounts()
+        return () => cleanups()
+      }, [])
+      return React.createElement(Text, null, `state:${cursor}:${size.columns}x${size.rows}`)
+    }
+    const app = renderDebouncedInteractive(terminal, size => React.createElement(Stateful, { size }), {
       interactive: true,
       patchConsole: false,
     })
-    const resize = () => {
-      windowColumns = stdout.columns
-      app.rerender(probe())
-    }
-    stdout.prependListener('resize', resize)
     await vi.advanceTimersByTimeAsync(100)
-    writes.length = 0
-    renderedSizes.length = 0
 
-    terminal.columns = 99
+    terminal.columns = 90
+    terminal.rows = 20
     terminal.emit('resize')
-    await vi.advanceTimersByTimeAsync(50)
-    terminal.columns = 98
-    terminal.emit('resize')
-    await vi.advanceTimersByTimeAsync(50)
-    terminal.columns = 97
-    terminal.rows = 30
-    terminal.emit('resize')
+    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS + 100)
 
-    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS - 1)
-    expect({ columns: stdout.columns, rows: stdout.rows }).toEqual({ columns: 100, rows: 24 })
-    expect(renderedSizes).toEqual([])
-    expect(writes).toEqual([])
-
-    await vi.advanceTimersByTimeAsync(1)
-    await vi.advanceTimersByTimeAsync(100)
-    expect({ columns: stdout.columns, rows: stdout.rows }).toEqual({ columns: 97, rows: 30 })
-    expect(renderedSizes).toEqual([{ columns: 97, rows: 30 }])
-    expect(writes.join('').match(/size:97x30/g)).toHaveLength(1)
-
-    stdout.off('resize', resize)
+    expect(mounts).toHaveBeenCalledOnce()
+    expect(cleanups).not.toHaveBeenCalled()
     app.unmount()
     await vi.runAllTimersAsync()
     await app.waitUntilExit()
+    expect(cleanups).toHaveBeenCalledOnce()
   })
 
   it('removes the source listener and cancels pending resize delivery on cleanup', async () => {
@@ -235,12 +315,10 @@ describe('interactive dashboard resize stream', () => {
     expect(stdout.listenerCount('resize')).toBe(1)
     expect(terminal.listenerCount('resize')).toBe(1)
 
-    terminal.emit('resize')
-    terminal.emit('resize')
+    stdout.emit('resize')
+    stdout.emit('resize')
     terminal.emit('drain')
-    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
-    terminal.emit('resize')
-    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
+    stdout.emit('resize')
 
     expect(resize).toHaveBeenCalledOnce()
     expect(drain).toHaveBeenCalledOnce()
@@ -260,8 +338,7 @@ describe('interactive dashboard resize stream', () => {
     stdout.prependOnceListener('resize', () => order.push('prepended-once'))
     stdout.on('drain', drain)
 
-    terminal.emit('resize')
-    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
+    stdout.emit('resize')
     expect(order).toEqual(['prepended-once', 'regular'])
 
     stdout.removeAllListeners()
@@ -275,8 +352,7 @@ describe('interactive dashboard resize stream', () => {
 
     const afterRemoval = vi.fn()
     stdout.once('resize', afterRemoval)
-    terminal.emit('resize')
-    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
+    stdout.emit('resize')
     expect(afterRemoval).toHaveBeenCalledOnce()
 
     stdout.dispose()
