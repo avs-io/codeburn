@@ -1,4 +1,5 @@
 import { homedir } from 'os'
+import { EventEmitter } from 'node:events'
 
 import React, { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
@@ -30,6 +31,103 @@ export type DailyActivityRow = {
 
 export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
+export const RESIZE_DEBOUNCE_MS = 150
+
+export type DebouncedResizeStream = NodeJS.WriteStream & { dispose(): void }
+
+export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs: number): DebouncedResizeStream {
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined
+  let disposed = false
+  let columns = source.columns
+  let rows = source.rows
+  const resizeEvents = new EventEmitter()
+
+  const resize = () => {
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(() => {
+      resizeTimer = undefined
+      if (disposed) return
+      columns = source.columns
+      rows = source.rows
+      resizeEvents.emit('resize')
+    }, delayMs)
+  }
+  source.on('resize', resize)
+
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    source.off('resize', resize)
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = undefined
+    resizeEvents.removeAllListeners()
+  }
+
+  const listenerMethods = new Set<PropertyKey>([
+    'addListener', 'on', 'once', 'prependListener', 'prependOnceListener', 'off', 'removeListener',
+  ])
+
+  let stream: DebouncedResizeStream
+  stream = new Proxy(source as DebouncedResizeStream, {
+    get(target, property) {
+      if (property === 'dispose') return dispose
+      if (property === 'columns') return columns
+      if (property === 'rows') return rows
+      if (property === 'emit') {
+        return (event: string | symbol, ...args: unknown[]) => event === 'resize'
+          ? resizeEvents.emit(event, ...args)
+          : target.emit(event, ...args)
+      }
+      if (property === 'setMaxListeners') {
+        return (count: number) => {
+          target.setMaxListeners(count)
+          resizeEvents.setMaxListeners(count)
+          return stream
+        }
+      }
+      if (property === 'getMaxListeners') return () => resizeEvents.getMaxListeners()
+      if (property === 'eventNames') {
+        return () => {
+          const names = target.eventNames().filter(event => event !== 'resize')
+          if (resizeEvents.listenerCount('resize') > 0) names.push('resize')
+          return [...new Set(names)]
+        }
+      }
+      if (property === 'removeAllListeners') {
+        return (event?: string | symbol) => {
+          if (event === 'resize') {
+            resizeEvents.removeAllListeners(event)
+          } else if (event === undefined) {
+            target.removeAllListeners()
+            resizeEvents.removeAllListeners()
+            // The source relay is implementation-owned, not part of the
+            // facade's public listener set, so preserve it across a global clear.
+            source.on('resize', resize)
+          } else {
+            target.removeAllListeners(event)
+          }
+          return stream
+        }
+      }
+      if (listenerMethods.has(property)) {
+        return (event: string | symbol, ...args: unknown[]) => {
+          const emitter = event === 'resize' ? resizeEvents : target
+          Reflect.apply(Reflect.get(emitter, property, emitter) as Function, emitter, [event, ...args])
+          return stream
+        }
+      }
+      if (property === 'listenerCount' || property === 'listeners' || property === 'rawListeners') {
+        return (event: string | symbol, ...args: unknown[]) => {
+          const emitter = event === 'resize' ? resizeEvents : target
+          return Reflect.apply(Reflect.get(emitter, property, emitter) as Function, emitter, [event, ...args])
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  return stream
+}
 
 export function getDailyActivityPageSize(columnCount: 1 | 2 | 3, projectRows: number, activityRows: number, dayMode = false): number {
   if (dayMode) return 1
@@ -1698,23 +1796,25 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
-    let windowColumns = process.stdout.columns
+    const stdout = createDebouncedResizeStream(process.stdout, RESIZE_DEBOUNCE_MS)
+    let windowColumns = stdout.columns
     const dashboard = () => (
       <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={windowColumns} />
     )
     const app = render(
       dashboard(),
-      INTERACTIVE_RENDER_OPTIONS,
+      { ...INTERACTIVE_RENDER_OPTIONS, stdout },
     )
     const resize = () => {
-      windowColumns = process.stdout.columns
+      windowColumns = stdout.columns
       app.rerender(dashboard())
     }
-    process.stdout.prependListener('resize', resize)
+    stdout.prependListener('resize', resize)
     try {
       await app.waitUntilExit()
     } finally {
-      process.stdout.off('resize', resize)
+      stdout.off('resize', resize)
+      stdout.dispose()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
