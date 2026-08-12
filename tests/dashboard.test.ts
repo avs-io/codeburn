@@ -467,7 +467,12 @@ describe('interactive terminal rendering', () => {
     chunks.length = 0
     stdout.columns = 134
     stdout.emit('resize')
-    await app.waitUntilRenderFlush()
+    for (let i = 0; i < 100; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+      const latest = chunks.filter(chunk => chunk.trim()).at(-1) ?? ''
+      const title = latest.split('\n').find(line => line.includes('Daily Activity')) ?? ''
+      if (title.includes('By Project') && !title.includes('By Activity')) break
+    }
 
     let panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
     expect(panelTitleLine).toContain('By Project')
@@ -476,7 +481,12 @@ describe('interactive terminal rendering', () => {
     chunks.length = 0
     stdout.columns = 89
     stdout.emit('resize')
-    await app.waitUntilRenderFlush()
+    for (let i = 0; i < 100; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+      const latest = chunks.filter(chunk => chunk.trim()).at(-1) ?? ''
+      const title = latest.split('\n').find(line => line.includes('Daily Activity')) ?? ''
+      if (!title.includes('By Project')) break
+    }
 
     panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
     expect(panelTitleLine).not.toContain('By Project')
