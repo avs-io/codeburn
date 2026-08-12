@@ -363,7 +363,6 @@ describe('Daily Activity viewport', () => {
       initialPeriod: 'all',
       initialProvider: 'all',
       refreshSeconds: 0,
-      windowColumns: 100,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
     await app.waitUntilRenderFlush()
@@ -428,7 +427,6 @@ describe('interactive terminal rendering', () => {
         initialPeriod: period,
         initialProvider: 'all',
         refreshSeconds: 60,
-        windowColumns: 160,
         initialDay,
       }), { stdin, stdout, interactive: true, patchConsole: false })
       onTestFinished(() => {
@@ -460,14 +458,15 @@ describe('interactive terminal rendering', () => {
       initialProvider: 'all',
       refreshSeconds: 0,
     }
-    const app = render(React.createElement(InteractiveDashboard, { ...props, windowColumns: 135 }), {
+    const app = render(React.createElement(InteractiveDashboard, props), {
       stdin, stdout, interactive: true, patchConsole: false,
     })
     onTestFinished(() => app.unmount())
 
     await new Promise(resolve => setTimeout(resolve, 20))
     chunks.length = 0
-    app.rerender(React.createElement(InteractiveDashboard, { ...props, windowColumns: 134 }))
+    stdout.columns = 134
+    stdout.emit('resize')
     await app.waitUntilRenderFlush()
 
     let panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
@@ -475,7 +474,8 @@ describe('interactive terminal rendering', () => {
     expect(panelTitleLine).not.toContain('By Activity')
 
     chunks.length = 0
-    app.rerender(React.createElement(InteractiveDashboard, { ...props, windowColumns: 89 }))
+    stdout.columns = 89
+    stdout.emit('resize')
     await app.waitUntilRenderFlush()
 
     panelTitleLine = (chunks.filter(chunk => chunk.trim()).at(-1) ?? '').split('\n').find(line => line.includes('Daily Activity')) ?? ''
@@ -503,7 +503,6 @@ describe('interactive terminal rendering', () => {
       initialPeriod: 'today' as const,
       initialProvider: 'all',
       refreshSeconds: 0,
-      windowColumns: columns,
     }
     const app = render(React.createElement(InteractiveDashboard, props), {
       stdin, stdout, debug: true, interactive: true, patchConsole: false,
@@ -520,10 +519,8 @@ describe('interactive terminal rendering', () => {
     frame = frames.filter(chunk => chunk.trim()).at(-1) ?? ''
     expect(frame).not.toContain('[ Today ]')
 
-    app.rerender(React.createElement(InteractiveDashboard, {
-      ...props,
-      windowColumns: columns + 1,
-    }))
+    stdout.columns = columns + 1
+    stdout.emit('resize')
     await app.waitUntilRenderFlush()
     frame = frames.filter(chunk => chunk.trim()).at(-1) ?? ''
     expect(frame).not.toContain('[ Today ]')
@@ -587,7 +584,6 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 0,
-      windowColumns: 135,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
@@ -647,7 +643,6 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 0,
-      windowColumns: 80,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
 
@@ -686,7 +681,6 @@ describe('InteractiveDashboard refresh', () => {
       initialPeriod: 'today',
       initialProvider: 'all',
       refreshSeconds: 60,
-      windowColumns: 160,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => {
       app.unmount()

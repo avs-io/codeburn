@@ -1322,8 +1322,7 @@ const WHEEL_LINES_PER_TICK = 3
 const MOUSE_TRACKING_ON = '\x1b[?1000h\x1b[?1006h'
 const MOUSE_TRACKING_OFF = '\x1b[?1006l\x1b[?1000l'
 
-function ScrollableViewport({ children, width, lineScroll = true }: { children: React.ReactNode; width: number; lineScroll?: boolean }) {
-  const { rows } = useWindowSize()
+function ScrollableViewport({ children, width, rows, lineScroll = true }: { children: React.ReactNode; width: number; rows: number; lineScroll?: boolean }) {
   const height = Math.max(1, rows - 1)
   const contentRef = useRef<DOMElement>(null)
   const [maxOffset, setMaxOffset] = useState(0)
@@ -1376,7 +1375,7 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
   )
 }
 
-export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns }: {
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -1389,9 +1388,9 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   customRange?: DateRange | null
   customRangeLabel?: string
   initialDay?: string
-  windowColumns: number
 }) {
   const { exit } = useApp()
+  const { columns, rows } = useWindowSize()
   const [period, setPeriod] = useState<Period>(initialPeriod)
   const [projects, setProjects] = useState<ProjectSummary[]>(initialProjects)
   const [durable, setDurable] = useState<DurableOverview | undefined>(initialDurable)
@@ -1416,7 +1415,6 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const isDayMode = dayDate != null
   const isCustomRange = customRange != null && !isDayMode
   const scrollableDailyHistory = !isCustomRange && !isDayMode
-  const columns = windowColumns
   const maxContentWidth = useMemo(
     () => getDashboardMaxWidth(projects, projectBudgets, activeProvider),
     [projects, projectBudgets, activeProvider],
@@ -1739,6 +1737,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     <ScrollableViewport
       key={`${view}:${period}:${activeProvider}:${dayDate ?? ''}:${customRangeLabel ?? ''}`}
       width={dashWidth}
+      rows={rows}
       lineScroll={view !== 'compare'}
     >
       {content}
@@ -1797,23 +1796,16 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   patchStdoutForWindows()
   if (isTTY) {
     const stdout = createDebouncedResizeStream(process.stdout, RESIZE_DEBOUNCE_MS)
-    let windowColumns = stdout.columns
     const dashboard = () => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={windowColumns} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} />
     )
     const app = render(
       dashboard(),
       { ...INTERACTIVE_RENDER_OPTIONS, stdout },
     )
-    const resize = () => {
-      windowColumns = stdout.columns
-      app.rerender(dashboard())
-    }
-    stdout.prependListener('resize', resize)
     try {
       await app.waitUntilExit()
     } finally {
-      stdout.off('resize', resize)
       stdout.dispose()
     }
   } else {
