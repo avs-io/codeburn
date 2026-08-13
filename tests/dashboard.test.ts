@@ -561,7 +561,7 @@ describe('interactive terminal rendering', () => {
 
     stdout.columns = columns + 1
     stdout.emit('resize')
-    await app.waitUntilRenderFlush()
+    await new Promise(resolve => setTimeout(resolve, RESIZE_DEBOUNCE_MS + 100))
     frame = frames.filter(chunk => chunk.trim()).at(-1) ?? ''
     expect(frame).not.toContain('[ Today ]')
   })
@@ -598,6 +598,10 @@ describe('interactive terminal rendering', () => {
 
     for (let i = 0; i < 8; i++) stdin.write('\u001B[6~')
     await new Promise(resolve => setTimeout(resolve, 100))
+    const beforeResize = synchronizedUpdates(writes).at(-1) ?? ''
+    const anchor = ['Workflow', 'Delegation', 'Git Ops', 'Build/Deploy', 'Conversation', 'Brainstorming', 'General']
+      .find(label => beforeResize.includes(label))
+    expect(anchor, beforeResize).toBeTruthy()
     writes.length = 0
 
     stdout.columns = 99
@@ -621,6 +625,7 @@ describe('interactive terminal rendering', () => {
     expect(frames[0]).toContain('PgUp/PgDn')
     expect(frames[0].split('\n')).toHaveLength(50)
     expect(frames[0]).not.toContain('[ 6 Months ]')
+    expect(frames[0]).toContain(anchor!)
   })
 })
 

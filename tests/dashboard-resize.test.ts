@@ -35,6 +35,32 @@ function LifecycleProbe({ onMount, onCleanup }: { onMount: () => void; onCleanup
   return React.createElement(Text, null, 'mounted')
 }
 
+function synchronizedFrames(writes: string[]): string[] {
+  const frames: string[] = []
+  let current: string | undefined
+  for (const write of writes) {
+    let rest = write
+    while (rest.length > 0) {
+      if (current === undefined) {
+        const start = rest.indexOf(BSU)
+        if (start === -1) break
+        current = ''
+        rest = rest.slice(start + BSU.length)
+      }
+      const end = rest.indexOf(ESU)
+      if (end === -1) {
+        current += rest
+        break
+      }
+      current += rest.slice(0, end)
+      frames.push(stripSyncUpdateEscapes(current))
+      current = undefined
+      rest = rest.slice(end + ESU.length)
+    }
+  }
+  return frames
+}
+
 describe('interactive dashboard resize stream', () => {
   afterEach(() => vi.useRealTimers())
 
@@ -75,6 +101,57 @@ describe('interactive dashboard resize stream', () => {
       .map(chunk => chunk.match(/size:\d+x\d+/g) ?? [])
       .flat()
     expect(frames).toEqual(['size:97x30'])
+
+    app.unmount()
+    await vi.runAllTimersAsync()
+    await app.waitUntilExit()
+  })
+
+  it('holds an unrelated state commit until one coherent settled resize frame', async () => {
+    vi.useFakeTimers()
+    const terminal = makeTerminal()
+    const writes: string[] = []
+    terminal.on('data', chunk => writes.push(String(chunk)))
+    let updateVisibleState = () => {}
+    const windowSizes: Array<{ columns: number; rows: number }> = []
+    const StatefulProbe = ({ size }: { size: { columns: number; rows: number } }) => {
+      const [revision, setRevision] = React.useState(0)
+      updateVisibleState = () => setRevision(value => value + 1)
+      const windowSize = useWindowSize()
+      useEffect(() => {
+        windowSizes.push(windowSize)
+      }, [windowSize])
+      return React.createElement(
+        Text,
+        null,
+        `FRAME:revision=${revision}:prop=${size.columns}x${size.rows}:hook=${windowSize.columns}x${windowSize.rows}`,
+      )
+    }
+    const app = renderDebouncedInteractive(terminal, size => React.createElement(StatefulProbe, { size }), {
+      interactive: true,
+      patchConsole: false,
+      alternateScreen: true,
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    writes.length = 0
+    windowSizes.length = 0
+
+    terminal.columns = 80
+    terminal.rows = 20
+    terminal.emit('resize')
+    updateVisibleState()
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(writes, 'no stale old-dimension application frame may reach the terminal before resize settlement').toEqual([])
+
+    await vi.advanceTimersByTimeAsync(RESIZE_DEBOUNCE_MS)
+    await vi.advanceTimersByTimeAsync(100)
+
+    const frames = synchronizedFrames(writes)
+      .filter(frame => frame.includes('FRAME:'))
+      .map(frame => frame.match(/FRAME:[^\r\n]*/)?.[0])
+    expect(frames).toEqual(['FRAME:revision=1:prop=80x20:hook=80x20'])
+    expect(windowSizes).toEqual([{ columns: 80, rows: 20 }])
 
     app.unmount()
     await vi.runAllTimersAsync()
@@ -294,6 +371,29 @@ describe('interactive dashboard resize stream', () => {
     expect(onDrain).toHaveBeenCalledOnce()
 
     stdout.off('drain', onDrain)
+    stdout.dispose()
+  })
+
+  it('passes imperative controls during a pending resize and preserves suppressed-write completion', async () => {
+    vi.useFakeTimers()
+    const terminal = makeTerminal()
+    const nativeWrites: string[] = []
+    terminal.write = vi.fn((chunk: unknown, ...args: unknown[]) => {
+      nativeWrites.push(String(chunk))
+      const callback = args.find(arg => typeof arg === 'function') as (() => void) | undefined
+      callback?.()
+      return false
+    }) as typeof terminal.write
+    const stdout = createDebouncedResizeStream(terminal, RESIZE_DEBOUNCE_MS)
+    const frameCallback = vi.fn()
+
+    terminal.columns = 80
+    terminal.emit('resize')
+    expect(stdout.write('\u001B[?1006l\u001B[?1000l')).toBe(false)
+    expect(stdout.write(`${BSU}stale-frame${ESU}`, frameCallback)).toBe(false)
+
+    expect(nativeWrites).toEqual(['\u001B[?1006l\u001B[?1000l', ''])
+    expect(frameCallback).toHaveBeenCalledOnce()
     stdout.dispose()
   })
 

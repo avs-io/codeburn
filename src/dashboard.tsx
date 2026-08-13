@@ -19,7 +19,7 @@ import { CompareView } from './compare.js'
 import { getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
 import { formatDayRangeLabel, getDateRange, parseDayFlag, PERIODS, PERIOD_LABELS, shiftDay, type Period } from './cli-date.js'
-import { patchStdoutForWindows } from './ink-win.js'
+import { BSU, ESU, patchStdoutForWindows } from './ink-win.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -39,23 +39,55 @@ export type DebouncedResizeStream = NodeJS.WriteStream & {
   onSettledResize(listener: (size: TerminalSize) => void): () => void
 }
 
+function normalizeTerminalDimension(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && value! > 0 ? Math.floor(value!) : fallback
+}
+
+function terminalSizeOf(source: NodeJS.WriteStream): TerminalSize {
+  return {
+    columns: normalizeTerminalDimension(source.columns, 80),
+    rows: normalizeTerminalDimension(source.rows, 24),
+  }
+}
+
 export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs: number): DebouncedResizeStream {
   let resizeTimer: ReturnType<typeof setTimeout> | undefined
+  let releaseTimer: ReturnType<typeof setTimeout> | undefined
   let disposed = false
-  let columns = source.columns
-  let rows = source.rows
+  let pendingResize = false
+  let suppressingFrame = false
+  let capturingResizeWrites = false
+  let finalFramePreamble = ''
+  let { columns, rows } = terminalSizeOf(source)
   const resizeEvents = new EventEmitter()
   const settledResizeListeners = new Set<(size: TerminalSize) => void>()
 
   const resize = () => {
+    pendingResize = true
     if (resizeTimer) clearTimeout(resizeTimer)
+    if (releaseTimer) clearTimeout(releaseTimer)
+    releaseTimer = undefined
     resizeTimer = setTimeout(() => {
       resizeTimer = undefined
       if (disposed) return
-      columns = source.columns
-      rows = source.rows
+      ;({ columns, rows } = terminalSizeOf(source))
       const size = { columns, rows }
-      for (const listener of [...settledResizeListeners]) listener(size)
+      // Ink and useWindowSize both observe the same updated facade dimensions.
+      // Their immediate writes remain suppressed until React has applied the
+      // hook update; the wrapper then requests the sole coherent final frame.
+      capturingResizeWrites = true
+      try {
+        resizeEvents.emit('resize')
+      } finally {
+        capturingResizeWrites = false
+      }
+      releaseTimer = setTimeout(() => {
+        releaseTimer = undefined
+        if (disposed) return
+        pendingResize = false
+        suppressingFrame = false
+        for (const listener of [...settledResizeListeners]) listener(size)
+      }, 0)
     }, delayMs)
   }
   source.on('resize', resize)
@@ -65,7 +97,13 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
     disposed = true
     source.off('resize', resize)
     if (resizeTimer) clearTimeout(resizeTimer)
+    if (releaseTimer) clearTimeout(releaseTimer)
     resizeTimer = undefined
+    releaseTimer = undefined
+    pendingResize = false
+    suppressingFrame = false
+    capturingResizeWrites = false
+    finalFramePreamble = ''
     resizeEvents.removeAllListeners()
     settledResizeListeners.clear()
   }
@@ -87,6 +125,53 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
       }
       if (property === 'columns') return columns
       if (property === 'rows') return rows
+      if (property === 'write') {
+        return (chunk: unknown, ...args: unknown[]) => {
+          if (typeof chunk !== 'string') {
+            return Reflect.apply(target.write, target, [chunk, ...args])
+          }
+
+          if (!pendingResize) {
+            if (finalFramePreamble.length === 0) {
+              return Reflect.apply(target.write, target, [chunk, ...args])
+            }
+            const start = chunk.indexOf(BSU)
+            const output = start === -1
+              ? finalFramePreamble + chunk
+              : chunk.slice(0, start + BSU.length) + finalFramePreamble + chunk.slice(start + BSU.length)
+            finalFramePreamble = ''
+            return Reflect.apply(target.write, target, [output, ...args])
+          }
+
+          let visible = ''
+          let rest = chunk
+          while (rest.length > 0) {
+            if (suppressingFrame) {
+              const end = rest.indexOf(ESU)
+              if (end === -1) {
+                rest = ''
+                break
+              }
+              suppressingFrame = false
+              rest = rest.slice(end + ESU.length)
+              continue
+            }
+            const start = rest.indexOf(BSU)
+            if (start === -1) {
+              visible += rest
+              break
+            }
+            visible += rest.slice(0, start)
+            suppressingFrame = true
+            rest = rest.slice(start + BSU.length)
+          }
+
+          if (capturingResizeWrites) finalFramePreamble += visible
+          // An empty native write is a terminal no-op while retaining the
+          // source stream's callback timing and backpressure return value.
+          return Reflect.apply(target.write, target, [capturingResizeWrites ? '' : visible, ...args])
+        }
+      }
       if (property === 'emit') {
         return (event: string | symbol, ...args: unknown[]) => event === 'resize'
           ? !disposed && resizeEvents.emit(event, ...args)
