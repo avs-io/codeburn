@@ -764,6 +764,46 @@ describe('observed provider model aliases', () => {
   })
 })
 
+// Unpriced-without-a-row: only an explicit cited alias/override may price a
+// model LiteLLM does not index under the session id. No family fallback.
+describe('unpriced-without-a-row class', () => {
+  it('prices kimi-k3 at Moonshot official $3 / $15 / $0.30 per 1M', () => {
+    // https://platform.kimi.ai/docs/pricing/chat-k3
+    expect(calculateCost('kimi-k3', 1_000_000, 0, 0, 0, 0)).toBeCloseTo(3, 6)
+    expect(calculateCost('kimi-k3', 0, 1_000_000, 0, 0, 0)).toBeCloseTo(15, 6)
+    expect(calculateCost('kimi-k3', 0, 0, 0, 1_000_000, 0)).toBeCloseTo(0.3, 6)
+    expect(getModelCosts('k3')).toEqual(getModelCosts('kimi-k3'))
+    expect(getModelCosts('cline-pass/kimi-k3')).toEqual(getModelCosts('kimi-k3'))
+  })
+
+  it('prices bare mimo-v2.5-pro through the LiteLLM xiaomi/ row, not $0', () => {
+    const expected = getModelCosts('xiaomi/mimo-v2.5-pro')
+    expect(expected).not.toBeNull()
+    expect(getModelCosts('mimo-v2.5-pro')).toEqual(expected)
+    expect(getModelCosts('cline-pass/mimo-v2.5-pro')).toEqual(expected)
+    expect(getModelCosts('mimo-v2.5')).toEqual(getModelCosts('xiaomi/mimo-v2.5'))
+    expect(calculateCost('mimo-v2.5-pro', 1_000_000, 0, 0, 0, 0)).toBeCloseTo(1, 6)
+    expect(calculateCost('mimo-v2.5-pro', 0, 1_000_000, 0, 0, 0)).toBeCloseTo(3, 6)
+  })
+
+  it('does not invent a next-gen or sibling rate', () => {
+    expect(getModelCosts('kimi-k4')).toBeNull()
+    expect(getModelCosts('mimo-v2.6-pro')).toBeNull()
+    expect(getModelCosts('mimo-v3-pro')).toBeNull()
+    expect(calculateCost('kimi-k4', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
+    expect(calculateCost('mimo-v2.6-pro', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
+  })
+
+  it('names bare→vendor aliases without recursing through the vendor prefix', () => {
+    expect(getShortModelName('mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getShortModelName('xiaomi/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    // Same class as the older mimo-v2-flash alias.
+    expect(getShortModelName('mimo-v2-flash')).toBeTruthy()
+    expect(getShortModelName('mimo-v2-flash')).not.toBe('xiaomi/mimo-v2-flash')
+  })
+})
+
 describe('findUnpricedModels', () => {
   it('flags an unknown paid-looking model with $0 cost and skips priced ones', () => {
     const rows = [

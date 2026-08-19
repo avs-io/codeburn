@@ -51,6 +51,11 @@ const BUILTIN_PRICE_OVERRIDES: Record<string, SnapshotEntry> = {
   'composer-2': [0.5e-6, 2.5e-6, 0.5e-6, 0.2e-6],
   'composer-1.5': [3.5e-6, 17.5e-6, 3.5e-6, 0.35e-6],
   'composer-1': [1.25e-6, 10e-6, 1.25e-6, 0.125e-6],
+  // Moonshot official K3 list price. LiteLLM has no kimi-k3 row; do not
+  // inherit K2. https://platform.kimi.ai/docs/pricing/chat-k3
+  // $3.00 input / $15.00 output / $0.30 cache-read per 1M. No published
+  // cache-write (buildCosts uses the 1.25x input heuristic).
+  'kimi-k3': [3e-6, 15e-6, null, 0.3e-6],
 }
 
 // Assemble a ModelCosts, applying the cache-cost heuristics (write = 1.25x
@@ -297,6 +302,12 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'k3-agent':                      'kimi-k3',
   'k2d6-agent':                    'kimi-k2p6',
   'mimo-v2-flash':                 'xiaomi/mimo-v2-flash',
+  // Hermes / Cline Pass emit the bare id. LiteLLM's row is vendor-prefixed.
+  // Cited: bundled litellm-snapshot.json keys `xiaomi/mimo-v2.5-pro` and
+  // `xiaomi/mimo-v2.5`. Do not invent a sibling of mimo-v2-flash or a family
+  // `mimo-v2.5-*` beyond those exact rows.
+  'mimo-v2.5-pro':                 'xiaomi/mimo-v2.5-pro',
+  'mimo-v2.5':                     'xiaomi/mimo-v2.5',
   'kat-coder-pro-v1':              'kwaipilot/kat-coder-pro',
   // Cursor emits dot-version tier-last names plus tier/reasoning suffixes
   // that LiteLLM does not index (`-high`, `-low`, `-medium`, `-thinking`,
@@ -981,28 +992,36 @@ function deriveClaudeShortName(canonical: string): string | undefined {
   return `${CLAUDE_FAMILY[family]} ${major}${minor ? `.${minor}` : ''}`
 }
 
-export function getShortModelName(model: string): string {
-  if (autoModelNames[model]) return autoModelNames[model]
-  const canonical = resolveAlias(getCanonicalName(model))
-  const claude = deriveClaudeShortName(canonical)
+function shortNameFor(id: string): string | undefined {
+  const claude = deriveClaudeShortName(id)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
     // Match on a version boundary, not a bare prefix: an unlisted future minor
     // (e.g. gpt-5.6) must NOT collapse into the base "gpt-5" entry — it should
     // fall through to its raw id rather than show a wrong name/tier.
-    if (canonical === key || canonical.startsWith(key + '-')) return name
+    if (id === key || id.startsWith(key + '-')) return name
   }
-  // getCanonicalName only strips the leading provider prefix, so a raw
-  // path-style id (e.g. accounts/fireworks/models/glm-5p2) still has slashes
-  // here. Take the last path segment and re-resolve it: the segment may itself
-  // be a known model slug (Fireworks fleet ids), earning a friendly name; a
-  // genuinely unmapped slug resolves to itself, preserving the raw-segment
-  // fallback for everything else.
-  if (canonical.includes('/')) {
-    const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
-    return segment ? getShortModelName(segment) : canonical
+  return undefined
+}
+
+export function getShortModelName(model: string): string {
+  if (autoModelNames[model]) return autoModelNames[model]
+  const stripped = getCanonicalName(model)
+  const aliased = resolveAlias(stripped)
+  // Display names are keyed by the session/bare id (`mimo-v2.5-pro`). Aliases
+  // that point at a vendor-prefixed LiteLLM key (`xiaomi/mimo-v2.5-pro`) must
+  // still hit that row — and must not recurse forever when the last path
+  // segment aliases back to the same vendor/model.
+  const named = shortNameFor(stripped) ?? shortNameFor(aliased)
+  if (named) return named
+  if (aliased.includes('/')) {
+    const segment = aliased.slice(aliased.lastIndexOf('/') + 1)
+    if (segment && segment !== stripped && segment !== model) {
+      return getShortModelName(segment)
+    }
+    return shortNameFor(segment) ?? segment ?? aliased
   }
-  return canonical
+  return aliased
 }
 
 // Pricing is process-global state assembled at CLI startup from the cached
