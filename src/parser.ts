@@ -24,10 +24,12 @@ import {
   fingerprintFile,
   isCacheComplete,
   isCacheDirty,
+  isIndexOnly,
   loadCache,
+  lookupCachedFile,
   markCacheDirty,
   monthScopeForRange,
-  reconcileFile,
+  reconcileIndexedFile,
   saveCache,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
@@ -1965,8 +1967,20 @@ async function scanProjectDirs(
       const fp = await fingerprintFile(filePath)
       if (!fp) continue
 
-      const cached = section.files[filePath]
-      const action = reconcileFile(fp, cached)
+      const cached = lookupCachedFile(diskCache, 'claude', filePath)
+      const indexOnly = isIndexOnly(diskCache, 'claude', filePath)
+      const action = reconcileIndexedFile(fp, cached, indexOnly)
+      if (indexOnly) {
+        // Out-of-range shard: fingerprint is enough to skip an unchanged file
+        // without loading turn bodies. Do not push empty-turn stubs into
+        // summaries or section.files (#1034).
+        if (readOnly || action.action === 'unchanged') {
+          if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+          continue
+        }
+        if (!readOnly) changedFiles.push({ filePath, info: { dirName, fp, source } })
+        continue
+      }
       if (cached && (readOnly || action.action === 'unchanged')) {
         if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
         unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
@@ -3056,11 +3070,24 @@ async function parseProviderSources(
     const fp = await fingerprintFile(source.path)
     if (!fp) continue
 
-    const cached = section.files[source.path]
-    const action = reconcileFile(fp, cached)
+    const cached = lookupCachedFile(diskCache, providerName, source.path)
+    const indexOnly = isIndexOnly(diskCache, providerName, source.path)
+    const action = reconcileIndexedFile(fp, cached, indexOnly)
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
+    if (indexOnly) {
+      // Out-of-range shard: skip unchanged sources without loading turn bodies.
+      // Fingerprint growth cannot append (no body), so it falls through as a
+      // full re-parse (#1034).
+      if (readOnly || action.action === 'unchanged') {
+        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+        continue
+      }
+      if (!readOnly) changedSources.push({ source, fp })
+      else readOnlyServedStale = true
+      continue
+    }
     if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })

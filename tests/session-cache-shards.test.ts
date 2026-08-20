@@ -22,6 +22,9 @@ import {
   monthScopeForRange,
   saveCache,
   sessionCacheDir,
+  lookupCachedFile,
+  isIndexOnly,
+  reconcileIndexedFile,
   type CachedFile,
   type SessionCache,
 } from '../src/session-cache.js'
@@ -838,5 +841,169 @@ describe('retiring an orphaned prior layout', () => {
     await cleanupOrphanedTempFiles()
     expect(existsSync(v8Dir)).toBe(false)
     expect(existsSync(v7)).toBe(false)
+  })
+})
+
+// Envelope fingerprint index (#1034): a scoped load classifies out-of-range
+// files `unchanged` without reading those shards' turn bodies. The index is an
+// additive v9 envelope field — old envelopes omit it and still load.
+describe('scoped-load fingerprints', () => {
+  async function seedThreeMonths(): Promise<void> {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: {
+            '/live/mar.jsonl': fileSpanning('2026-03-10T10:00:00Z'),
+            '/live/apr.jsonl': fileSpanning('2026-04-10T10:00:00Z'),
+            '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+      },
+    }
+    markCacheDirty(cache, 'claude')
+    await saveCache(cache)
+  }
+
+  const juneScope = monthScopeForRange(new Date('2026-06-01T00:00:00Z'), new Date('2026-06-30T23:59:59Z'))
+
+  type EnvelopeShape = {
+    providers: Record<string, {
+      shards: Record<string, { name: string; until: string }>
+      index?: Record<string, { fingerprint: { dev: number; ino: number; mtimeMs: number; sizeBytes: number }; lastCompleteLineOffset?: number; bucket: string }>
+    }>
+  }
+
+  async function readEnvelopeJson(): Promise<EnvelopeShape> {
+    return JSON.parse(await readFile(join(sessionCacheDir(), 'envelope.json'), 'utf-8')) as EnvelopeShape
+  }
+
+  it('save writes a fingerprint index for every file', async () => {
+    await seedThreeMonths()
+    const index = (await readEnvelopeJson()).providers['claude']!.index
+    expect(Object.keys(index ?? {}).sort()).toEqual(['/live/apr.jsonl', '/live/jun.jsonl', '/live/mar.jsonl'])
+    expect(index!['/live/mar.jsonl']!.bucket).toBe('2026-03')
+    expect(index!['/live/mar.jsonl']!.fingerprint).toEqual({ dev: 1, ino: 2, mtimeMs: 3, sizeBytes: 4 })
+    expect(index!['/live/mar.jsonl']!.lastCompleteLineOffset).toBe(128)
+  })
+
+  it('scoped load keeps skipped files out of section.files but visible to reconcile', async () => {
+    await seedThreeMonths()
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    expect(Object.keys(scoped.providers['claude']!.files)).toEqual(['/live/jun.jsonl'])
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(true)
+    expect(isIndexOnly(scoped, 'claude', '/live/jun.jsonl')).toBe(false)
+
+    const stub = lookupCachedFile(scoped, 'claude', '/live/mar.jsonl')
+    expect(stub?.turns).toEqual([])
+    expect(stub?.fingerprint).toEqual({ dev: 1, ino: 2, mtimeMs: 3, sizeBytes: 4 })
+    expect(reconcileIndexedFile(stub!.fingerprint, stub, true)).toEqual({ action: 'unchanged' })
+    // Installing that stub into section.files would re-bucket it to 0000-00.
+    expect(scoped.providers['claude']!.files['/live/mar.jsonl']).toBeUndefined()
+  })
+
+  it('a pre-#1034 envelope (no index) still loads; skipped files look uncached', async () => {
+    await seedThreeMonths()
+    const env = await readEnvelopeJson()
+    for (const meta of Object.values(env.providers)) delete meta.index
+    await writeFile(join(sessionCacheDir(), 'envelope.json'), JSON.stringify({
+      version: CACHE_VERSION, complete: true, nonce: 'old', providers: env.providers,
+    }))
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    expect(Object.keys(scoped.providers['claude']!.files)).toEqual(['/live/jun.jsonl'])
+    expect(lookupCachedFile(scoped, 'claude', '/live/mar.jsonl')).toBeUndefined()
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(false)
+  })
+
+  it('scoped save of a pre-#1034 envelope backfills the index from carried shards', async () => {
+    await seedThreeMonths()
+    const env = await readEnvelopeJson()
+    for (const meta of Object.values(env.providers)) delete meta.index
+    await writeFile(join(sessionCacheDir(), 'envelope.json'), JSON.stringify({
+      version: CACHE_VERSION, complete: true, nonce: 'old', providers: env.providers,
+    }))
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    scoped.providers['claude']!.files['/live/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(scoped, 'claude', '/live/jun2.jsonl')
+    await saveCache(scoped)
+
+    const index = (await readEnvelopeJson()).providers['claude']!.index
+    expect(Object.keys(index ?? {}).sort()).toEqual([
+      '/live/apr.jsonl', '/live/jun.jsonl', '/live/jun2.jsonl', '/live/mar.jsonl',
+    ])
+    expect(index!['/live/mar.jsonl']!.bucket).toBe('2026-03')
+
+    clearLoadCacheMemo()
+    const next = await loadCache(juneScope)
+    expect(isIndexOnly(next, 'claude', '/live/mar.jsonl')).toBe(true)
+    expect(next.providers['claude']!.files['/live/mar.jsonl']).toBeUndefined()
+  })
+
+  it('scoped save never writes an empty-turn stub into a skipped shard', async () => {
+    await seedThreeMonths()
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    // Reconcile would see March as unchanged; a buggy install would put the
+    // stub in section.files and the save would prune the real March body.
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(true)
+    scoped.providers['claude']!.files['/live/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(scoped, 'claude', '/live/jun2.jsonl')
+    await saveCache(scoped)
+
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(full.providers['claude']!.files['/live/mar.jsonl']!.turns.length).toBeGreaterThan(0)
+    expect(full.providers['claude']!.files['/live/mar.jsonl']!.turns[0]!.timestamp).toBe('2026-03-10T10:00:00Z')
+  })
+
+  it('two writers: a scoped save does not drop another provider\'s index entries', async () => {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: {
+            '/live/mar.jsonl': fileSpanning('2026-03-10T10:00:00Z'),
+            '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+        codex: {
+          envFingerprint: computeEnvFingerprint('codex'),
+          files: { '/live/r.jsonl': fileSpanning('2026-03-10T10:00:00Z') },
+        },
+      },
+    }
+    markCacheDirty(cache, 'claude')
+    markCacheDirty(cache, 'codex')
+    await saveCache(cache)
+
+    clearLoadCacheMemo()
+    const b = await loadCache(juneScope)
+    clearLoadCacheMemo()
+    const a = await loadCache(juneScope)
+    a.providers['claude']!.files['/live/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(a, 'claude', '/live/jun2.jsonl')
+    await saveCache(a)
+
+    b.providers['codex']!.files['/live/r2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(b, 'codex', '/live/r2.jsonl')
+    await saveCache(b)
+
+    const env = await readEnvelopeJson()
+    expect(env.providers['claude']!.index!['/live/mar.jsonl']!.bucket).toBe('2026-03')
+    expect(env.providers['codex']!.index!['/live/r.jsonl']!.bucket).toBe('2026-03')
+    expect(env.providers['codex']!.index!['/live/r2.jsonl']!.bucket).toBe('2026-06')
+
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(full.providers['claude']!.files['/live/mar.jsonl']).toBeDefined()
+    expect(full.providers['codex']!.files['/live/r.jsonl']).toBeDefined()
+    expect(full.providers['codex']!.files['/live/r2.jsonl']).toBeDefined()
   })
 })
