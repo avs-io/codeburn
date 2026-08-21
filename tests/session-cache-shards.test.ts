@@ -1020,6 +1020,28 @@ describe('scoped-load fingerprints', () => {
     expect(lookupCachedFile(scoped, 'claude', '/live/mar.jsonl')).toBeUndefined()
   })
 
+  it('does not trust an index entry whose bucket the envelope no longer names', async () => {
+    await seedThreeMonths()
+    const env = await readEnvelopeJson()
+    delete env.providers['claude']!.shards['2026-03']
+    await writeFile(join(sessionCacheDir(), 'envelope.json'), JSON.stringify({
+      version: CACHE_VERSION, complete: true, nonce: 'unnamed', providers: env.providers,
+    }))
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(false)
+    expect(lookupCachedFile(scoped, 'claude', '/live/mar.jsonl')).toBeUndefined()
+  })
+
+  it('a full load ignores the index even when it names skipped-looking paths', async () => {
+    await seedThreeMonths()
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(isIndexOnly(full, 'claude', '/live/mar.jsonl')).toBe(false)
+    expect(full.providers['claude']!.files['/live/mar.jsonl']).toBeDefined()
+    expect(lookupCachedFile(full, 'claude', '/live/mar.jsonl')?.turns.length).toBeGreaterThan(0)
+  })
+
   it('prunes the prior shard when an index-only file re-buckets into a loaded month', async () => {
     await seedThreeMonths()
     clearLoadCacheMemo()

@@ -937,6 +937,10 @@ export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
     for (const [path, entry] of Object.entries(index)) {
       if (section.files[path]) continue
       if (loaded.has(entry.bucket)) continue
+      // Envelope no longer names this bucket: the shard is gone. Trusting the
+      // index would hide the file forever (unchanged → skip parse and skip
+      // the next save). Fall through as uncached so it re-parses.
+      if (!(entry.bucket in meta.shards)) continue
       state.fileIndex.set(fileIndexKey(provider, path), entry)
     }
   }
@@ -1374,8 +1378,10 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
         state.bucketOf.set(`${provider}\0${path}`, cacheFileSpan(file).bucket)
       }
       // Skipped months stay index-only; in-memory files are the live copy.
+      // Do not re-install an index entry whose bucket this envelope dropped.
       for (const [path, entry] of Object.entries(meta.index ?? {})) {
         if (liveFiles[path]) continue
+        if (!(entry.bucket in meta.shards)) continue
         state.fileIndex.set(fileIndexKey(provider, path), entry)
       }
     }
