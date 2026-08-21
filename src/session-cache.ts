@@ -923,14 +923,20 @@ export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
     state.fingerprints.set(provider, meta.envFingerprint)
   }
   await Promise.all(reads)
-  // Fingerprints of skipped shards: expose them for reconcileFile without
-  // installing empty-turn stubs into section.files (#1034).
+  // Fingerprints of shards this load deliberately skipped: expose them for
+  // reconcileFile without installing empty-turn stubs into section.files
+  // (#1034). A full load (loaded === null) has every attempted bucket in
+  // memory or dirty-empty — never index-only. A scoped load must not treat
+  // a selected-but-unreadable bucket as skipped: those paths have to reparse.
   for (const [provider, meta] of Object.entries(envelope.providers)) {
     const section = cache.providers[provider]
     if (!section) continue
+    const loaded = state.loaded.get(provider)
+    if (loaded == null) continue
     const index = meta.index !== undefined ? readFileIndex(meta.index) : {}
     for (const [path, entry] of Object.entries(index)) {
       if (section.files[path]) continue
+      if (loaded.has(entry.bucket)) continue
       state.fileIndex.set(fileIndexKey(provider, path), entry)
     }
   }
@@ -1128,18 +1134,18 @@ async function buildProviderIndex(
 
   if (priorIndex !== undefined) return index
 
-  // Pre-#1034 envelope: read each carried shard once to mint the index so the
-  // next ranged run can skip those bodies.
-  const bucketsCovered = new Set(Object.values(index).map(e => e.bucket))
+  // Pre-#1034 envelope: read each carried, unloaded shard once and overlay
+  // every path not already in memory. Skip by path, not by "this bucket
+  // already has one in-memory file" — a reparsed sibling would otherwise
+  // hide the rest of the shard from the index.
   for (const [bucket, ref] of Object.entries(shards)) {
-    if (plan.loaded.has(bucket) || bucketsCovered.has(bucket)) continue
+    if (plan.loaded.has(bucket)) continue
     const files = await loadShard(join(dir, ref.name))
     if (!files) continue
     for (const [path, file] of Object.entries(files)) {
       if (plan.moved.has(path) || index[path]) continue
       index[path] = toIndexEntry(file)
     }
-    bucketsCovered.add(bucket)
   }
   return index
 }
@@ -1203,8 +1209,16 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
       // trigger below reads shards it otherwise would not.
       if (loaded) {
         for (const [path, file] of Object.entries(section.files)) {
-          if (state.bucketOf.has(`${provider}\0${path}`)) continue
+          const priorBucket = state.bucketOf.get(`${provider}\0${path}`)
+            ?? state.fileIndex.get(fileIndexKey(provider, path))?.bucket
           const bucket = cacheFileSpan(file).bucket
+          if (priorBucket !== undefined) {
+            // Index-only files have no bucketOf from a shard read. If they
+            // reparsed into a loaded month, the old shard is still carried
+            // unless we mark the path moved.
+            if (priorBucket !== bucket) plan.moved.add(path)
+            continue
+          }
           if (!loaded.has(bucket) || bucket === UNDATED_BUCKET) plan.moved.add(path)
         }
       }

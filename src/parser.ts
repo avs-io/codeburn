@@ -2853,6 +2853,15 @@ function cachedFileNeedsProviderReparse(providerName: string, sourcePath: string
   )
 }
 
+/** Index-only stubs have empty turns. Provider overrides that inspect the body
+ *  (Gemini legacy aggregates) cannot prove "safe to skip", and Devin/Antigravity
+ *  already force reparse via cachedFileNeedsProviderReparse even on a stub
+ *  (Devin always; Antigravity 0-turn). Gemini is fail-closed for the class. */
+function indexOnlyMustReparse(providerName: string, sourcePath: string, cached: CachedFile): boolean {
+  if (cachedFileNeedsProviderReparse(providerName, sourcePath, cached)) return true
+  return providerName === 'gemini'
+}
+
 const warnedProviderReadFailures = new Set<string>()
 
 function warnProviderReadFailureOnce(providerName: string, err: unknown): void {
@@ -3079,13 +3088,16 @@ async function parseProviderSources(
     if (indexOnly) {
       // Out-of-range shard: skip unchanged sources without loading turn bodies.
       // Fingerprint growth cannot append (no body), so it falls through as a
-      // full re-parse (#1034).
-      if (readOnly || action.action === 'unchanged') {
-        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      // full re-parse (#1034). Provider overrides still apply: Devin always,
+      // Antigravity 0-turn/statusline, Gemini as a class (no body to inspect).
+      if (readOnly) {
+        if (action.action !== 'unchanged') readOnlyServedStale = true
         continue
       }
-      if (!readOnly) changedSources.push({ source, fp })
-      else readOnlyServedStale = true
+      if (action.action === 'unchanged' && cached && !indexOnlyMustReparse(providerName, source.path, cached)) {
+        continue
+      }
+      changedSources.push({ source, fp })
       continue
     }
     if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {

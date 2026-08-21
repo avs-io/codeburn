@@ -1006,4 +1006,77 @@ describe('scoped-load fingerprints', () => {
     expect(full.providers['codex']!.files['/live/r.jsonl']).toBeDefined()
     expect(full.providers['codex']!.files['/live/r2.jsonl']).toBeDefined()
   })
+
+  it('does not treat a loaded-but-unreadable shard as index-only', async () => {
+    await seedThreeMonths()
+    const env = await readEnvelopeJson()
+    const march = env.providers['claude']!.shards['2026-03']!.name
+    await writeFile(join(sessionCacheDir(), march), '{"/x":{"turns":')
+    clearLoadCacheMemo()
+    const marchScope = monthScopeForRange(new Date('2026-03-01T00:00:00Z'), new Date('2026-03-31T23:59:59Z'))
+    const scoped = await loadCache(marchScope)
+    expect(scoped.providers['claude']!.files['/live/mar.jsonl']).toBeUndefined()
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(false)
+    expect(lookupCachedFile(scoped, 'claude', '/live/mar.jsonl')).toBeUndefined()
+  })
+
+  it('prunes the prior shard when an index-only file re-buckets into a loaded month', async () => {
+    await seedThreeMonths()
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    expect(isIndexOnly(scoped, 'claude', '/live/mar.jsonl')).toBe(true)
+    scoped.providers['claude']!.files['/live/mar.jsonl'] = fileSpanning('2026-06-15T10:00:00Z')
+    markCacheDirty(scoped, 'claude', '/live/mar.jsonl')
+    await saveCache(scoped)
+
+    const env = await readEnvelopeJson()
+    expect(env.providers['claude']!.index!['/live/mar.jsonl']!.bucket).toBe('2026-06')
+    const marchRef = env.providers['claude']!.shards['2026-03']
+    if (marchRef) {
+      const marchFiles = JSON.parse(await readFile(join(sessionCacheDir(), marchRef.name), 'utf-8')) as Record<string, unknown>
+      expect(marchFiles['/live/mar.jsonl']).toBeUndefined()
+    }
+
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(full.providers['claude']!.files['/live/mar.jsonl']!.turns[0]!.timestamp).toBe('2026-06-15T10:00:00Z')
+    expect(full.providers['claude']!.files['/live/mar.jsonl']!.turns.some(t => t.timestamp.startsWith('2026-03'))).toBe(false)
+    expect(env.providers['claude']!.shards['2026-06']).toBeDefined()
+  })
+
+  it('pre-#1034 backfill indexes every sibling in a carried shard', async () => {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: {
+            '/live/mar-a.jsonl': fileSpanning('2026-03-10T10:00:00Z'),
+            '/live/mar-b.jsonl': fileSpanning('2026-03-20T10:00:00Z'),
+            '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+      },
+    }
+    markCacheDirty(cache, 'claude')
+    await saveCache(cache)
+    const env = await readEnvelopeJson()
+    for (const meta of Object.values(env.providers)) delete meta.index
+    await writeFile(join(sessionCacheDir(), 'envelope.json'), JSON.stringify({
+      version: CACHE_VERSION, complete: true, nonce: 'old', providers: env.providers,
+    }))
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    scoped.providers['claude']!.files['/live/mar-a.jsonl'] = fileSpanning('2026-03-10T10:00:00Z')
+    scoped.providers['claude']!.files['/live/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(scoped, 'claude', '/live/jun2.jsonl')
+    await saveCache(scoped)
+
+    const index = (await readEnvelopeJson()).providers['claude']!.index
+    expect(Object.keys(index ?? {}).sort()).toEqual([
+      '/live/jun.jsonl', '/live/jun2.jsonl', '/live/mar-a.jsonl', '/live/mar-b.jsonl',
+    ])
+    expect(index!['/live/mar-b.jsonl']!.bucket).toBe('2026-03')
+  })
 })
