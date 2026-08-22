@@ -1322,10 +1322,15 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
         // option, and the sweep retires the name.
         if (files) shards[bucket] = await writeShard(provider, bucket, files)
       }
-      const rawIndex = latest?.providers[provider]?.index
-      const priorIndex = rawIndex !== undefined
-        ? readFileIndex(rawIndex)
-        : fileIndexForProvider(state, provider)
+      const latestProv = latest?.providers[provider]
+      // A concurrent full save omits `index` on purpose. That is not "no prior
+      // knowledge" — do not fall back to this process's stale fileIndex or we
+      // skip shard backfill and drop siblings the full writer just published.
+      const priorIndex = latestProv === undefined
+        ? fileIndexForProvider(state, provider)
+        : latestProv.index !== undefined
+          ? readFileIndex(latestProv.index)
+          : undefined
       providers[provider] = {
         envFingerprint: plan.section.envFingerprint,
         ...(plan.section.durable ? { durable: true } : {}),

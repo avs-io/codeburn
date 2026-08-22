@@ -1027,6 +1027,65 @@ describe('scoped-load fingerprints', () => {
     expect(full.providers['codex']!.files['/live/r2.jsonl']).toBeDefined()
   })
 
+  it('stale scoped writer rebuilds skipped index after a concurrent full save omitted it', async () => {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: {
+            '/claude/mar.jsonl': fileSpanning('2026-03-10T10:00:00Z'),
+            '/claude/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+        codex: {
+          envFingerprint: computeEnvFingerprint('codex'),
+          files: {
+            '/codex/mar-a.jsonl': fileSpanning('2026-03-10T10:00:00Z'),
+            '/codex/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+      },
+    }
+    markCacheDirty(cache, 'claude')
+    markCacheDirty(cache, 'codex')
+    await saveCache(cache)
+    clearLoadCacheMemo()
+    const indexSeed = await loadCache(juneScope)
+    markCacheDirty(indexSeed, 'claude')
+    markCacheDirty(indexSeed, 'codex')
+    await saveCache(indexSeed)
+
+    clearLoadCacheMemo()
+    const staleScoped = await loadCache(juneScope)
+
+    clearLoadCacheMemo()
+    const fullWriter = await loadCache()
+    fullWriter.providers['codex']!.files['/codex/mar-b.jsonl'] = fileSpanning('2026-03-20T10:00:00Z')
+    markCacheDirty(fullWriter, 'codex', '/codex/mar-b.jsonl')
+    await saveCache(fullWriter)
+    expect((await readEnvelopeJson()).providers['codex']!.index).toBeUndefined()
+
+    staleScoped.providers['claude']!.files['/claude/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(staleScoped, 'claude', '/claude/jun2.jsonl')
+    await saveCache(staleScoped)
+
+    const env = await readEnvelopeJson()
+    expect(Object.keys(env.providers['codex']!.index ?? {}).sort()).toEqual([
+      '/codex/mar-a.jsonl', '/codex/mar-b.jsonl',
+    ])
+    expect(env.providers['codex']!.index!['/codex/jun.jsonl']).toBeUndefined()
+    expect(env.providers['claude']!.index!['/claude/mar.jsonl']!.bucket).toBe('2026-03')
+    expect(env.providers['claude']!.index!['/claude/jun.jsonl']).toBeUndefined()
+
+    clearLoadCacheMemo()
+    const nextJune = await loadCache(juneScope)
+    expect(isIndexOnly(nextJune, 'codex', '/codex/mar-a.jsonl')).toBe(true)
+    expect(isIndexOnly(nextJune, 'codex', '/codex/mar-b.jsonl')).toBe(true)
+    expect(isIndexOnly(nextJune, 'codex', '/codex/jun.jsonl')).toBe(false)
+  })
+
   it('does not treat a loaded-but-unreadable shard as index-only', async () => {
     await seedThreeMonths()
     await backfillSkippedIndex()
