@@ -330,8 +330,10 @@ export function sessionCacheDir(): string {
 // turn), so the pair bounds every turn the shard can contribute and a ranged
 // load can skip the shard outright when the two do not overlap the query.
 type ShardRef = { name: string; until: string }
-/** Fingerprint (+ resume offset + bucket) of one cached file. Cheap enough to
- *  live on the envelope so a scoped load can skip the shard body (#1034). */
+/** Fingerprint + bucket of one cached file in a *skipped* shard. Cheap enough
+ *  to live on the envelope so a scoped load can skip that shard body (#1034).
+ *  Loaded months are already in `section.files` — they must not be copied here
+ *  or a 1.9 GB corpus inflates the envelope for a two-file skip. */
 export type FileIndexEntry = {
   fingerprint: FileFingerprint
   lastCompleteLineOffset?: number
@@ -344,9 +346,8 @@ type EnvelopeProvider = {
   durable?: boolean
   /** month (`YYYY-MM`, or `0000-00` for turn-less files) -> shard */
   shards: Record<string, ShardRef>
-  /** Every cached file's fingerprint, including months this load will skip.
-   *  Optional: pre-#1034 envelopes omit it and scoped loads re-parse
-   *  out-of-range files the way they used to. */
+  /** Files in shards this load *skipped*. Optional. A full load omits it.
+   *  Pre-#1034 envelopes omit it and scoped loads re-parse out-of-range files. */
   index?: Record<string, FileIndexEntry>
 }
 type CacheEnvelope = {
@@ -562,7 +563,6 @@ function readFileIndex(raw: unknown): Record<string, FileIndexEntry> {
 function toIndexEntry(file: CachedFile): FileIndexEntry {
   return {
     fingerprint: file.fingerprint,
-    ...(file.lastCompleteLineOffset !== undefined ? { lastCompleteLineOffset: file.lastCompleteLineOffset } : {}),
     bucket: cacheFileSpan(file).bucket,
   }
 }
@@ -1107,51 +1107,42 @@ type ProviderPlan = {
   refs: Record<string, ShardRef>
 }
 
-function toIndexFromFiles(files: Record<string, CachedFile>): Record<string, FileIndexEntry> {
-  const index: Record<string, FileIndexEntry> = {}
-  for (const [path, file] of Object.entries(files)) index[path] = toIndexEntry(file)
-  return index
-}
-
 /** Build the envelope fingerprint index for one provider.
- *  Full load: exactly the files in memory.
- *  Scoped load: in-memory overlay + carried months from the previous index,
- *  backfilling from shard bodies only when the previous envelope had no index. */
+ *  Full load: omit — every file is already in memory / shards.
+ *  Scoped load: only files in skipped, still-named buckets. Never copy
+ *  in-memory files (that was the 5.6 MB envelope on a 2-file skip). */
 async function buildProviderIndex(
   _provider: string,
   plan: ProviderPlan,
   shards: Record<string, ShardRef>,
   priorIndex: Record<string, FileIndexEntry> | undefined,
   dir: string,
-): Promise<Record<string, FileIndexEntry>> {
-  if (!plan.loaded) return toIndexFromFiles(plan.section.files)
+): Promise<Record<string, FileIndexEntry> | undefined> {
+  if (!plan.loaded) return undefined
 
   const index: Record<string, FileIndexEntry> = {}
   for (const [path, entry] of Object.entries(priorIndex ?? {})) {
     if (plan.moved.has(path)) continue
+    if (plan.section.files[path]) continue
     if (plan.loaded.has(entry.bucket)) continue
-    index[path] = entry
-  }
-  for (const [path, file] of Object.entries(plan.section.files)) {
-    index[path] = toIndexEntry(file)
+    if (!(entry.bucket in shards)) continue
+    index[path] = { fingerprint: entry.fingerprint, bucket: entry.bucket }
   }
 
-  if (priorIndex !== undefined) return index
-
-  // Pre-#1034 envelope: read each carried, unloaded shard once and overlay
-  // every path not already in memory. Skip by path, not by "this bucket
-  // already has one in-memory file" — a reparsed sibling would otherwise
-  // hide the rest of the shard from the index.
-  for (const [bucket, ref] of Object.entries(shards)) {
-    if (plan.loaded.has(bucket)) continue
-    const files = await loadShard(join(dir, ref.name))
-    if (!files) continue
-    for (const [path, file] of Object.entries(files)) {
-      if (plan.moved.has(path) || index[path]) continue
-      index[path] = toIndexEntry(file)
+  if (priorIndex === undefined) {
+    // Pre-#1034 envelope: read each carried, unloaded shard once.
+    for (const [bucket, ref] of Object.entries(shards)) {
+      if (plan.loaded.has(bucket)) continue
+      const files = await loadShard(join(dir, ref.name))
+      if (!files) continue
+      for (const [path, file] of Object.entries(files)) {
+        if (plan.moved.has(path) || plan.section.files[path] || index[path]) continue
+        index[path] = toIndexEntry(file)
+      }
     }
   }
-  return index
+
+  return Object.keys(index).length > 0 ? index : undefined
 }
 
 export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {

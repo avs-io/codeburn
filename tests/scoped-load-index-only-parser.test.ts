@@ -227,6 +227,11 @@ describe('scoped-load index-only parser guards', () => {
     const cache = await import('../src/session-cache.js')
     clearParserCache = parser.clearSessionCache
     await parser.parseAllSessions(undefined, 'gemini')
+    parser.clearSessionCache()
+    cache.clearLoadCacheMemo()
+    const seeded = await cache.loadCache(cache.monthScopeForRange(juneRange.start, juneRange.end))
+    cache.markCacheDirty(seeded, 'gemini')
+    await cache.saveCache(seeded)
     await poisonProviderTurns('gemini', marPath, 'POISON')
     await writeFile(junPath, geminiSession('g-jun', '2026-06-10T10:00:00.000Z', 'june gemini plus'))
     parser.clearSessionCache()
