@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import Observation
 import ServiceManagement
+import Darwin
 
 private let refreshIntervalSeconds: UInt64 = 30
 private let forceRefreshWatchdogSeconds: TimeInterval = 90
@@ -53,6 +54,7 @@ struct CodeBurnApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var statusItemPlacementRecoveryTask: Task<Void, Never>?
     private var popover: NSPopover!
     private var rightClickMonitor: Any?
     private var lastContextMenuPresentedAt: Date = .distantPast
@@ -90,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // is the orphan in #1117. shutdown() still runs for the tidy case.
         ServeChildRegistry.shared.reapAll()
         Task { await ServeConnection.shared.shutdown() }
+        stopStatusItemPlacementRecovery()
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)
             rightClickMonitor = nil
@@ -122,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        runMaintenanceCommandIfRequested()
         ProcessInfo.processInfo.automaticTerminationSupportEnabled = false
         ProcessInfo.processInfo.disableSuddenTermination()
         // Deliberately NO app-lifetime beginActivity here. A permanent
@@ -155,6 +159,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         Task { await updateChecker.checkIfNeeded() }
     }
 
+    /// Runs only from the installed source bundle during identity repair. The
+    /// exact installed code identity is required for SMAppService to address
+    /// the source registration. Packaged builds advertise this protocol in
+    /// Info.plist so older binaries are never launched with an unknown flag.
+    private func runMaintenanceCommandIfRequested() {
+        let arguments = ProcessInfo.processInfo.arguments
+        let statusRequested = arguments.contains("--codeburn-login-item-status")
+        let unregisterRequested = arguments.contains("--codeburn-unregister-login-item")
+        let registerRequested = arguments.contains("--codeburn-register-login-item")
+        guard statusRequested || unregisterRequested || registerRequested else {
+            return
+        }
+
+        let key = "codeburn.loginItemRegistered"
+        let service = SMAppService.mainApp
+        do {
+            let state = LoginItemRegistrationPolicy.migrationState(
+                status: service.status,
+                wasPreviouslyRegistered: UserDefaults.standard.bool(forKey: key)
+            )
+            if unregisterRequested {
+                switch service.status {
+                case .enabled, .requiresApproval:
+                    try service.unregister()
+                case .notRegistered, .notFound:
+                    break
+                @unknown default:
+                    break
+                }
+            } else if registerRequested, service.status != .enabled {
+                try service.register()
+            }
+            let resultState: LoginItemMigrationState
+            if registerRequested {
+                switch service.status {
+                case .enabled:
+                    resultState = .registered
+                case .requiresApproval:
+                    resultState = .disabled
+                case .notRegistered, .notFound:
+                    resultState = .notRegistered
+                @unknown default:
+                    resultState = .unknown
+                }
+            } else {
+                // Unregister reports the state that was retired so the caller
+                // can verify it addressed the intended identity.
+                resultState = state
+            }
+            print(resultState.rawValue)
+            fflush(stdout)
+            Darwin.exit(EXIT_SUCCESS)
+        } catch {
+            let message = "CodeBurn Login Item maintenance failed: \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            Darwin.exit(EXIT_FAILURE)
+        }
+    }
+
     private func setupWakeObservers() {
         // Pause the refresh loop while the machine is asleep. Without this,
         // Task.sleep keeps a wakeup pending across the suspension and the
@@ -166,6 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.stopStatusItemPlacementRecovery()
                 self?.prepareRefreshPipelineForSleep()
             }
         }
@@ -182,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "wake")
+                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -193,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "screen wake")
+                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -206,6 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.displayAsleep = true
+                self?.stopStatusItemPlacementRecovery()
             }
         }
     }
@@ -285,15 +352,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     private func registerLoginItemIfNeeded() {
         let key = "codeburn.loginItemRegistered"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        let service = SMAppService.mainApp
+        let wasPreviouslyRegistered = UserDefaults.standard.bool(forKey: key)
+        guard LoginItemRegistrationPolicy.shouldRegister(
+            status: service.status,
+            wasPreviouslyRegistered: wasPreviouslyRegistered
+        ) else {
+            if LoginItemRegistrationPolicy.shouldRecordRegistration(
+                status: service.status,
+                wasPreviouslyRegistered: wasPreviouslyRegistered
+            ) {
+                UserDefaults.standard.set(true, forKey: key)
+            }
+            return
+        }
 
         // Registers in-process. The old path told System Events to make the login
         // item, which made macOS ask for Automation access on first launch (#1026).
         // No AppleScript fallback: a failure here must not bring that prompt back.
         do {
-            if SMAppService.mainApp.status != .enabled {
-                try SMAppService.mainApp.register()
-            }
+            try service.register()
             UserDefaults.standard.set(true, forKey: key)
         } catch {
             NSLog("CodeBurn: login item registration failed: \(error.localizedDescription)")
@@ -959,8 +1037,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
-        guard let button = statusItem.button else { return }
+        let item = NSStatusBar.system.statusItem(withLength: statusItemWidth)
+        item.autosaveName = StatusItemPlacementPolicy.autosaveName
+        // `autosaveName` makes AppKit restore status-item state across launches.
+        // CodeBurn has no user-facing hide toggle, so explicitly restore the
+        // supported visible state in case Tahoe persisted a hidden/parked item.
+        item.isVisible = true
+        statusItem = item
+        guard let button = statusItem.button else {
+            startStatusItemPlacementRecovery()
+            return
+        }
 
         // Set the bundled flame image immediately to ensure the status item renders.
         // On macOS Tahoe, status items may fail to appear if only an attributed title
@@ -1002,7 +1089,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // Defer the full attributed title setup to ensure initial render completes
         DispatchQueue.main.async { [weak self] in
             self?.refreshStatusButton()
+            self?.startStatusItemPlacementRecovery()
         }
+    }
+
+    /// Tahoe can park an accessory app's status item at the screen's top-right
+    /// corner when the auto-hidden menu bar is hidden during launch (#1148).
+    /// Wait for the user's pointer to reveal the bar, then perform up to three
+    /// supported visibility pulses. Never remove/recreate the item: repeated
+    /// creation churn is implicated in poisoning the bundle-id state this
+    /// recovery protects.
+    private func startStatusItemPlacementRecovery() {
+        stopStatusItemPlacementRecovery()
+
+        statusItemPlacementRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(120))
+            var recovery = StatusItemPlacementRecoveryCoordinator()
+
+            while !Task.isCancelled && clock.now < deadline {
+                let placement = self.statusItemPlacementState
+                let revealed = placement.screen.map { screen in
+                    StatusItemPlacementPolicy.isMenuBarRevealed(
+                        pointer: NSEvent.mouseLocation,
+                        screenFrame: screen.frame,
+                        screenVisibleFrame: screen.visibleFrame
+                    )
+                } ?? false
+                switch recovery.action(
+                    for: placement.geometry,
+                    isMenuBarRevealed: revealed,
+                    revealHasSettled: false
+                ) {
+                case .stopHealthy:
+                    return
+                case .poll, .waitForReveal:
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                case .stopExhausted:
+                    NSLog("CodeBurn: status item remains parked after bounded retries; run `codeburn menubar --repair-placement`")
+                    return
+                case .settleBeforePulse:
+                    // Let the auto-hide animation finish before asking AppKit
+                    // to place the existing item again.
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard !Task.isCancelled else { return }
+                    let settledPlacement = self.statusItemPlacementState
+                    let settledReveal = settledPlacement.screen.map { screen in
+                        StatusItemPlacementPolicy.isMenuBarRevealed(
+                            pointer: NSEvent.mouseLocation,
+                            screenFrame: screen.frame,
+                            screenVisibleFrame: screen.visibleFrame
+                        )
+                    } ?? false
+                    switch recovery.action(
+                        for: settledPlacement.geometry,
+                        isMenuBarRevealed: settledReveal,
+                        revealHasSettled: true
+                    ) {
+                    case .stopHealthy:
+                        return
+                    case .poll, .waitForReveal, .settleBeforePulse:
+                        continue
+                    case .stopExhausted:
+                        NSLog("CodeBurn: status item remains parked after bounded retries; run `codeburn menubar --repair-placement`")
+                        return
+                    case .pulse(let attempt):
+                        NSLog("CodeBurn: retrying parked status-item placement after menu bar reveal (\(attempt)/\(recovery.maximumPulseCount))")
+                        await StatusItemVisibilityPulse.run { self.statusItem.isVisible = $0 }
+                        guard !Task.isCancelled else { return }
+                        try? await Task.sleep(for: .milliseconds(250))
+                        continue
+                    }
+                case .pulse:
+                    // A pulse is only emitted after the settle phase above.
+                    assertionFailure("status item pulse emitted before reveal settled")
+                    return
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            switch self.statusItemPlacementState {
+            case .healthy:
+                return
+            case .unrealized:
+                NSLog("CodeBurn: status item did not realize before placement recovery timed out; run `codeburn menubar --repair-placement`")
+            case .parked:
+                NSLog("CodeBurn: status item stayed parked without a menu-bar reveal; run `codeburn menubar --repair-placement`")
+            }
+        }
+    }
+
+    private func stopStatusItemPlacementRecovery() {
+        statusItemPlacementRecoveryTask?.cancel()
+        statusItemPlacementRecoveryTask = nil
+    }
+
+    private enum StatusItemPlacementState {
+        case unrealized
+        case healthy
+        case parked(NSScreen)
+
+        var geometry: StatusItemPlacementRecoveryGeometry {
+            switch self {
+            case .unrealized: return .unrealized
+            case .healthy: return .healthy
+            case .parked: return .parked
+            }
+        }
+
+        var screen: NSScreen? {
+            if case .parked(let screen) = self { return screen }
+            return nil
+        }
+    }
+
+    private var statusItemPlacementState: StatusItemPlacementState {
+        guard let window = statusItem?.button?.window else { return .unrealized }
+        let frame = window.frame
+        guard !frame.isEmpty else { return .unrealized }
+        guard let screen = window.screen
+                ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) })
+                ?? NSScreen.main else { return .unrealized }
+        let parked = StatusItemPlacementPolicy.isParked(
+            itemFrame: frame,
+            screenFrame: screen.frame,
+            statusBarThickness: NSStatusBar.system.thickness
+        )
+        return parked ? .parked(screen) : .healthy
     }
 
     /// Composes the menubar title as a single attributed string with the flame as an inline
