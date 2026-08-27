@@ -16,6 +16,7 @@ import { clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './ho
 import { readDailyBudget } from './lib/budget'
 import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
 import { motionClass } from './lib/motion'
+import { clearOverviewHeadlines, readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import { codeburn } from './lib/ipc'
 import { isModifierChord, shortcutLabel } from './lib/platform'
 import { localDateKey, PERIOD_LABELS } from './lib/period'
@@ -240,6 +241,25 @@ function AppMain() {
     { memoKey: overviewMemoKey(provider, period, customRange, claudeConfigSource, scope) },
   )
   const refreshOverview = overview.refresh
+  const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope)
+  // A compact, privacy-minimized last exact headline makes a returning launch or
+  // an as-yet-unwarmed period useful immediately. It is never presented as the
+  // current answer: the full authoritative fetch starts normally behind it.
+  const headlineSnapshot = useMemo(
+    () => customRange || scope !== 'local' ? null : readOverviewHeadline(activeOverviewKey),
+    [activeOverviewKey, customRange, scope],
+  )
+
+  useEffect(() => {
+    if (!overview.data || customRange || scope !== 'local') return
+    writeOverviewHeadline(activeOverviewKey, overview.data, overview.lastSuccessAt ?? Date.now())
+  }, [activeOverviewKey, customRange, overview.data, overview.lastSuccessAt, scope])
+
+  useEffect(() => {
+    if (overview.data || !headlineSnapshot?.currency) return
+    setActiveCurrency(headlineSnapshot.currency)
+    setCurrencyTick(tick => tick + 1)
+  }, [headlineSnapshot?.currency, overview.data])
 
   // Boot readiness: the overview poll is the single cold-cache warmer (long
   // timeout + progress). Other sections gate their first CLI spawn on this so a
@@ -403,7 +423,10 @@ function AppMain() {
           // background priority (5th arg) so this never delays an interactive
           // poll; ignored by an older preload, degrading to current behavior.
           const value = await codeburn.getOverview(target.period, target.provider, undefined, undefined, true)
-          if (!cancelled) primePolledMemo(key, value)
+          if (!cancelled) {
+            primePolledMemo(key, value)
+            writeOverviewHeadline(key, value)
+          }
         } catch { /* best-effort warm; a real switch will fetch and surface any error */ }
         i++
         if (!cancelled && i < targets.length) await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
@@ -434,6 +457,7 @@ function AppMain() {
   // couple seconds (quick like the menubar) instead of at the next poll.
   const onConfigMutated = useCallback(() => {
     clearPolledMemo()
+    clearOverviewHeadlines()
     refreshVisible()
   }, [refreshVisible])
 
@@ -528,12 +552,13 @@ function AppMain() {
 
   return (
     <Window>
-      <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} />} />
+      <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} snapshot={headlineSnapshot} />} />
       <ToastHost />
-      <Splash hasData={overview.data != null} hasError={overview.error != null && !overviewCold} />
+      <Splash hasData={overview.data != null || headlineSnapshot != null} hasError={overview.error != null && !overviewCold} />
       {onboardingStatus && <Onboarding defaultEnabled={onboardingStatus.defaultEnabled} onDone={finishOnboarding} />}
-      <div className="ct">
-        <div className={overview.switching ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
+      <div className="ct" aria-busy={overview.switching || (!!headlineSnapshot && overview.loading)}>
+        <div className={overview.switching || (!!headlineSnapshot && overview.loading) ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
+        {(overview.switching || (!!headlineSnapshot && overview.loading)) && <SwitchingBanner />}
         <UpdateBanner />
         <IndexingBanner payload={overview.data ?? null} />
         <DailyBudgetBanner payload={overview.data ?? null} provider={provider} />
@@ -561,7 +586,7 @@ function AppMain() {
             />
             <div className={motionClass('body', 'section-fade')}>
               {section === 'overview' ? (
-                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} />
+                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
                 <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={detectedProviders} onProviderChange={onProviderSelect} ready={ready} />
               ) : section === 'pullRequests' ? (
@@ -596,7 +621,7 @@ function AppMain() {
   )
 }
 
-function StatusLine({ polled }: { polled: ReturnType<typeof usePolled<MenubarPayload>> }) {
+function StatusLine({ polled, snapshot }: { polled: ReturnType<typeof usePolled<MenubarPayload>>; snapshot?: ReturnType<typeof readOverviewHeadline> }) {
   if (polled.data) {
     return (
       <>
@@ -604,6 +629,7 @@ function StatusLine({ polled }: { polled: ReturnType<typeof usePolled<MenubarPay
       </>
     )
   }
+  if (snapshot) return <>{snapshot.label} <b>{formatUsd(snapshot.cost)}</b> · updating</>
   if (polled.error?.kind === 'not-found') return <>CLI not found</>
   if (polled.loading) return <>scanning…</>
   return <>—</>

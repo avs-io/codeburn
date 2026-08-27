@@ -23,6 +23,7 @@ import type {
   Scope,
   YieldJsonReport,
 } from '../lib/types'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 
 export { localDateKey } from '../lib/period'
 
@@ -677,6 +678,7 @@ export function OverviewContent({
   onNavigate,
   ready = true,
   scope = 'local',
+  headlineSnapshot = null,
 }: {
   period: Period
   provider?: string
@@ -685,6 +687,7 @@ export function OverviewContent({
   onNavigate?: (section: 'optimize' | 'sessions') => void
   ready?: boolean
   scope?: Scope
+  headlineSnapshot?: OverviewHeadlineSnapshot | null
 }) {
   // Gate secondary spawns on the app-level readiness (first overview resolved),
   // so the cold hydration runs once (via overview) rather than 3 parses at once
@@ -696,6 +699,26 @@ export function OverviewContent({
 
   if (!data) {
     if (error) return <CliErrorPanel error={error} subject="your usage" />
+    if (headlineSnapshot) {
+      const generated = new Date(headlineSnapshot.generated)
+      const captured = Number.isNaN(generated.getTime()) ? new Date(headlineSnapshot.capturedAt) : generated
+      const capturedLabel = Number.isNaN(captured.getTime())
+        ? 'earlier'
+        : captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+      return (
+        <div className="ov-dashboard" aria-label="Cached usage summary">
+          <div className="ov-card ov-hero-split snapshot-hero">
+            <div className="ov-hero-main">
+              <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact at {capturedLabel}</span></div>
+              <CountUp value={headlineSnapshot.cost} animateKey={`snapshot|${period}|${provider}`} />
+              <div className="ov-hero-sub">{headlineSnapshot.calls.toLocaleString('en-US')} calls · sessions updating</div>
+              <p className="ov-widget-caption">Current totals, charts, sessions, and efficiency are refreshing in the background.</p>
+            </div>
+          </div>
+          <SectionSkeleton label="Updating detailed drill-downs…" rows={3} chart />
+        </div>
+      )
+    }
     return <SectionSkeleton label="Scanning sessions…" rows={3} chart />
   }
 

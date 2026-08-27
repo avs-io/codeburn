@@ -507,6 +507,7 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .ov-hero-split { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; align-items: stretch; }
 .ov-hero-split > * { min-width: 0; padding: 16px 18px; }
 .ov-hero-split > * + * { border-left: 1px solid var(--line2); }
+.ov-hero-split.snapshot-hero > * { grid-column: 1 / -1; }
 .ov-hero-main { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .ov-hero-top { width: 100%; }
 .ov-saved-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 7px; margin-top: 5px; padding-top: 9px; border-top: 1px solid var(--line2); color: var(--mut2); font-size: 10.5px; }

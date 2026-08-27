@@ -6,6 +6,7 @@ import { App, overviewMemoKey, topCategoryByModel, usageSnapshotProps } from './
 import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
+import { readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
 
 const stored = new Map<string, string>()
@@ -214,6 +215,20 @@ describe('App shortcuts', () => {
     await act(async () => { await Promise.resolve() })
     expect(mocks.getActReport).not.toHaveBeenCalled()
     expect(screen.queryByText("Couldn't read data")).not.toBeInTheDocument()
+  })
+
+  it('paints the last exact headline immediately while authoritative details load', async () => {
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, overviewPayload(), Date.now() - 1_000)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+    expect(screen.getByText(/sessions updating/)).toBeInTheDocument()
+    expect(screen.getByText('Updating detailed drill-downs…')).toBeInTheDocument()
+    expect(screen.getByText('Refreshing selected view…')).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
   })
 
   it('releases the sections when the overview fails for a real reason', async () => {
@@ -810,6 +825,7 @@ describe('currency correctness', () => {
     // A warmed entry (as the prefetcher would leave one) that must be purged so a
     // later switch can't repaint a payload computed under the old currency.
     primePolledMemo('sentinel-warmed-key', { stale: true })
+    writeOverviewHeadline(overviewMemoKey('all', 'week', null, null), overviewPayload())
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(true)
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
@@ -820,6 +836,7 @@ describe('currency correctness', () => {
     // Memo purged and the active view force-refreshed so the new currency lands fast.
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(false)
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
   })
 })
 
