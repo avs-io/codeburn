@@ -251,9 +251,12 @@ function AppMain() {
   )
 
   useEffect(() => {
-    if (!overview.data || customRange || scope !== 'local') return
+    // React renders once with the previous hook result before the dependency-
+    // change effect clears or swaps it. Never persist that previous payload
+    // beneath the newly selected period/provider key.
+    if (!overview.data || overview.dataKey !== activeOverviewKey || customRange || scope !== 'local') return
     writeOverviewHeadline(activeOverviewKey, overview.data, overview.lastSuccessAt ?? Date.now())
-  }, [activeOverviewKey, customRange, overview.data, overview.lastSuccessAt, scope])
+  }, [activeOverviewKey, customRange, overview.data, overview.dataKey, overview.lastSuccessAt, scope])
 
   useEffect(() => {
     if (overview.data || !headlineSnapshot?.currency) return
@@ -418,7 +421,6 @@ function AppMain() {
           await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
           continue
         }
-        warmedKeys.current.add(key)
         try {
           // background priority (5th arg) so this never delays an interactive
           // poll; ignored by an older preload, degrading to current behavior.
@@ -426,6 +428,9 @@ function AppMain() {
           if (!cancelled) {
             primePolledMemo(key, value)
             writeOverviewHeadline(key, value)
+            // A cancelled/failed warm did not produce a usable memo entry and
+            // must remain retryable on the next idle pass.
+            warmedKeys.current.add(key)
           }
         } catch { /* best-effort warm; a real switch will fetch and surface any error */ }
         i++

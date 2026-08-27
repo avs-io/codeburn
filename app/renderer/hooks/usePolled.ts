@@ -6,6 +6,10 @@ import type { CliError } from '../lib/types'
 
 export type Polled<T> = {
   data: T | null
+  /** Memo key that produced `data`. During a dependency change React may render
+   *  once with the previous result before the load effect clears or replaces it;
+   *  consumers that persist data under the active key must compare this first. */
+  dataKey?: string | null
   error: CliError | null
   loading: boolean
   /** True while a fresh fetch runs behind instantly-served memoized data (a
@@ -98,6 +102,8 @@ export function usePolled<T>(
   const enabled = opts.enabled ?? true
   const memoKey = opts.memoKey
   const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey)?.value ?? null : null))
+  const [dataKey, setDataKey] = useState<string | null>(() =>
+    memoKey && memoGet<T>(memoKey) !== undefined ? memoKey : null)
   const [error, setError] = useState<CliError | null>(null)
   const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
@@ -131,6 +137,7 @@ export function usePolled<T>(
       const cached = memoGet<T>(memoKey)
       if (cached !== undefined) {
         setData(cached.value)
+        setDataKey(memoKey)
         servedCached = true
         // The footer's "refreshed Ns ago" must describe the payload on screen,
         // not this hook instance's last fetch of some other key.
@@ -144,7 +151,10 @@ export function usePolled<T>(
           setSwitching(false)
           return
         }
-      } else setData(null)
+      } else {
+        setData(null)
+        setDataKey(null)
+      }
     }
     setLoading(true)
     setSwitching(servedCached)
@@ -155,6 +165,7 @@ export function usePolled<T>(
       .then(result => {
         if (epochRef.current !== epoch) return
         setData(result)
+        setDataKey(memoKey ?? null)
         setError(null)
         const at = Date.now()
         setLastSuccessAt(at)
@@ -212,5 +223,26 @@ export function usePolled<T>(
     load()
   }, [load])
 
-  return { data, error, loading, switching, lastSuccessAt, refresh }
+  // A dependency/key change renders before the effect above can swap state.
+  // Mask the previous key synchronously in that render; if the new key is
+  // already memoized, expose that matching value immediately instead. This
+  // keeps the selected filter and every visible number consistent per frame,
+  // not merely after effects have run.
+  const renderMemo = memoKey ? memoGet<T>(memoKey) : undefined
+  const keyMismatch = memoKey !== undefined && dataKey !== memoKey
+  const renderedData = keyMismatch ? renderMemo?.value ?? null : data
+  const renderedDataKey = keyMismatch ? (renderMemo ? memoKey : null) : dataKey
+  const renderedLastSuccessAt = keyMismatch && renderMemo ? renderMemo.at : lastSuccessAt
+  const renderedLoading = keyMismatch ? true : loading
+  const renderedSwitching = keyMismatch ? renderMemo !== undefined : switching
+
+  return {
+    data: renderedData,
+    dataKey: renderedDataKey,
+    error,
+    loading: renderedLoading,
+    switching: renderedSwitching,
+    lastSuccessAt: renderedLastSuccessAt,
+    refresh,
+  }
 }

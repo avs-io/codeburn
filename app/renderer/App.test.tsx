@@ -232,6 +232,25 @@ describe('App shortcuts', () => {
     expect(mocks.getActReport).not.toHaveBeenCalled()
   })
 
+  it('never persists the previous period headline under a newly selected period', async () => {
+    const thirtyDays = overviewPayload()
+    thirtyDays.current = { ...thirtyDays.current, label: 'Last 30 Days', cost: 30 }
+    const pendingWeek = new Promise<MenubarPayload>(() => {})
+    mocks.getOverview.mockImplementation((period: string) =>
+      period === 'week' ? pendingWeek : Promise.resolve(thirtyDays))
+
+    render(<App />)
+    expect(await screen.findByText('$30.00')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+
+    // The selected key has not resolved yet. A 30-day result must never be
+    // written beneath it and then shown as the seven-day headline on a later
+    // switch or app launch.
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
   it('releases the sections when the overview fails for a real reason', async () => {
     mocks.getOverview.mockRejectedValue({ kind: 'nonzero', message: 'permission denied' })
     render(<App />)
@@ -710,6 +729,47 @@ describe('overview idle warming', () => {
       ])
 
       expect(backgroundSpawns.filter(call => call[1] !== 'all')).toHaveLength(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries a period warm that was cancelled by a user period switch', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveFirstToday!: (payload: MenubarPayload) => void
+      const firstToday = new Promise<MenubarPayload>(resolve => { resolveFirstToday = resolve })
+      let todayWarmCalls = 0
+      mocks.getOverview.mockImplementation((period: string, _provider: string, _range, _config, background) => {
+        if (period === 'today' && background === true) {
+          todayWarmCalls++
+          if (todayWarmCalls === 1) return firstToday
+        }
+        const payload = manyProviderPayload()
+        payload.current = {
+          ...payload.current,
+          label: period === 'week' ? 'Last 7 Days' : payload.current.label,
+        }
+        return Promise.resolve(payload)
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(todayWarmCalls).toBe(1)
+
+      // The user takes priority while the first background warm is pending.
+      fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+      await act(async () => { await Promise.resolve() })
+      expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all')
+
+      // The cancelled result must not poison the session-lifetime retry guard.
+      await act(async () => {
+        resolveFirstToday(manyProviderPayload())
+        await Promise.resolve()
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      expect(todayWarmCalls).toBe(2)
     } finally {
       vi.useRealTimers()
     }

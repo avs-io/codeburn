@@ -1,12 +1,15 @@
 import type { MenubarPayload } from './types'
 
-const STORAGE_KEY = 'codeburn.overview-headlines.v1'
-const SNAPSHOT_VERSION = 1
+const STORAGE_KEY = 'codeburn.overview-headlines.v2'
+const LEGACY_STORAGE_KEYS = ['codeburn.overview-headlines.v1'] as const
+const SNAPSHOT_VERSION = 2
 const MAX_ENTRIES = 96
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 export type OverviewHeadlineSnapshot = {
-  version: 1
+  version: 2
+  /** The exact period/provider/config memo identity this headline belongs to. */
+  key: string
   capturedAt: number
   generated: string
   label: string
@@ -33,6 +36,7 @@ function valid(value: unknown): value is OverviewHeadlineSnapshot {
   if (!value || typeof value !== 'object') return false
   const item = value as Partial<OverviewHeadlineSnapshot>
   return item.version === SNAPSHOT_VERSION
+    && typeof item.key === 'string'
     && finite(item.capturedAt)
     && typeof item.generated === 'string'
     && typeof item.label === 'string'
@@ -60,7 +64,7 @@ function readMap(store = storage()): StoredSnapshotMap {
  * behavioral conclusions are duplicated into renderer storage. */
 export function readOverviewHeadline(key: string, now = Date.now()): OverviewHeadlineSnapshot | null {
   const item = readMap()[key]
-  if (!item || now - item.capturedAt > MAX_AGE_MS || item.capturedAt > now + 60_000) return null
+  if (!item || item.key !== key || now - item.capturedAt > MAX_AGE_MS || item.capturedAt > now + 60_000) return null
   return item
 }
 
@@ -73,6 +77,7 @@ export function writeOverviewHeadline(key: string, payload: MenubarPayload, capt
   const current = payload.current
   const snapshot: OverviewHeadlineSnapshot = {
     version: SNAPSHOT_VERSION,
+    key,
     capturedAt,
     generated: payload.generated,
     label: current.label,
@@ -96,7 +101,11 @@ export function writeOverviewHeadline(key: string, payload: MenubarPayload, capt
 }
 
 export function clearOverviewHeadlines(): void {
-  try { storage()?.removeItem(STORAGE_KEY) } catch { /* storage can be unavailable */ }
+  try {
+    const store = storage()
+    store?.removeItem(STORAGE_KEY)
+    for (const key of LEGACY_STORAGE_KEYS) store?.removeItem(key)
+  } catch { /* storage can be unavailable */ }
 }
 
 export const __overviewSnapshotStorageKey = STORAGE_KEY

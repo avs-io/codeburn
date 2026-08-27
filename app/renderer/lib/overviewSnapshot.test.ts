@@ -52,9 +52,40 @@ describe('persisted Overview headline', () => {
     expect(readOverviewHeadline('anything', NOW)).toBeNull()
   })
 
+  it('rejects a snapshot whose embedded identity does not match the requested period key', () => {
+    const requestedKey = 'overview|all|week'
+    writeOverviewHeadline(requestedKey, payload(), NOW)
+    const parsed = JSON.parse(localStorage.getItem(__overviewSnapshotStorageKey) ?? '{}')
+    parsed[requestedKey].key = 'overview|all|30days'
+    localStorage.setItem(__overviewSnapshotStorageKey, JSON.stringify(parsed))
+
+    expect(readOverviewHeadline(requestedKey, NOW)).toBeNull()
+  })
+
+  it('ignores legacy v1 headlines that may already contain a cross-period write', () => {
+    localStorage.setItem('codeburn.overview-headlines.v1', JSON.stringify({
+      'overview|all|week': {
+        version: 1,
+        capturedAt: NOW,
+        generated: payload().generated,
+        label: 'Last 30 Days',
+        cost: 999,
+        calls: 999,
+        inputTokens: 1,
+        outputTokens: 2,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 4,
+      },
+    }))
+
+    expect(readOverviewHeadline('overview|all|week', NOW)).toBeNull()
+  })
+
   it('clears every persisted headline after a pricing or currency mutation', () => {
     writeOverviewHeadline('one', payload(), NOW)
+    localStorage.setItem('codeburn.overview-headlines.v1', '{"legacy":true}')
     clearOverviewHeadlines()
     expect(localStorage.getItem(__overviewSnapshotStorageKey)).toBeNull()
+    expect(localStorage.getItem('codeburn.overview-headlines.v1')).toBeNull()
   })
 })

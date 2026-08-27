@@ -317,6 +317,23 @@ describe('Overview', () => {
     }
   })
 
+  it('keeps weekday labels fixed while month context scrolls with the activity cells', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(makePayload(now))
+
+    render(<Overview period="30days" provider="all" />)
+
+    expect(await screen.findByText('$312.40')).toBeInTheDocument()
+    const timeline = screen.getByRole('region', { name: 'Scrollable daily activity timeline' })
+    const weekdayLabels = screen.getByLabelText('Weekday labels')
+
+    expect(within(weekdayLabels).getByText('Mon')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Wed')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Fri')).toBeInTheDocument()
+    expect(within(timeline).queryByText('Mon')).not.toBeInTheDocument()
+    expect(within(timeline).getByText(now.toLocaleString('en-US', { month: 'short' }))).toBeInTheDocument()
+  })
+
   it('renders efficiency, cost-per-outcome, and the weekday-spike risk signal', async () => {
     const now = new Date()
     const payload = makePayload(now)

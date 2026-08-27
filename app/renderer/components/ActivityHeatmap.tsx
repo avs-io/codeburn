@@ -79,6 +79,23 @@ function buildHeatmapDays(daily: DailyHistoryEntry[], now: Date): HeatmapDay[] {
 
 export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEntry[]; bare?: boolean }) {
   const days = useMemo(() => buildHeatmapDays(daily, new Date()), [daily])
+  const monthMarkers = useMemo(() => {
+    const markers: Array<{ key: string; label: string; week: number }> = []
+    const seen = new Set<string>()
+    for (let index = 0; index < days.length; index++) {
+      const date = dateFromKey(days[index]!.date)
+      if (index !== 0 && date.getDate() !== 1) continue
+      const key = `${date.getFullYear()}-${date.getMonth()}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      markers.push({
+        key,
+        label: date.toLocaleString('en-US', { month: 'short' }),
+        week: Math.floor(index / 7),
+      })
+    }
+    return markers
+  }, [days])
   const activeDays = days.filter(day => !day.isFuture && day.cost > 0).length
   const [tip, setTip] = useState<{ day: HeatmapDay; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
@@ -118,29 +135,43 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
     </div>
   )
   const grid = (
-    <div className="ov-heatmap-scroll" ref={scrollRef}>
-      <div className="ov-heatmap" role="grid" aria-label="Daily activity contribution heatmap">
-        <div className="ov-heatmap-labels" aria-hidden="true">
-          {WEEKDAYS.map((weekday, index) => (
-            <span key={weekday}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
-          ))}
-        </div>
-        <div className="ov-heatmap-cells">
-          {days.map(day => (
-            <button
-              type="button"
-              role="gridcell"
-              key={day.date}
-              className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
-              aria-label={`${formatDate(day.date)}: ${day.noData ? 'no data recorded' : day.isFuture ? 'future day' : `${formatUsd(day.cost)}, ${day.calls} calls`}`}
-              data-date={day.date}
-              data-cost={day.cost}
-              data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
-              onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseLeave={() => setTip(null)}
-            />
-          ))}
+    <div className="ov-heatmap-frame">
+      <div className="ov-heatmap-corner" aria-hidden="true" />
+      <div className="ov-heatmap-labels" aria-label="Weekday labels">
+        {WEEKDAYS.map((weekday, index) => (
+          <span key={weekday}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
+        ))}
+      </div>
+      <div
+        className="ov-heatmap-scroll"
+        ref={scrollRef}
+        role="region"
+        aria-label="Scrollable daily activity timeline"
+        tabIndex={0}
+      >
+        <div className="ov-heatmap-track">
+          <div className="ov-heatmap-months" aria-label="Month labels">
+            {monthMarkers.map(marker => (
+              <span key={marker.key} style={{ gridColumnStart: marker.week + 1 }}>{marker.label}</span>
+            ))}
+          </div>
+          <div className="ov-heatmap-cells" role="grid" aria-label="Daily activity contribution heatmap">
+            {days.map(day => (
+              <button
+                type="button"
+                role="gridcell"
+                key={day.date}
+                className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
+                aria-label={`${formatDate(day.date)}: ${day.noData ? 'no data recorded' : day.isFuture ? 'future day' : `${formatUsd(day.cost)}, ${day.calls} calls`}`}
+                data-date={day.date}
+                data-cost={day.cost}
+                data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
+                onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseLeave={() => setTip(null)}
+              />
+            ))}
+          </div>
         </div>
       </div>
     </div>

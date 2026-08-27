@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { createElement, type ReactNode } from 'react'
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
+import { render, renderHook, act } from '@testing-library/react'
 
 import { RefreshCadenceContext, type RefreshCadence } from '../lib/refreshCadence'
 import { clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './usePolled'
@@ -229,6 +229,24 @@ describe('usePolled', () => {
     // showing data — the clear-on-miss must never blank a plain refresh.
     act(() => { result.current.refresh() })
     expect(result.current.data).toBe('B0')
+  })
+
+  it('never exposes a prior keyed payload even for the render before switch effects run', async () => {
+    const resolvers: Array<(v: string) => void> = []
+    const fetcher = vi.fn(() => new Promise<string>(resolve => { resolvers.push(resolve) }))
+    const observed: Array<{ key: string; data: string | null }> = []
+    function Probe({ memoKey }: { memoKey: string }) {
+      const polled = usePolled(fetcher, [memoKey], { memoKey, intervalMs: null })
+      observed.push({ key: memoKey, data: polled.data })
+      return null
+    }
+
+    const view = render(createElement(Probe, { memoKey: 'frame-A' }))
+    await act(async () => { resolvers[0]!('A0') })
+    observed.length = 0
+
+    view.rerender(createElement(Probe, { memoKey: 'frame-B' }))
+    expect(observed[0]).toEqual({ key: 'frame-B', data: null })
   })
 
   it('manual cadence (null interval) polls only on mount + refresh, never on a timer', async () => {
