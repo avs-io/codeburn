@@ -357,10 +357,10 @@ function AppMain() {
 
   // Prefetch for millisecond switches: once the first overview has resolved,
   // quietly warm the other standard time horizons for the active provider in
-  // product priority order (Today -> 7D -> 30D -> Month -> 6M -> Life). Only
-  // after those likely next clicks are ready do we spend idle work on every
-  // OTHER detected provider at the current period. This is one sequential queue,
-  // never a provider x period matrix. The CLI's own read-cache + in-flight
+  // product priority order (Today -> 7D -> 30D -> Month -> 6M -> Life). Provider
+  // variants stay on-demand: until they can reuse one hydrated summary, each is
+  // another expensive full parse and an unacceptable idle CPU/memory tax. The
+  // CLI's own read-cache + in-flight
   // coalescing keep it from double-spawning against a live user fetch;
   // hasPolledMemo skips any result already warm (including one warmed by a real
   // visit).
@@ -377,17 +377,13 @@ function AppMain() {
   overviewBusyRef.current = overview.loading
   const warmedKeys = useRef<Set<string>>(new Set())
   useEffect(() => {
-    // Combined scope has no provider picker to warm — it always shows unfiltered
-    // all-device usage — so the per-provider prefetch is local-scope only.
+    // Keep this first slice local-only; combined scope has its own remote-data
+    // lifecycle and must not inherit local-corpus assumptions by accident.
     if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
     const periodTargets = STANDARD_PERIODS
       .filter(targetPeriod => targetPeriod !== period)
       .map(targetPeriod => ({ period: targetPeriod, provider }))
-    const providerTargets = detectedProviders
-      .map(entry => entry.id)
-      .filter(id => id !== provider)
-      .map(targetProvider => ({ period, provider: targetProvider }))
-    const targets = [...periodTargets, ...providerTargets]
+    const targets = periodTargets
     if (targets.length === 0) return
     let cancelled = false
     const warm = async () => {
@@ -418,7 +414,7 @@ function AppMain() {
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, customRange, claudeConfigSource, scope, detectedProviders, overview.data == null])
+  }, [ready, period, provider, customRange, claudeConfigSource, scope, overview.data == null])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)

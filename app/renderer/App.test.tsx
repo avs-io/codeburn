@@ -615,7 +615,7 @@ describe('win32 shortcut chords', () => {
   })
 })
 
-describe('provider prefetch storm', () => {
+describe('overview idle warming', () => {
   const PROVIDERS = [
     'claude', 'codex', 'gemini', 'grok', 'copilot', 'droid',
     'hermes', 'zcode', 'cursor', 'kiro', 'codewhale', 'openrouter',
@@ -653,18 +653,13 @@ describe('provider prefetch storm', () => {
     __resetPolledMemo()
   })
 
-  // With MEMO_MAX too small (< providers + base keys) the base overview key
-  // LRU-evicts between polls, blanking the overview and re-arming the prefetch
-  // every 30s cycle: 12 redundant full-history parses forever. This asserts the
-  // fix — each provider is prefetched EXACTLY ONCE total across three cycles.
-  it('warms the other time horizons in user-priority order before provider variants', async () => {
+  it('warms only the other time horizons in user-priority order', async () => {
     vi.useFakeTimers()
     try {
       render(<App />)
       // Boot is pinned to 30D in beforeEach. Once it resolves, the idle queue
-      // should warm the remaining horizons in product priority order. Only
-      // after those summaries are ready may it spend idle work on per-provider
-      // variants of the already-active period.
+      // should warm the remaining horizons in product priority order without
+      // launching expensive per-provider parses in the background.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
       await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
 
@@ -677,23 +672,21 @@ describe('provider prefetch storm', () => {
         ['lifetime', 'all'],
       ])
 
-      const providerVariant = backgroundSpawns.findIndex(call => call[1] !== 'all')
-      expect(providerVariant).toBeGreaterThanOrEqual(5)
-      expect(backgroundSpawns.filter(call => call[0] !== '30days' && call[1] !== 'all')).toHaveLength(0)
+      expect(backgroundSpawns.filter(call => call[1] !== 'all')).toHaveLength(0)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('prefetches each detected provider exactly once across 3 poll cycles', async () => {
+  it('never prefetches provider variants across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the prefetch start delay and staggered
-      // per-provider warms (12 × 400ms). A re-arming storm would re-spawn some
-      // providers on cycles 2 and 3; the once-per-key guard must prevent it.
+      // Three full 30s poll cycles plus the period-warming queue. Provider
+      // variants are deliberately on-demand until they can reuse one hydrated
+      // summary instead of launching a full parse per provider.
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
 
       for (const id of PROVIDERS) {
@@ -701,20 +694,14 @@ describe('provider prefetch storm', () => {
           // Prefetch warms carry the background-priority flag (5th arg).
           c => c[0] === '30days' && c[1] === id && c[2] === undefined && c[3] === undefined && c[4] === true,
         )
-        expect(spawns.length, `prefetch spawns for ${id}`).toBe(1)
+        expect(spawns.length, `prefetch spawns for ${id}`).toBe(0)
       }
 
       // Sanity: the active 'all' view was polled every cycle (not prefetch-gated).
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')
       expect(allPolls.length).toBeGreaterThanOrEqual(3)
 
-      // The memo must be sized to hold every warmed provider so none LRU-evict
-      // between polls — the eviction that (in the real app) blanked the base
-      // overview key and re-armed the prefetch. Under the old fixed cap of 8,
-      // 7 of these 12 keys would have been evicted by soak's end.
-      for (const id of PROVIDERS) {
-        expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null)), `warm key ${id}`).toBe(true)
-      }
+      for (const id of PROVIDERS) expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null))).toBe(false)
     } finally {
       vi.useRealTimers()
     }
