@@ -657,6 +657,34 @@ describe('provider prefetch storm', () => {
   // LRU-evicts between polls, blanking the overview and re-arming the prefetch
   // every 30s cycle: 12 redundant full-history parses forever. This asserts the
   // fix — each provider is prefetched EXACTLY ONCE total across three cycles.
+  it('warms the other time horizons in user-priority order before provider variants', async () => {
+    vi.useFakeTimers()
+    try {
+      render(<App />)
+      // Boot is pinned to 30D in beforeEach. Once it resolves, the idle queue
+      // should warm the remaining horizons in product priority order. Only
+      // after those summaries are ready may it spend idle work on per-provider
+      // variants of the already-active period.
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+
+      const backgroundSpawns = mocks.getOverview.mock.calls.filter(call => call[4] === true)
+      expect(backgroundSpawns.slice(0, 5).map(call => [call[0], call[1]])).toEqual([
+        ['today', 'all'],
+        ['week', 'all'],
+        ['month', 'all'],
+        ['all', 'all'],
+        ['lifetime', 'all'],
+      ])
+
+      const providerVariant = backgroundSpawns.findIndex(call => call[1] !== 'all')
+      expect(providerVariant).toBeGreaterThanOrEqual(5)
+      expect(backgroundSpawns.filter(call => call[0] !== '30days' && call[1] !== 'all')).toHaveLength(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('prefetches each detected provider exactly once across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {

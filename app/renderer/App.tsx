@@ -356,20 +356,21 @@ function AppMain() {
   }, [overview.data?.currency?.code, overview.data?.currency?.rate, overview.data?.currency?.symbol, overview.switching])
 
   // Prefetch for millisecond switches: once the first overview has resolved,
-  // quietly warm the instant-switch memo for every OTHER detected provider at the
-  // current period, so a picker switch to one paints from memory instead of
-  // waiting on a fresh 2-3s CLI spawn. One provider at a time, lowest priority,
-  // and only for the plain view (no custom range / no config scope) the picker
-  // actually toggles between. The CLI's own read-cache + in-flight coalescing keep
-  // this from double-spawning against a live user fetch; hasPolledMemo skips any
-  // provider already warm (including one warmed by a real visit).
+  // quietly warm the other standard time horizons for the active provider in
+  // product priority order (Today -> 7D -> 30D -> Month -> 6M -> Life). Only
+  // after those likely next clicks are ready do we spend idle work on every
+  // OTHER detected provider at the current period. This is one sequential queue,
+  // never a provider x period matrix. The CLI's own read-cache + in-flight
+  // coalescing keep it from double-spawning against a live user fetch;
+  // hasPolledMemo skips any result already warm (including one warmed by a real
+  // visit).
   //
   // `warmedKeys` is a session-lifetime once-per-key guard: each (provider,period)
   // memo key is marked BEFORE its spawn, so an effect re-run — e.g. an overview
-  // poll that momentarily blanked `overview.data` — can never re-spawn a provider
-  // already warmed. New keys (a new provider id, or a period switch) still warm
-  // exactly once. Without this the prefetch re-fired every poll: 12 redundant
-  // full-history CLI parses every 30s, forever.
+  // poll that momentarily blanked `overview.data` — can never re-spawn work already
+  // warmed. New keys (a new provider id, or a period switch) still warm exactly
+  // once. Without this the prefetch re-fired every poll: redundant full-history
+  // CLI parses every 30s, forever.
   // Mirror the visible overview's fetch state into a ref so the prefetch can hold
   // for a user-triggered fetch without re-arming the whole loop on each toggle.
   const overviewBusyRef = useRef(false)
@@ -379,16 +380,24 @@ function AppMain() {
     // Combined scope has no provider picker to warm — it always shows unfiltered
     // all-device usage — so the per-provider prefetch is local-scope only.
     if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
-    const targets = detectedProviders.map(entry => entry.id).filter(id => id !== provider)
+    const periodTargets = STANDARD_PERIODS
+      .filter(targetPeriod => targetPeriod !== period)
+      .map(targetPeriod => ({ period: targetPeriod, provider }))
+    const providerTargets = detectedProviders
+      .map(entry => entry.id)
+      .filter(id => id !== provider)
+      .map(targetProvider => ({ period, provider: targetProvider }))
+    const targets = [...periodTargets, ...providerTargets]
     if (targets.length === 0) return
     let cancelled = false
     const warm = async () => {
       for (let i = 0; i < targets.length && !cancelled; ) {
-        const key = overviewMemoKey(targets[i]!, period, null, null)
+        const target = targets[i]!
+        const key = overviewMemoKey(target.provider, target.period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) { i++; continue }
         // Only warm while the visible overview is idle: a user fetch in flight
         // takes priority (background-classed CLI spawns yield their slot to it),
-        // so hold and retry this provider after the stagger rather than race it.
+        // so hold and retry this target after the stagger rather than race it.
         if (overviewBusyRef.current) {
           await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
           continue
@@ -397,7 +406,7 @@ function AppMain() {
         try {
           // background priority (5th arg) so this never delays an interactive
           // poll; ignored by an older preload, degrading to current behavior.
-          const value = await codeburn.getOverview(period, targets[i]!, undefined, undefined, true)
+          const value = await codeburn.getOverview(target.period, target.provider, undefined, undefined, true)
           if (!cancelled) primePolledMemo(key, value)
         } catch { /* best-effort warm; a real switch will fetch and surface any error */ }
         i++
