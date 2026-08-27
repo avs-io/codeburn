@@ -238,6 +238,27 @@ describe('App shortcuts', () => {
     await waitFor(() => expect(mocks.getActReport).toHaveBeenCalled())
   })
 
+  it('does not fan out secondary analysis after the bounded overview timeout', async () => {
+    // A real installed heavy-corpus run reached the 600s no-output boundary.
+    // Marking that timeout as generally ready mounted Overview's act/yield polls;
+    // a user Refresh then ran another status parse beside yield, multiplying the
+    // retry's memory pressure instead of helping it recover.
+    mocks.getOverview
+      .mockRejectedValueOnce({ kind: 'timeout', message: 'no output for 600000ms' })
+      .mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByText("Couldn't read data")).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledTimes(2))
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
+  })
+
   it('applies the persisted theme on app boot before Settings mounts', async () => {
     localStorage.setItem('codeburn.theme', 'dark')
     render(<App />)

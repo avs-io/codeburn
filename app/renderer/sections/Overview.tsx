@@ -692,8 +692,19 @@ export function OverviewContent({
   // Gate secondary spawns on the app-level readiness (first overview resolved),
   // so the cold hydration runs once (via overview) rather than 3 parses at once
   // on boot. Defaults true so standalone renders/tests poll normally.
-  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: ready, memoKey: 'overview-act' })
-  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: ready, memoKey: `overview-yield|${period}|${provider}` })
+  // A bounded Overview timeout is not permission to fan out more expensive
+  // analysis. On a real heavy corpus the timeout released act/yield, and a user
+  // Refresh then ran another status parse beside yield. Latch that timeout until
+  // real Overview data arrives: refresh() clears the current error while its new
+  // request is pending, which must not accidentally re-open the secondary gate.
+  const [timeoutBlocked, setTimeoutBlocked] = useState(false)
+  useEffect(() => {
+    if (overview.error?.kind === 'timeout') setTimeoutBlocked(true)
+    else if (overview.data != null) setTimeoutBlocked(false)
+  }, [overview.data, overview.error?.kind])
+  const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
+  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
+  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: `overview-yield|${period}|${provider}` })
   const { data, error } = overview
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
