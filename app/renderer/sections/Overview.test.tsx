@@ -277,6 +277,46 @@ describe('Overview', () => {
     expect(screen.queryByText('Nearest limit')).not.toBeInTheDocument()
   })
 
+  it('keeps six-month and lifetime chart dates legible by capping and spreading axis ticks', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.current.label = 'Lifetime'
+    payload.history.daily = consecutiveDays(now, 365, index => index + 1)
+    getOverview.mockResolvedValue(payload)
+
+    const { container } = render(<Overview period="lifetime" provider="all" />)
+
+    expect(await screen.findByText('Lifetime')).toBeInTheDocument()
+    const ticks = [...container.querySelectorAll('.ov-xax span')]
+    expect(ticks).toHaveLength(6)
+    expect(ticks[0]).toHaveTextContent(new Date(
+      now.getFullYear(), now.getMonth(), now.getDate() - 364,
+    ).toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+    expect(ticks.at(-1)).toHaveTextContent(now.toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+  })
+
+  it('opens the activity heatmap at the newest dates without pinning later manual scrolling', async () => {
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(520)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(320)
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
   it('renders efficiency, cost-per-outcome, and the weekday-spike risk signal', async () => {
     const now = new Date()
     const payload = makePayload(now)

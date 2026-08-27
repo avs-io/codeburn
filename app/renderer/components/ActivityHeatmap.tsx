@@ -82,7 +82,16 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
   const activeDays = days.filter(day => !day.isFuture && day.cost > 0).length
   const [tip, setTip] = useState<{ day: HeatmapDay; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
+
+  // The fixed 26-week grid is wider than the compact hero slot. Start at the
+  // newest weeks, then leave the user's scroll position alone.
+  useLayoutEffect(() => {
+    const scroller = scrollRef.current
+    if (!scroller) return
+    scroller.scrollLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+  }, [])
 
   useLayoutEffect(() => {
     if (!tip) {
@@ -109,7 +118,7 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
     </div>
   )
   const grid = (
-    <div className="ov-heatmap-scroll">
+    <div className="ov-heatmap-scroll" ref={scrollRef}>
       <div className="ov-heatmap" role="grid" aria-label="Daily activity contribution heatmap">
         <div className="ov-heatmap-labels" aria-hidden="true">
           {WEEKDAYS.map((weekday, index) => (

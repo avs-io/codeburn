@@ -535,7 +535,12 @@ function DailyChart({ daily, dataStart = null, animateKey = '' }: { daily: Daily
   const peak = daily[peakIndex]
   const yesterday = daily.at(-2)
   const average = mean(daily.map(day => day.cost))
-  const ticks = daily.filter((_, index) => index % 7 === 0)
+  // Weekly labels work for 30 days, but become unreadable at 6M/Life (26-53
+  // labels). Long ranges use five even intervals plus the newest day.
+  const tickStride = daily.length <= 45 ? 7 : Math.ceil((daily.length - 1) / 5)
+  const tickIndexes = daily.map((_, index) => index).filter(index => index % tickStride === 0)
+  if (daily.length > 45 && tickIndexes.at(-1) !== daily.length - 1) tickIndexes.push(daily.length - 1)
+  const ticks = tickIndexes.map(index => daily[index])
   const [tip, setTip] = useState<{ day: DailyHistoryEntry; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
   const tipRef = useRef<HTMLDivElement>(null)
