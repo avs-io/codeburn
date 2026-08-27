@@ -428,7 +428,7 @@ function streakDays(daily: DailyHistoryEntry[], now: Date): number {
  * changes (a user action), but never on the 30s poll: a value that arrives
  * under the same `animateKey` snaps in place instead of re-animating.
  */
-function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
+function CountUp({ value, animateKey, animate = true }: { value: number; animateKey: string; animate?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const keyRef = useRef<string | null>(null)
 
@@ -437,7 +437,7 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
     if (!element) return
     const keyChanged = keyRef.current !== animateKey
     keyRef.current = animateKey
-    if (!keyChanged || !motionEnabled()) {
+    if (!animate || !keyChanged || !motionEnabled()) {
       element.textContent = formatUsd(value)
       return
     }
@@ -449,7 +449,7 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
       onUpdate: () => { element.textContent = formatUsd(counter.n) },
     })
     return () => { tween.kill() }
-  }, [value, animateKey])
+  }, [value, animateKey, animate])
 
   return <div ref={ref} className="ov-hero-num" data-countup={value}>{formatUsd(value)}</div>
 }
@@ -778,7 +778,10 @@ export function OverviewContent({
       <div className="ov-card ov-hero-split" aria-label="Key performance indicators">
         <div className="ov-hero-main">
           <div className="ov-hero-top"><span className="ov-label">{combined ? `Combined · ${data.current.label}` : data.current.label}</span><span className="ov-streak"><b>{streakDays(data.history.daily, now)}</b>-day streak</span></div>
-          <CountUp value={heroCost} animateKey={animateKey} />
+          {/* A returning launch already showed a truthful persisted headline.
+              Replaying the live hero from $0 on handoff makes that exact value
+              appear to collapse and recover; snap to the revalidated total. */}
+          <CountUp value={heroCost} animateKey={animateKey} animate={headlineSnapshot == null} />
           <div className="ov-hero-sub">{heroCalls.toLocaleString('en-US')} calls · {heroSessions.toLocaleString('en-US')} sessions</div>
           {combined
             ? <CombinedDevices usage={combined} />
