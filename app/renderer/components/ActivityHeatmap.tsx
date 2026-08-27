@@ -107,7 +107,36 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
   useLayoutEffect(() => {
     const scroller = scrollRef.current
     if (!scroller) return
-    scroller.scrollLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+
+    let aligned = false
+    const alignNewest = (): boolean => {
+      if (aligned) return true
+      const newestOffset = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+      if (newestOffset === 0) return false
+      scroller.scrollLeft = newestOffset
+      aligned = true
+      return true
+    }
+
+    if (alignNewest()) return
+
+    // Electron can mount this card while its parent still has the wider
+    // skeleton measurement, then compact it before first paint. Wait for that
+    // final width instead of leaving the timeline at its oldest dates.
+    const observer = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(() => {
+          if (alignNewest()) observer?.disconnect()
+        })
+    observer?.observe(scroller)
+    const frame = window.requestAnimationFrame(() => {
+      if (alignNewest()) observer?.disconnect()
+    })
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      observer?.disconnect()
+    }
   }, [])
 
   useLayoutEffect(() => {

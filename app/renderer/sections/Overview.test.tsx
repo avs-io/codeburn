@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Polled } from '../hooks/usePolled'
@@ -312,6 +312,51 @@ describe('Overview', () => {
       fireEvent.scroll(scroller)
       expect(scroller.scrollLeft).toBe(24)
     } finally {
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('waits for the compact heatmap slot to reach its final width before aligning newest dates', async () => {
+    let measuredScrollWidth = 320
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    const disconnect = vi.fn()
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback
+      }
+      observe = vi.fn()
+      disconnect = disconnect
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(0)
+
+      measuredScrollWidth = 520
+      measuredClientWidth = 320
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(200)
+      expect(disconnect).toHaveBeenCalledOnce()
+
+      scroller.scrollLeft = 24
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
       scrollWidth.mockRestore()
       clientWidth.mockRestore()
     }
