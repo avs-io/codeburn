@@ -710,7 +710,7 @@ export function OverviewContent({
           <div className="ov-card ov-hero-split snapshot-hero">
             <div className="ov-hero-main">
               <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact at {capturedLabel}</span></div>
-              <CountUp value={headlineSnapshot.cost} animateKey={`snapshot|${period}|${provider}`} />
+              <div className="ov-hero-num" data-countup={headlineSnapshot.cost}>{formatUsd(headlineSnapshot.cost)}</div>
               <div className="ov-hero-sub">{headlineSnapshot.calls.toLocaleString('en-US')} calls · sessions updating</div>
               <p className="ov-widget-caption">Current totals, charts, sessions, and efficiency are refreshing in the background.</p>
             </div>

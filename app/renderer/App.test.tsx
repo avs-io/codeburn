@@ -225,6 +225,7 @@ describe('App shortcuts', () => {
     render(<App />)
 
     expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+    expect(screen.getAllByText('$12.34').length).toBeGreaterThan(0)
     expect(screen.getByText(/sessions updating/)).toBeInTheDocument()
     expect(screen.getByText('Updating detailed drill-downs…')).toBeInTheDocument()
     expect(screen.getByText('Refreshing selected view…')).toBeInTheDocument()
