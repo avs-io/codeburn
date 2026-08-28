@@ -2,7 +2,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { App, overviewMemoKey, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
+import { App, overviewMemoKey, refreshedLabel, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
 import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
@@ -303,6 +303,11 @@ describe('App shortcuts', () => {
       .toEqual(['comparemodels|week|claude|-||'])
     expect(selectedReportMemoKeys('plans', 'week', 'claude', null, 'overview-key', new Set(['kimi', 'codex'])))
       .toEqual(['quota|codex,kimi', 'plans|week|all|-||'])
+  })
+
+  it('uses readable hour and day units for restored report freshness', () => {
+    expect(refreshedLabel(0, false, 2 * 60 * 60 * 1000)).toBe('refreshed 2h ago')
+    expect(refreshedLabel(0, false, 3 * 24 * 60 * 60 * 1000)).toBe('refreshed 3d ago')
   })
 
   it('releases the sections when the overview fails for a real reason', async () => {

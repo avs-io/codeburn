@@ -203,6 +203,17 @@ describe('usePolled', () => {
     expect(hasPolledMemo('key-96')).toBe(true)
   })
 
+  it('bounds the instant-switch memo by serialized weight, not only entry count', () => {
+    primePolledMemo('large', { text: 'x'.repeat(12_000_001) })
+    expect(hasPolledMemo('large')).toBe(true)
+
+    // The newest entry wins; adding it evicts the older oversized graph rather
+    // than retaining both merely because the count is below 96.
+    primePolledMemo('newest', { total: 42 })
+    expect(hasPolledMemo('large')).toBe(false)
+    expect(hasPolledMemo('newest')).toBe(true)
+  })
+
   it('restores the last successful keyed payload after a renderer restart, then refreshes behind it', async () => {
     const firstFetcher = vi.fn().mockResolvedValue({ total: 42 })
     const first = renderHook(() => usePolled(firstFetcher, [], { memoKey: 'sessions|today|all', intervalMs: null }))
@@ -248,6 +259,42 @@ describe('usePolled', () => {
       { memoKey: 'sessions|lifetime|all', intervalMs: null },
     ))
     expect(second.result.current.data).toEqual(repeated)
+  })
+
+  it('does not recompress or rewrite an unchanged durable report', () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    primePolledMemo('unchanged|week|all', { total: 42, rows: [1, 2, 3] })
+    expect(setItem).toHaveBeenCalledTimes(1)
+
+    primePolledMemo('unchanged|week|all', { total: 42, rows: [1, 2, 3] })
+    expect(setItem).toHaveBeenCalledTimes(1)
+    setItem.mockRestore()
+  })
+
+  it('keeps oversized, stale, and partial reports out of restart persistence', () => {
+    primePolledMemo('oversized', { text: 'x'.repeat(300_001) })
+    primePolledMemo('stale', { stale: true, total: 42 })
+    primePolledMemo('partial', { hydration: { complete: false }, total: 42 })
+
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.oversized')).toBeNull()
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.stale')).toBeNull()
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.partial')).toBeNull()
+    __resetPolledMemo()
+    expect(hasPolledMemo('oversized')).toBe(false)
+    expect(hasPolledMemo('stale')).toBe(false)
+    expect(hasPolledMemo('partial')).toBe(false)
+  })
+
+  it('discards an old-config fetch that resolves after cache invalidation', async () => {
+    let resolve!: (value: { total: number }) => void
+    const fetcher = vi.fn(() => new Promise<{ total: number }>(done => { resolve = done }))
+    const { result } = renderHook(() => usePolled(fetcher, [], { memoKey: 'old-config', intervalMs: null }))
+
+    clearPolledMemo()
+    await act(async () => { resolve({ total: 42 }) })
+
+    expect(result.current.data).toBeNull()
+    expect(hasPolledMemo('old-config')).toBe(false)
   })
 
   it('clears stale data on a switch to an unmemoized key (skeleton, never the prior filter)', async () => {

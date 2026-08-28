@@ -224,14 +224,17 @@ function providerName(provider: string): string {
     .join(' ')
 }
 
-function refreshedLabel(lastSuccessAt: number | null, loading: boolean, now: number): string {
+export function refreshedLabel(lastSuccessAt: number | null, loading: boolean, now: number): string {
   if (loading && lastSuccessAt === null) return 'refreshing…'
   if (lastSuccessAt === null) return 'not refreshed yet'
   const seconds = Math.max(0, Math.floor((now - lastSuccessAt) / 1000))
   if (seconds < 1) return 'refreshed just now'
   if (seconds < 60) return `refreshed ${seconds}s ago`
   const minutes = Math.floor(seconds / 60)
-  return `refreshed ${minutes}m ago`
+  if (minutes < 60) return `refreshed ${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `refreshed ${hours}h ago`
+  return `refreshed ${Math.floor(hours / 24)}d ago`
 }
 
 /** Provides the app-wide refresh cadence (read persisted at boot, applied live)
@@ -452,9 +455,6 @@ function AppMain() {
     if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
     let cancelled = false
     const warm = async () => {
-      const disabledProviders = readDisabledProviders()
-      const quotaKey = `quota|${[...disabledProviders].sort().join(',')}`
-
       for (const targetPeriod of STANDARD_PERIODS) {
         if (cancelled) break
 
@@ -509,12 +509,6 @@ function AppMain() {
             key: reportMemoKey('yield', targetPeriod, provider),
             load: () => codeburn.getYield(targetPeriod, provider, undefined, true),
           },
-          ...(targetPeriod === 'today' ? [{
-            // Quota discovery is shared by every Plans horizon. Keep it inside
-            // the Today slice so it cannot delay the first useful analytics.
-            key: quotaKey,
-            load: () => codeburn.getQuota(false, disabledProviders),
-          }] : []),
           {
             key: reportMemoKey('plans', targetPeriod),
             load: () => codeburn.getPlans(targetPeriod, true),

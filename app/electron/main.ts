@@ -562,11 +562,10 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // CodeBurn is a background indexer as well as a visible dashboard. Keep
-      // refresh timers alive while covered/minimized so a long-open app cannot
-      // be hours stale when the user returns. Animations remain separately
-      // visibility-gated in the renderer.
-      backgroundThrottling: false,
+      // Keep Chromium's normal background throttling so minimizing/occluding the
+      // window updates the Page Visibility API and pauses renderer animations.
+      // Data intervals remain registered and use a visibility catch-up on return.
+      backgroundThrottling: true,
     },
   })
 

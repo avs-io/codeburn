@@ -36,21 +36,33 @@ export type Polled<T> = {
 // manual refresh are unaffected.
 const POLLED_FRESH_MS = 30_000
 const MAX_MEMO_ENTRIES = 96
+const MAX_MEMO_CHARS = 12_000_000
 const SNAPSHOT_PREFIX = 'codeburn.reportSnapshot.v1.'
 const SNAPSHOT_GENERATION_KEY = 'codeburn.reportSnapshotGeneration.v1'
 const MAX_SNAPSHOT_CHARS = 2_500_000
+// Do not synchronously compress arbitrarily large reports on the renderer main
+// thread. A payload above this raw JSON ceiling is still kept in the bounded
+// memory LRU; it simply is not eligible for best-effort restart persistence.
+const MAX_SNAPSHOT_SOURCE_CHARS = 300_000
 const MAX_STORED_SNAPSHOTS = 72
-type MemoEntry = { value: unknown; at: number; durable?: boolean }
+type MemoEntry = { value: unknown; at: number; durable?: boolean; sizeChars?: number }
 const memoStore = new Map<string, MemoEntry>()
+let memoSizeChars = 0
+let memoEpoch = 0
 
 function memoPut(key: string, entry: MemoEntry): void {
   // Map iteration order is the eviction order. Both a cache hit and a write
-  // become most recent, preserving the reviewed 96-entry memory ceiling.
+  // become most recent. Bound both count and serialized weight: report graphs
+  // vary drastically in size, so a count-only LRU is not a memory ceiling.
+  memoSizeChars -= memoStore.get(key)?.sizeChars ?? 0
   memoStore.delete(key)
   memoStore.set(key, entry)
-  while (memoStore.size > MAX_MEMO_ENTRIES) {
+  memoSizeChars += entry.sizeChars ?? 0
+  while (memoStore.size > 1
+    && (memoStore.size > MAX_MEMO_ENTRIES || memoSizeChars > MAX_MEMO_CHARS)) {
     const oldest = memoStore.keys().next().value as string | undefined
     if (oldest === undefined) break
+    memoSizeChars -= memoStore.get(oldest)?.sizeChars ?? 0
     memoStore.delete(oldest)
   }
 }
@@ -63,7 +75,41 @@ function snapshotStorageKey(key: string): string {
   return `${SNAPSHOT_PREFIX}${key}`
 }
 
-function readDurableMemo<T>(key: string): { value: T; at: number; durable: true } | undefined {
+function snapshotFingerprint(json: string): string {
+  // Two independent 32-bit hashes plus length make unchanged-payload detection
+  // cheap without retaining a second multi-megabyte JSON string in memory.
+  let fnv = 0x811c9dc5
+  let djb = 0x1505
+  for (let index = 0; index < json.length; index++) {
+    const code = json.charCodeAt(index)
+    fnv = Math.imul(fnv ^ code, 0x01000193)
+    djb = Math.imul(djb, 33) ^ code
+  }
+  return `${json.length}:${(fnv >>> 0).toString(16)}:${(djb >>> 0).toString(16)}`
+}
+
+function snapshotHeader(raw: string | null): { at: number; generation?: number; fingerprint?: string } | undefined {
+  if (!raw) return undefined
+  // Current envelopes deliberately write these small fields first. Avoid
+  // JSON-parsing (and therefore allocating) every compressed report merely to
+  // compare or evict snapshot metadata.
+  const current = /^\{"at":(\d+),"generation":(\d+),"fingerprint":"([^"]+)"/.exec(raw)
+  if (current) return { at: Number(current[1]), generation: Number(current[2]), fingerprint: current[3] }
+  try {
+    const parsed = JSON.parse(raw) as { at?: number; generation?: number; fingerprint?: string }
+    return { at: Number(parsed.at) || 0, generation: parsed.generation, fingerprint: parsed.fingerprint }
+  } catch {
+    return undefined
+  }
+}
+
+function isDurableSnapshotValue(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return true
+  const report = value as { stale?: unknown; hydration?: { complete?: unknown } }
+  return report.stale !== true && report.hydration?.complete !== false
+}
+
+function readDurableMemo<T>(key: string): { value: T; at: number; durable: true; sizeChars?: number } | undefined {
   try {
     const raw = globalThis.localStorage?.getItem(snapshotStorageKey(key))
     if (!raw) return undefined
@@ -79,7 +125,7 @@ function readDurableMemo<T>(key: string): { value: T; at: number; durable: true 
     if (parsed.encoding === 'lz-utf16' && typeof parsed.data === 'string') {
       const json = decompressFromUTF16(parsed.data)
       if (!json) return undefined
-      return { value: JSON.parse(json) as T, at: parsed.at as number, durable: true }
+      return { value: JSON.parse(json) as T, at: parsed.at as number, durable: true, sizeChars: json.length }
     }
     // Backward-compatible read of the short-lived uncompressed development
     // format; the next success rewrites it compressed.
@@ -90,8 +136,8 @@ function readDurableMemo<T>(key: string): { value: T; at: number; durable: true 
   }
 }
 
-function memoGet<T>(key: string): { value: T; at: number; durable?: boolean } | undefined {
-  const memory = memoStore.get(key) as { value: T; at: number; durable?: boolean } | undefined
+function memoGet<T>(key: string): { value: T; at: number; durable?: boolean; sizeChars?: number } | undefined {
+  const memory = memoStore.get(key) as { value: T; at: number; durable?: boolean; sizeChars?: number } | undefined
   if (memory) {
     memoPut(key, memory)
     return memory
@@ -103,19 +149,34 @@ function memoGet<T>(key: string): { value: T; at: number; durable?: boolean } | 
 
 function memoSet(key: string, value: unknown): void {
   const at = Date.now()
-  const entry = { value, at }
+  let json: string | undefined
+  try { json = JSON.stringify(value) } catch { /* memory-only fallback */ }
+  const entry = { value, at, sizeChars: json?.length }
   memoPut(key, entry)
+  // Partial hydration and stale read-only reports are useful last-good data for
+  // the current renderer, but must never become the restart-time exact answer.
+  if (!isDurableSnapshotValue(value)) return
   try {
     const storage = globalThis.localStorage
     if (!storage) return
+    if (json === undefined) return
+    if (json.length > MAX_SNAPSHOT_SOURCE_CHARS) return
+    const generation = snapshotGeneration()
+    const fingerprint = snapshotFingerprint(json)
+    const storageKey = snapshotStorageKey(key)
+    const previous = snapshotHeader(storage.getItem(storageKey))
+    // Polls commonly return byte-identical reports. Keep the existing durable
+    // body instead of re-stringifying it into an envelope and recompressing it
+    // every cadence tick; the in-memory timestamp above still records success.
+    if (previous?.generation === generation && previous.fingerprint === fingerprint) return
     const raw = JSON.stringify({
       at,
-      generation: snapshotGeneration(),
+      generation,
+      fingerprint,
       encoding: 'lz-utf16',
-      data: compressToUTF16(JSON.stringify(value)),
+      data: compressToUTF16(json),
     })
     if (raw.length > MAX_SNAPSHOT_CHARS) return
-    const storageKey = snapshotStorageKey(key)
     // localStorage quotas differ by Electron/Chromium release. On quota pressure,
     // evict the oldest report and retry; the selected/latest snapshots win.
     for (let attempt = 0; attempt < MAX_STORED_SNAPSHOTS; attempt++) {
@@ -140,9 +201,7 @@ function durableSnapshotRows(storage: Storage): Array<{ key: string; at: number 
   for (let index = 0; index < storage.length; index++) {
     const key = storage.key(index)
     if (!key?.startsWith(SNAPSHOT_PREFIX)) continue
-    let at = 0
-    try { at = Number((JSON.parse(storage.getItem(key) ?? '{}') as { at?: number }).at) || 0 } catch { /* evict corrupt rows first */ }
-    rows.push({ key, at })
+    rows.push({ key, at: snapshotHeader(storage.getItem(key))?.at ?? 0 })
   }
   return rows
 }
@@ -164,6 +223,8 @@ function removeOldestDurableSnapshot(storage: Storage, except: string): boolean 
  *  one test never bleed into the next. */
 export function __resetPolledMemo(): void {
   memoStore.clear()
+  memoSizeChars = 0
+  memoEpoch++
 }
 
 /** Empty the instant-switch memo. Called when a Settings action mutates config
@@ -172,6 +233,8 @@ export function __resetPolledMemo(): void {
  *  config, which is what stuck the display on the previous currency. */
 export function clearPolledMemo(): void {
   memoStore.clear()
+  memoSizeChars = 0
+  memoEpoch++
   try {
     const storage = globalThis.localStorage
     if (!storage) return
@@ -257,6 +320,7 @@ export function usePolled<T>(
   const load = useCallback(() => {
     if (!enabled) return
     const epoch = ++epochRef.current
+    const loadMemoEpoch = memoEpoch
     // A switch (new memoKey) may serve a still-fresh cached payload without
     // fetching; a reload on the same key never may.
     const keyChanged = memoKey !== undefined && memoKey !== lastKeyRef.current
@@ -303,7 +367,7 @@ export function usePolled<T>(
     setErrorKey(null)
     fetcher()
       .then(result => {
-        if (epochRef.current !== epoch) return
+        if (epochRef.current !== epoch || memoEpoch !== loadMemoEpoch) return
         setData(result)
         setDataKey(memoKey ?? null)
         setError(null)
