@@ -1,9 +1,8 @@
 import Foundation
 
-/// Per-provider live-quota snapshot consumed by the AgentTab progress bar
-/// and the hover-detail popover. Today only Claude has a real quota source
-/// (Anthropic /api/oauth/usage); future providers (Cursor, Copilot, etc.)
-/// will plug in by producing the same struct from their own auth path.
+/// Per-provider live-quota snapshot consumed by the AgentTab progress bar and
+/// Capacity Dock. Every CodeBurn-owned provider adapter normalizes into this
+/// presentation type.
 struct QuotaSummary: Equatable {
     enum Connection: Equatable {
         case connected
@@ -23,9 +22,8 @@ struct QuotaSummary: Equatable {
     /// confirm at a glance which subscription is feeding the bar.
     let planLabel: String?
     /// Optional footer rows that the popover renders below the window list.
-    /// Used today only by Codex to surface the on-account credits balance,
-    /// but kept generic so future providers can add provider-specific facts
-    /// (e.g. "Anthropic incident in progress", "Cursor team seat").
+    /// Used for provider-specific facts such as account identity, remaining
+    /// credits, source attribution, and retry diagnostics.
     let footerLines: [String]
 
     struct Window: Equatable {
@@ -51,6 +49,44 @@ struct QuotaSummary: Equatable {
         case warning    // 70-90%
         case critical   // 90-100%
         case danger     // >=100%
+    }
+
+    /// The glance value for Capacity Dock. A provider can expose several
+    /// independent rate windows; the one nearest exhaustion is the honest
+    /// headline even when a different window is the provider's historical
+    /// `primary`. Empty data stays nil rather than masquerading as 0%.
+    var headlineWindow: Window? {
+        var candidates = details
+        if let primary, !candidates.contains(primary) {
+            candidates.append(primary)
+        }
+        return candidates.max { lhs, rhs in lhs.percent < rhs.percent }
+    }
+}
+
+/// The one user-initiated recovery action Capacity Dock may offer. Keeping the
+/// decision pure lets the dock render the same affordance whether a provider
+/// has no summary yet or has explicitly reported an expired connection.
+enum CapacityDockConnectionAction: String, Equatable, Sendable {
+    case connect = "Connect"
+    case reconnect = "Reconnect"
+
+    var title: String { rawValue }
+
+    func title(for provider: CapacityDockProvider) -> String {
+        if provider.catalogEntry.authMethods == [.apiTokenOrCloudCredentials] {
+            return "Add API Key"
+        }
+        return title
+    }
+
+    static func resolve(quota: QuotaSummary?) -> Self? {
+        guard let quota else { return .connect }
+        switch quota.connection {
+        case .disconnected: return .connect
+        case .terminalFailure: return .reconnect
+        case .connected, .loading, .stale, .transientFailure: return nil
+        }
     }
 }
 

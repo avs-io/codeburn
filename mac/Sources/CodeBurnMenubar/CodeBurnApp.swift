@@ -55,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var statusItem: NSStatusItem!
     private var statusItemPlacementRecoveryTask: Task<Void, Never>?
     private var popover: NSPopover!
+    private var capacityDockController: CapacityDockController?
     private var rightClickMonitor: Any?
     private var lastContextMenuPresentedAt: Date = .distantPast
     /// Held only while the right-click menu is open. Cleared in menuDidClose so
@@ -84,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var claudeQuotaRefreshTask: Task<Bool, Never>?
     private var codexQuotaRefreshTask: Task<Bool, Never>?
     private var refreshLoopHeartbeatAt: Date = .distantPast
+    private var providerSettingsObserver: NSObjectProtocol?
 
     func applicationWillTerminate(_ notification: Notification) {
         // Synchronously, before the actor hop: the app can exit before a
@@ -92,6 +94,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         ServeChildRegistry.shared.reapAll()
         Task { await ServeConnection.shared.shutdown() }
         stopStatusItemPlacementRecovery()
+        capacityDockController?.stop()
+        capacityDockController = nil
+        if let providerSettingsObserver {
+            NotificationCenter.default.removeObserver(providerSettingsObserver)
+            self.providerSettingsObserver = nil
+        }
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)
             rightClickMonitor = nil
@@ -147,6 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         NSApp.activate(ignoringOtherApps: true)
         setupStatusItem()
         setupPopover()
+        capacityDockController = CapacityDockController(store: store)
+        capacityDockController?.start()
         observeStore()
         startRefreshLoop()
         startNapBackstop()
@@ -154,7 +164,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         removeLegacyRefreshAgent()
         registerLoginItemIfNeeded()
         observeSubscriptionDisconnect()
+        observeCapacityDockProviderSettingsRequests()
         Task { await updateChecker.checkIfNeeded() }
+    }
+
+    private func observeCapacityDockProviderSettingsRequests() {
+        providerSettingsObserver = NotificationCenter.default.addObserver(
+            forName: .capacityDockOpenProviderSettings,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let providerID = notification.object as? String else { return }
+            Task { @MainActor [weak self] in
+                self?.store.settingsTab = providerID
+                self?.openSettings()
+            }
+        }
     }
 
     private func setupWakeObservers() {
@@ -540,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastGeminiRefreshAt: Date?
     fileprivate var lastCopilotRefreshAt: Date?
     fileprivate var lastAntigravityRefreshAt: Date?
+    fileprivate var lastCapacityDockProviderRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -547,11 +573,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private func refreshLiveQuotaProgressIfDue(
         force: Bool = false,
         forceClaude: Bool = false,
-        forceCodex: Bool = false
+        forceCodex: Bool = false,
+        forceCapacityDockProviders: Bool = false
     ) async -> Bool {
         let cadence = SubscriptionRefreshCadence.current
         let autoRefreshAllowed = cadence != .manual
-        if !force && !forceClaude && !forceCodex && !autoRefreshAllowed { return false }
+        if !force && !forceClaude && !forceCodex && !forceCapacityDockProviders
+            && !autoRefreshAllowed { return false }
 
         let now = Date()
         let threshold = TimeInterval(cadence.rawValue)
@@ -563,7 +591,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         let shouldRefreshCodex = force || forceCodex || (
             autoRefreshAllowed && now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast) >= threshold
         )
-        guard shouldRefreshClaude || shouldRefreshCodex else { return false }
+        let shouldRefreshCapacityDockProviders = force || forceCapacityDockProviders || (
+            autoRefreshAllowed
+                && now.timeIntervalSince(lastCapacityDockProviderRefreshAt ?? .distantPast) >= threshold
+        )
+        guard shouldRefreshClaude || shouldRefreshCodex || shouldRefreshCapacityDockProviders else {
+            return false
+        }
 
         if shouldRefreshClaude {
             // The cadence anchor represents the start of an attempt, even if
@@ -592,6 +626,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             }
         case (false, false):
             break
+        }
+        if shouldRefreshCapacityDockProviders {
+            // Generic adapters have their own attempt anchor. They must not be
+            // polled on every payload tick merely because Codex is disconnected
+            // or a Codex refresh failed.
+            lastCapacityDockProviderRefreshAt = now
+            await store.refreshSelectedCapacityDockProviders()
         }
         return true
     }
@@ -694,15 +735,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         let now = Date()
         let claudeElapsed = now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast)
         let codexElapsed = now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast)
+        let capacityDockElapsed = now.timeIntervalSince(lastCapacityDockProviderRefreshAt ?? .distantPast)
         let refreshClaude = claudeElapsed >= interactiveQuotaRefreshFloorSeconds
         let refreshCodex = codexElapsed >= interactiveQuotaRefreshFloorSeconds
-        guard refreshClaude || refreshCodex else { return }
+        let refreshCapacityDockProviders = capacityDockElapsed >= interactiveQuotaRefreshFloorSeconds
+        guard refreshClaude || refreshCodex || refreshCapacityDockProviders else { return }
 
         Task { [weak self] in
             guard let self else { return }
             _ = await self.refreshLiveQuotaProgressIfDue(
                 forceClaude: refreshClaude,
-                forceCodex: refreshCodex
+                forceCodex: refreshCodex,
+                forceCapacityDockProviders: refreshCapacityDockProviders
             )
         }
     }
@@ -902,6 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         lastGeminiRefreshAt = nil
         lastCopilotRefreshAt = nil
         lastAntigravityRefreshAt = nil
+        lastCapacityDockProviderRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -938,18 +983,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             _ = self.store.subscriptionLoadState
             _ = self.store.codexUsage
             _ = self.store.codexLoadState
+            _ = self.store.kimiUsage
+            _ = self.store.kimiLoadState
             _ = self.store.geminiUsage
             _ = self.store.geminiLoadState
             _ = self.store.copilotUsage
             _ = self.store.copilotLoadState
             _ = self.store.antigravityUsage
             _ = self.store.antigravityLoadState
+            _ = self.store.capacityDockProviderSummaries
+            _ = self.store.capacityDockProviderErrors
+            _ = self.store.capacityDockProvidersLoading
+            _ = self.store.capacityDockProviderTransientFailures
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.pendingRefreshWork?.cancel()
                 let work = DispatchWorkItem { [weak self] in
                     self?.refreshStatusButton()
+                    self?.capacityDockController?.refreshQuotaPresentation()
                     self?.observeStore()
                 }
                 self.pendingRefreshWork = work
