@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Polled } from '../hooks/usePolled'
 import { setActiveCurrency } from '../lib/format'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 import type { ActReportJson, DailyHistoryEntry, MenubarPayload, YieldJsonReport } from '../lib/types'
 import { Overview, OverviewContent, deriveSignals, localDateKey } from './Overview'
 
@@ -843,6 +844,40 @@ describe('Overview', () => {
     const outcome = (await screen.findByText('Cost per outcome')).closest('.ov-panel') as HTMLElement
     expect(within(outcome).getByText('€22.50')).toBeInTheDocument()
     expect(within(outcome).getByText('€36.00')).toBeInTheDocument()
+  })
+
+  it('formats a persisted headline in its own currency on first paint and dates older snapshots', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 7, 28, 10, 0, 0))
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    const captured = new Date(2026, 7, 26, 14, 30, 0)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: captured.getTime(),
+      generated: captured.toISOString(),
+      label: 'Last 30 days',
+      cost: 100,
+      calls: 12,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'EUR', symbol: '€', rate: 0.9 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+
+    render(<OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />)
+
+    expect(screen.getByText('€90.00')).toBeInTheDocument()
+    expect(screen.getByText('exact Aug 26 at 2:30 PM')).toBeInTheDocument()
   })
 })
 

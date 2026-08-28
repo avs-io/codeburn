@@ -204,6 +204,7 @@ describe('App shortcuts', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('keeps sections gated (and the splash up) while a cold hydration times out', async () => {
@@ -640,6 +641,7 @@ describe('win32 shortcut chords', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('navigates with Ctrl+2 and refreshes with Ctrl+R', async () => {
@@ -869,6 +871,7 @@ describe('currency correctness', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('never regresses the applied currency to a memo-served (stale) payload during a switch', async () => {
@@ -919,6 +922,54 @@ describe('currency correctness', () => {
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(false)
     expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
+  it('does not resurrect the live cached headline after a settings invalidation', async () => {
+    const eur = { ...overviewPayload(), currency: EUR }
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, eur)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset to USD' }))
+    await waitFor(() => expect(mocks.resetCurrency).toHaveBeenCalled())
+    fireEvent.keyDown(document, { key: '1', metaKey: true })
+
+    expect(screen.queryByLabelText('Cached usage summary')).not.toBeInTheDocument()
+    expect(readOverviewHeadline(key)).toBeNull()
+  })
+
+  it('rejects an old in-flight background warm after a settings invalidation', async () => {
+    vi.useFakeTimers()
+    let resolveOldWarm!: (payload: MenubarPayload) => void
+    const oldWarm = new Promise<MenubarPayload>(resolve => { resolveOldWarm = resolve })
+    const usd = { ...overviewPayload(), currency: USD }
+    mocks.getOverview.mockImplementation((period: string, _provider: string, _range, _config, background) => {
+      if (period === 'today' && background === true) return oldWarm
+      return Promise.resolve(usd)
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all', undefined, undefined, true)
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset to USD' }))
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.resetCurrency).toHaveBeenCalled()
+
+    await act(async () => {
+      resolveOldWarm(usd)
+      await Promise.resolve()
+    })
+
+    const todayKey = overviewMemoKey('all', 'today', null, null)
+    expect(hasPolledMemo(todayKey)).toBe(false)
+    expect(readOverviewHeadline(todayKey)).toBeNull()
   })
 })
 

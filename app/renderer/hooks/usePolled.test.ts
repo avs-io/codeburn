@@ -249,6 +249,25 @@ describe('usePolled', () => {
     expect(observed[0]).toEqual({ key: 'frame-B', data: null })
   })
 
+  it('never exposes a prior keyed error during the render before switch effects run', async () => {
+    const calls: Array<{ resolve: (value: string) => void; reject: (error: unknown) => void }> = []
+    const fetcher = vi.fn(() => new Promise<string>((resolve, reject) => { calls.push({ resolve, reject }) }))
+    const observed: Array<{ key: string; error: unknown }> = []
+    function Probe({ memoKey }: { memoKey: string }) {
+      const polled = usePolled(fetcher, [memoKey], { memoKey, intervalMs: null })
+      observed.push({ key: memoKey, error: polled.error })
+      return null
+    }
+    const view = render(createElement(Probe, { memoKey: 'error-A' }))
+    await act(async () => { calls[0]!.reject({ kind: 'nonzero', message: 'A failed' }) })
+    expect(observed.at(-1)?.error).toMatchObject({ message: 'A failed' })
+    observed.length = 0
+
+    view.rerender(createElement(Probe, { memoKey: 'error-B' }))
+
+    expect(observed[0]).toEqual({ key: 'error-B', error: null })
+  })
+
   it('manual cadence (null interval) polls only on mount + refresh, never on a timer', async () => {
     vi.useFakeTimers()
     try {

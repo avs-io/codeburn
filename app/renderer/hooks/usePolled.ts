@@ -105,6 +105,7 @@ export function usePolled<T>(
   const [dataKey, setDataKey] = useState<string | null>(() =>
     memoKey && memoGet<T>(memoKey) !== undefined ? memoKey : null)
   const [error, setError] = useState<CliError | null>(null)
+  const [errorKey, setErrorKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
   const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null)
@@ -147,6 +148,7 @@ export function usePolled<T>(
         // the painted answer is good enough, so skip the CLI spawn entirely.
         if (keyChanged && Date.now() - cached.at < POLLED_FRESH_MS) {
           setError(null)
+          setErrorKey(null)
           setLoading(false)
           setSwitching(false)
           return
@@ -161,12 +163,14 @@ export function usePolled<T>(
     // Clear any prior error at the start of each attempt so a fresh poll never
     // shows a stale banner while it is still in flight; last-good `data` stays.
     setError(null)
+    setErrorKey(null)
     fetcher()
       .then(result => {
         if (epochRef.current !== epoch) return
         setData(result)
         setDataKey(memoKey ?? null)
         setError(null)
+        setErrorKey(null)
         const at = Date.now()
         setLastSuccessAt(at)
         lastSuccessRef.current = at
@@ -175,6 +179,7 @@ export function usePolled<T>(
       .catch(err => {
         if (epochRef.current !== epoch) return
         setError(normalizeCliError(err))
+        setErrorKey(memoKey ?? null)
       })
       .finally(() => {
         if (epochRef.current !== epoch) return
@@ -235,11 +240,12 @@ export function usePolled<T>(
   const renderedLastSuccessAt = keyMismatch && renderMemo ? renderMemo.at : lastSuccessAt
   const renderedLoading = keyMismatch ? true : loading
   const renderedSwitching = keyMismatch ? renderMemo !== undefined : switching
+  const renderedError = memoKey !== undefined && errorKey !== memoKey ? null : error
 
   return {
     data: renderedData,
     dataKey: renderedDataKey,
-    error,
+    error: renderedError,
     loading: renderedLoading,
     switching: renderedSwitching,
     lastSuccessAt: renderedLastSuccessAt,

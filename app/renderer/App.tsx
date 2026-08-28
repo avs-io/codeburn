@@ -223,6 +223,8 @@ function AppMain() {
   const [refreshToken, setRefreshToken] = useState(0)
   const [now, setNow] = useState(() => Date.now())
   const [, setCurrencyTick] = useState(0)
+  const [snapshotRevision, setSnapshotRevision] = useState(0)
+  const configGenerationRef = useRef(0)
 
   // Preserve the 2/3-arg call shapes when no config is scoped so the CLI argv
   // stays flag-free; only add --claude-config-source once a config is picked.
@@ -248,7 +250,7 @@ function AppMain() {
   // current answer: the full authoritative fetch starts normally behind it.
   const headlineSnapshot = useMemo(
     () => customRange || scope !== 'local' ? null : readOverviewHeadline(activeOverviewKey),
-    [activeOverviewKey, customRange, scope],
+    [activeOverviewKey, customRange, scope, snapshotRevision],
   )
 
   useEffect(() => {
@@ -423,10 +425,11 @@ function AppMain() {
           continue
         }
         try {
+          const configGeneration = configGenerationRef.current
           // background priority (5th arg) so this never delays an interactive
           // poll; ignored by an older preload, degrading to current behavior.
           const value = await codeburn.getOverview(target.period, target.provider, undefined, undefined, true)
-          if (!cancelled) {
+          if (!cancelled && configGeneration === configGenerationRef.current) {
             primePolledMemo(key, value)
             writeOverviewHeadline(key, value)
             // A cancelled/failed warm did not produce a usable memo entry and
@@ -443,7 +446,7 @@ function AppMain() {
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, customRange, claudeConfigSource, scope, overview.data == null])
+  }, [ready, period, provider, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -462,8 +465,11 @@ function AppMain() {
   // Purge the memo, then force-refresh the active view so the new values land in a
   // couple seconds (quick like the menubar) instead of at the next poll.
   const onConfigMutated = useCallback(() => {
+    configGenerationRef.current++
+    warmedKeys.current.clear()
     clearPolledMemo()
     clearOverviewHeadlines()
+    setSnapshotRevision(revision => revision + 1)
     refreshVisible()
   }, [refreshVisible])
 

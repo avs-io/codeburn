@@ -10,7 +10,7 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { StaleBanner } from '../components/StaleBanner'
 import { motionEnabled, useBarGrowIn } from '../lib/motion'
 import { type Polled, usePolled } from '../hooks/usePolled'
-import { formatCompact, formatUsd } from '../lib/format'
+import { formatCompact, formatUsd, formatUsdWithCurrency } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
 import type {
@@ -720,13 +720,18 @@ export function OverviewContent({
       const captured = Number.isNaN(generated.getTime()) ? new Date(headlineSnapshot.capturedAt) : generated
       const capturedLabel = Number.isNaN(captured.getTime())
         ? 'earlier'
-        : captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+        : localDateKey(captured) === localDateKey(new Date())
+          ? `at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+          : `${captured.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      const headlineCost = headlineSnapshot.currency
+        ? formatUsdWithCurrency(headlineSnapshot.cost, headlineSnapshot.currency)
+        : formatUsd(headlineSnapshot.cost)
       return (
         <div className="ov-dashboard" aria-label="Cached usage summary">
           <div className="ov-card ov-hero-split snapshot-hero">
             <div className="ov-hero-main">
-              <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact at {capturedLabel}</span></div>
-              <div className="ov-hero-num" data-countup={headlineSnapshot.cost}>{formatUsd(headlineSnapshot.cost)}</div>
+              <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact {capturedLabel}</span></div>
+              <div className="ov-hero-num" data-countup={headlineSnapshot.cost}>{headlineCost}</div>
               <div className="ov-hero-sub">{headlineSnapshot.calls.toLocaleString('en-US')} calls · sessions updating</div>
               <p className="ov-widget-caption">Current totals, charts, sessions, and efficiency are refreshing in the background.</p>
             </div>
