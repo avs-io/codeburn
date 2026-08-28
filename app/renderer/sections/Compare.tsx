@@ -8,6 +8,7 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { CompareJsonReport, ComparisonRow, DateRange, ModelStats, Period, WorkingStyleRow } from '../lib/types'
 
 function fmtMetric(v: number | null, fn: 'cost' | 'number' | 'percent' | 'decimal'): string {
@@ -44,7 +45,7 @@ export function Compare({
   const models = usePolled<ModelStats[]>(
     () => codeburn.getCompareModels(period, provider),
     [period, provider, refreshToken],
-    { enabled: ready, memoKey: `comparemodels|${period}|${provider}` },
+    { enabled: ready, memoKey: reportMemoKey('comparemodels', period, provider) },
   )
   const [modelA, setModelA] = useState<string | null>(null)
   const [modelB, setModelB] = useState<string | null>(null)
@@ -136,7 +137,7 @@ function CompareReport({
   const report = usePolled<CompareJsonReport>(
     () => codeburn.getCompare(period, provider, modelA, modelB),
     [period, provider, modelA, modelB, refreshToken],
-    { memoKey: `compare|${period}|${provider}|${modelA}|${modelB}` },
+    { memoKey: reportMemoKey('compare', period, provider, null, `${modelA}|${modelB}`) },
   )
 
   useEffect(() => {

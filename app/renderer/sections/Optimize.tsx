@@ -9,6 +9,7 @@ import { StaleBanner } from '../components/StaleBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { DateRange, FindingClass, MenubarPayload, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
 
 type OptimizeTab = 'waste' | 'reverts' | 'abandoned' | 'fixes'
@@ -41,12 +42,12 @@ export function OptimizeContent({
   const optimizeReport = usePolled<OptimizeJsonReport>(
     () => range ? codeburn.getOptimizeReport(period, provider, range) : codeburn.getOptimizeReport(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `optimize|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('optimize', period, provider, range) },
   )
   const yieldReport = usePolled<YieldJsonReport>(
     () => range ? codeburn.getYield(period, provider, range) : codeburn.getYield(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `optyield|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('yield', period, provider, range) },
   )
   const [tab, setTab] = useState<OptimizeTab>('waste')
 

@@ -11,6 +11,7 @@ import type { Section } from '../components/Sidebar'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { AuditRow, DateRange, ModelReportRow, Period } from '../lib/types'
 import type { SettingsPane } from './Settings'
 
@@ -95,7 +96,7 @@ function ModelsUsage({
   const report = usePolled<ModelReportRow[]>(
     () => range ? codeburn.getModels(period, provider, byTask, range) : codeburn.getModels(period, provider, byTask),
     [period, provider, byTask, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `models|${period}|${provider}|${byTask}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('models', period, provider, range, String(byTask)) },
   )
 
   if (!report.data) {
@@ -141,7 +142,7 @@ function AuditLens({
   const report = usePolled<AuditRow[]>(
     () => range ? codeburn.getAudit(period, provider, range) : codeburn.getAudit(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `audit|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('audit', period, provider, range) },
   )
 
   if (!report.data) {

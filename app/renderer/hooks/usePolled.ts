@@ -1,4 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { compressToUTF16, decompressFromUTF16 } from 'lz-string'
 
 import { normalizeCliError } from '../lib/ipc'
 import { RefreshCadenceContext } from '../lib/refreshCadence'
@@ -21,11 +22,10 @@ export type Polled<T> = {
   refresh: () => void
 }
 
-// Module-level LRU store of the last successful result per memoKey. A section
-// that switches deps to a recently-seen key (a period or provider switch, or a
-// switch-back) paints the cached result in the same frame: no blank, no skeleton,
-// no stale-freeze. Today and Month keys deliberately include a date boundary,
-// so a fixed cap prevents a long-running app from retaining old payloads forever.
+// Last successful result per memoKey. The bounded in-memory LRU makes switches
+// instant; the versioned localStorage copy makes the same guarantee survive a
+// renderer restart. These are report snapshots only (never credentials), bounded
+// by both entry count and serialized size, and cleared after settings mutations.
 //
 // Entries carry the wall-clock of the fetch that produced them. When the memoKey
 // CHANGES (a period/provider/scope switch) a cached entry younger than
@@ -36,26 +36,128 @@ export type Polled<T> = {
 // manual refresh are unaffected.
 const POLLED_FRESH_MS = 30_000
 const MAX_MEMO_ENTRIES = 96
-type MemoEntry = { value: unknown; at: number }
+const SNAPSHOT_PREFIX = 'codeburn.reportSnapshot.v1.'
+const SNAPSHOT_GENERATION_KEY = 'codeburn.reportSnapshotGeneration.v1'
+const MAX_SNAPSHOT_CHARS = 2_500_000
+const MAX_STORED_SNAPSHOTS = 72
+type MemoEntry = { value: unknown; at: number; durable?: boolean }
 const memoStore = new Map<string, MemoEntry>()
 
-function memoGet<T>(key: string): { value: T; at: number } | undefined {
-  const entry = memoStore.get(key)
-  if (entry === undefined) return undefined
-  // Map iteration order is the eviction order. A cache hit becomes most recent.
+function memoPut(key: string, entry: MemoEntry): void {
+  // Map iteration order is the eviction order. Both a cache hit and a write
+  // become most recent, preserving the reviewed 96-entry memory ceiling.
   memoStore.delete(key)
   memoStore.set(key, entry)
-  return entry as { value: T; at: number }
-}
-
-function memoSet(key: string, value: unknown): void {
-  memoStore.delete(key)
-  memoStore.set(key, { value, at: Date.now() })
   while (memoStore.size > MAX_MEMO_ENTRIES) {
     const oldest = memoStore.keys().next().value as string | undefined
     if (oldest === undefined) break
     memoStore.delete(oldest)
   }
+}
+
+function snapshotGeneration(): number {
+  try { return Number(globalThis.localStorage?.getItem(SNAPSHOT_GENERATION_KEY) ?? '0') || 0 } catch { return 0 }
+}
+
+function snapshotStorageKey(key: string): string {
+  return `${SNAPSHOT_PREFIX}${key}`
+}
+
+function readDurableMemo<T>(key: string): { value: T; at: number; durable: true } | undefined {
+  try {
+    const raw = globalThis.localStorage?.getItem(snapshotStorageKey(key))
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as {
+      value?: T
+      data?: string
+      encoding?: string
+      at?: number
+      generation?: number
+    }
+    if (parsed.generation !== snapshotGeneration()
+      || !Number.isFinite(parsed.at)) return undefined
+    if (parsed.encoding === 'lz-utf16' && typeof parsed.data === 'string') {
+      const json = decompressFromUTF16(parsed.data)
+      if (!json) return undefined
+      return { value: JSON.parse(json) as T, at: parsed.at as number, durable: true }
+    }
+    // Backward-compatible read of the short-lived uncompressed development
+    // format; the next success rewrites it compressed.
+    if (!Object.prototype.hasOwnProperty.call(parsed, 'value')) return undefined
+    return { value: parsed.value as T, at: parsed.at as number, durable: true }
+  } catch {
+    return undefined
+  }
+}
+
+function memoGet<T>(key: string): { value: T; at: number; durable?: boolean } | undefined {
+  const memory = memoStore.get(key) as { value: T; at: number; durable?: boolean } | undefined
+  if (memory) {
+    memoPut(key, memory)
+    return memory
+  }
+  const durable = readDurableMemo<T>(key)
+  if (durable) memoPut(key, durable)
+  return durable
+}
+
+function memoSet(key: string, value: unknown): void {
+  const at = Date.now()
+  const entry = { value, at }
+  memoPut(key, entry)
+  try {
+    const storage = globalThis.localStorage
+    if (!storage) return
+    const raw = JSON.stringify({
+      at,
+      generation: snapshotGeneration(),
+      encoding: 'lz-utf16',
+      data: compressToUTF16(JSON.stringify(value)),
+    })
+    if (raw.length > MAX_SNAPSHOT_CHARS) return
+    const storageKey = snapshotStorageKey(key)
+    // localStorage quotas differ by Electron/Chromium release. On quota pressure,
+    // evict the oldest report and retry; the selected/latest snapshots win.
+    for (let attempt = 0; attempt < MAX_STORED_SNAPSHOTS; attempt++) {
+      try {
+        storage.setItem(storageKey, raw)
+        break
+      } catch {
+        if (!removeOldestDurableSnapshot(storage, storageKey)) return
+      }
+    }
+    while (durableSnapshotCount(storage) > MAX_STORED_SNAPSHOTS) {
+      if (!removeOldestDurableSnapshot(storage, storageKey)) break
+    }
+  } catch {
+    // Storage can be disabled, full, or the value may not be serializable. The
+    // in-memory fast path still works; persistence is a best-effort enhancement.
+  }
+}
+
+function durableSnapshotRows(storage: Storage): Array<{ key: string; at: number }> {
+  const rows: Array<{ key: string; at: number }> = []
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index)
+    if (!key?.startsWith(SNAPSHOT_PREFIX)) continue
+    let at = 0
+    try { at = Number((JSON.parse(storage.getItem(key) ?? '{}') as { at?: number }).at) || 0 } catch { /* evict corrupt rows first */ }
+    rows.push({ key, at })
+  }
+  return rows
+}
+
+function durableSnapshotCount(storage: Storage): number {
+  return durableSnapshotRows(storage).length
+}
+
+function removeOldestDurableSnapshot(storage: Storage, except: string): boolean {
+  const oldest = durableSnapshotRows(storage)
+    .filter(row => row.key !== except)
+    .sort((a, b) => a.at - b.at)[0]
+  if (!oldest) return false
+  storage.removeItem(oldest.key)
+  return true
 }
 
 /** Test-only: clear the module-level memo between renders so cached results from
@@ -70,12 +172,25 @@ export function __resetPolledMemo(): void {
  *  config, which is what stuck the display on the previous currency. */
 export function clearPolledMemo(): void {
   memoStore.clear()
+  try {
+    const storage = globalThis.localStorage
+    if (!storage) return
+    // Generation invalidation is atomic and makes stale snapshots unreadable
+    // even if storage enumeration/removal is interrupted or unavailable.
+    storage.setItem(SNAPSHOT_GENERATION_KEY, String(snapshotGeneration() + 1))
+    const keys: string[] = []
+    for (let index = 0; index < storage.length; index++) {
+      const key = storage.key(index)
+      if (key?.startsWith(SNAPSHOT_PREFIX)) keys.push(key)
+    }
+    for (const key of keys) storage.removeItem(key)
+  } catch { /* storage can be unavailable */ }
 }
 
 /** Seed the instant-switch memo out of band. The prefetcher (App.tsx) warms the
- *  overview result for every detected provider so a picker switch to one paints
- *  from memory in the same frame instead of waiting on a fresh CLI spawn. Keyed
- *  identically to the corresponding usePolled `memoKey`. */
+ *  standard horizons and their first-click reports for the active provider so a
+ *  period or destination switch paints from memory instead of waiting on a fresh
+ *  CLI spawn. Keyed identically to the corresponding usePolled `memoKey`. */
 export function primePolledMemo(key: string, value: unknown): void {
   memoSet(key, value)
 }
@@ -83,7 +198,15 @@ export function primePolledMemo(key: string, value: unknown): void {
 /** Whether a live result is already memoized for `key` (does not affect recency).
  *  Lets the prefetcher skip providers it has already warmed. */
 export function hasPolledMemo(key: string): boolean {
-  return memoStore.has(key)
+  return memoGet(key) !== undefined
+}
+
+/** Timestamp of the exact report snapshot currently available for `key`.
+ * The app footer uses this to describe the selected destination instead of
+ * repeating Overview's timestamp everywhere. Reading it may hydrate the
+ * in-memory memo from the versioned durable snapshot, but never changes data. */
+export function polledMemoTimestamp(key: string): number | null {
+  return memoGet(key)?.at ?? null
 }
 
 /**
@@ -157,7 +280,10 @@ export function usePolled<T>(
         lastSuccessRef.current = cached.at
         // Still fresh, and this is a switch rather than a poll/manual refresh:
         // the painted answer is good enough, so skip the CLI spawn entirely.
-        if (keyChanged && Date.now() - cached.at < POLLED_FRESH_MS) {
+        // A durable entry came from an earlier renderer lifetime. Paint it, but
+        // always revalidate once even when it is only seconds old; disk data is
+        // a snapshot, not proof that provider files have not changed meanwhile.
+        if (keyChanged && !cached.durable && Date.now() - cached.at < POLLED_FRESH_MS) {
           setError(null)
           setErrorKey(null)
           setLoading(false)
@@ -205,15 +331,10 @@ export function usePolled<T>(
 
   useEffect(() => {
     load()
-    // Skip interval ticks while the window is hidden/minimized/occluded: a
-    // backgrounded dashboard polling the CLI is pure energy waste. A visible-
-    // but-unfocused window (e.g. a second monitor) reports 'visible' and keeps
-    // polling. Read visibility live per tick so pausing holds even if a
-    // visibilitychange event was missed.
-    const tick = () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-      load()
-    }
+    // Data freshness is a product contract, including while the app is covered
+    // or minimized. The CLI resident process coalesces reads, so keep the cadence
+    // alive; purely visual animation remains visibility-gated elsewhere.
+    const tick = () => load()
     // Manual cadence (intervalMs == null) skips the interval entirely.
     const id = intervalMs != null ? setInterval(tick, intervalMs) : null
     // On return to visible, if the last success is older than a full cadence,

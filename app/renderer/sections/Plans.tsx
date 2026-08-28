@@ -11,6 +11,7 @@ import { formatConverted } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { motionClass } from '../lib/motion'
 import { PROVIDER_NAMES, PROVIDER_OWNERS, readDisabledProviders } from '../lib/providers'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { JsonPlanSummary, Period, PlanId, PlanProvider, QuotaProvider, QuotaWindow, StatusJson } from '../lib/types'
 import type { SettingsPane } from './Settings'
 
@@ -75,14 +76,19 @@ export function Plans({ period, refreshToken = 0, onNavigate, ready = true }: { 
   // the steady 30s poll keeps serving cached quota.
   const [reconnectNonce, setReconnectNonce] = useState(0)
   const lastForced = useRef(`${refreshToken}:${reconnectNonce}`)
+  const disabledProviders = readDisabledProviders()
+  const quotaMemoKey = `quota|${[...disabledProviders].sort().join(',')}`
   const quota = usePolled<QuotaProvider[]>(() => {
     const key = `${refreshToken}:${reconnectNonce}`
     const force = key !== lastForced.current
     lastForced.current = key
-    return codeburn.getQuota(force, readDisabledProviders())
-  }, [refreshToken, reconnectNonce])
+    return codeburn.getQuota(force, disabledProviders)
+  }, [refreshToken, reconnectNonce, quotaMemoKey], { memoKey: quotaMemoKey })
   const reconnect = () => setReconnectNonce(value => value + 1)
-  const budgetReport = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken], { enabled: ready })
+  const budgetReport = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken], {
+    enabled: ready,
+    memoKey: reportMemoKey('plans', period),
+  })
   const manualPlans = budgetReport.data ? manualPlanSummaries(budgetReport.data) : []
 
   return (

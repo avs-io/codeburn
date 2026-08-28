@@ -13,6 +13,7 @@ import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, localDateKey } from '../lib/period'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { CliError, DateRange, MenubarPayload, Period, SpendFlow } from '../lib/types'
 
 type Project = MenubarPayload['current']['topProjects'][number]
@@ -76,7 +77,7 @@ export function SpendContent({
   const flow = usePolled<SpendFlow>(
     () => range ? codeburn.getSpendFlow(period, provider, range) : codeburn.getSpendFlow(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `spendflow|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('spendflow', period, provider, range) },
   )
 
   if (!overview.data) {
