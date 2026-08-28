@@ -2009,7 +2009,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={view !== 'compare' && multipleProviders} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
-        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} visiblePeriod={period} />}
         {view === 'compare'
           ? <Box flexDirection="column" paddingX={2} paddingY={1}>
               <Box flexDirection="column" borderStyle="round" borderColor={ORANGE} paddingX={1}>
@@ -2030,7 +2030,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders && view !== 'compare'} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
-        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} visiblePeriod={period} />}
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
@@ -2057,17 +2057,18 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   )
 }
 
-/// Honest phase and file-count state while Today remains usable and older
-/// periods wait for the shared normalized index.
-function IndexingBanner({ width, done, total, cold, phase }: { width: number; done: number; total: number; cold: boolean; phase: DashboardIndexPhase }) {
+/// Honest phase and file-count state while the selected period remains usable
+/// and the shared normalized index widens in the background.
+function IndexingBanner({ width, done, total, cold, phase, visiblePeriod }: { width: number; done: number; total: number; cold: boolean; phase: DashboardIndexPhase; visiblePeriod: Period }) {
   const largeFirstIndex = cold && total >= LARGE_HISTORY_FILE_THRESHOLD
-  const readyLabel = phase === 'cached'
-    ? 'loading normalized cache · cached Today ready; source refresh pending'
+  const sharedIndexLabel = phase === 'cached'
+    ? 'loading normalized cache; source refresh pending'
     : phase === 'refreshing'
       ? 'cached periods ready; refreshing changed source files'
       : phase === 'week'
         ? 'Today ready; loading 7 Days'
         : `${PERIOD_LABELS[DASHBOARD_COLD_INDEX_PHASES[Math.max(0, DASHBOARD_COLD_INDEX_PHASES.indexOf(phase) - 1)]!]} ready; loading ${PERIOD_LABELS[phase]}`
+  const readyLabel = `${PERIOD_LABELS[visiblePeriod]} visible · shared index: ${sharedIndexLabel}`
   const count = cold && total > 0
     ? ` · ${Math.min(done, total)} source files parsed · ${total} deferred at first paint`
     : ''

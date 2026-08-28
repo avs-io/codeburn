@@ -106,7 +106,7 @@ describe('interactive period truth', () => {
     }, 'lifetime').durable).toMatchObject({ cost: 4, calls: 1, sessions: 1 })
   })
 
-  it('warns honestly before a large first history index', async () => {
+  it('names the visible explicit Month while a cold shared index widens in the background', async () => {
     const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
     const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
     stdin.isTTY = true
@@ -120,14 +120,14 @@ describe('interactive period truth', () => {
     stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
 
     const app = render(React.createElement(InteractiveDashboard, {
-      initialProjects: [project()], initialPeriod: 'today', initialProvider: 'all',
+      initialProjects: [project()], initialPeriod: 'month', initialProvider: 'all',
       refreshSeconds: 0, windowColumns: 140, initialIndexPendingFiles: 1000, initialCacheWasCold: true,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
     await app.waitUntilRenderFlush()
 
     const frame = frames.filter(value => value.trim()).at(-1) ?? ''
-    expect(frame).toContain('indexing Today ready; loading 7 Days · 0 source files parsed · 1000 deferred at first paint')
+    expect(frame).toContain('indexing This Month visible · shared index: Today ready; loading 7 Days · 0 source files parsed · 1000 deferred at first paint')
     expect(frame).toContain('large first index · may take a few minutes')
   })
 
@@ -232,7 +232,7 @@ describe('interactive period truth', () => {
     expect(frame).not.toContain('$1.00 cost')
   })
 
-  it('labels a warm first frame as cached without a fake source-file fraction', async () => {
+  it('names the visible explicit Month while a warm shared index loads in the background', async () => {
     const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
     const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
     stdin.isTTY = true
@@ -246,14 +246,14 @@ describe('interactive period truth', () => {
     stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
 
     const app = render(React.createElement(InteractiveDashboard, {
-      initialProjects: [project()], initialPeriod: 'today', initialProvider: 'all',
+      initialProjects: [project()], initialPeriod: 'month', initialProvider: 'all',
       refreshSeconds: 0, windowColumns: 140, initialIndexPendingFiles: 1, initialCacheWasCold: false,
     }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
     onTestFinished(() => app.unmount())
     await app.waitUntilRenderFlush()
 
     const frame = frames.filter(value => value.trim()).at(-1) ?? ''
-    expect(frame).toContain('cached loading normalized cache · cached Today ready; source refresh pending')
+    expect(frame).toContain('cached This Month visible · shared index: loading normalized cache; source refresh pending')
     expect(frame).not.toContain('0/1 source files')
   })
 })
