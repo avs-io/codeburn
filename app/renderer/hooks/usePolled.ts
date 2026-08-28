@@ -21,12 +21,11 @@ export type Polled<T> = {
   refresh: () => void
 }
 
-// Module-level store of the LAST successful result per memoKey, kept for the
-// whole app session — one payload per key, replaced on each success, never
-// evicted. A section that switches deps to a previously-seen key (a period or
-// provider switch, or a switch-back) paints the cached result in the same frame:
-// no blank, no skeleton, no stale-freeze. Keys are bounded by
-// (section × period × provider × range), so the map cannot grow without limit.
+// Module-level LRU store of the last successful result per memoKey. A section
+// that switches deps to a recently-seen key (a period or provider switch, or a
+// switch-back) paints the cached result in the same frame: no blank, no skeleton,
+// no stale-freeze. Today and Month keys deliberately include a date boundary,
+// so a fixed cap prevents a long-running app from retaining old payloads forever.
 //
 // Entries carry the wall-clock of the fetch that produced them. When the memoKey
 // CHANGES (a period/provider/scope switch) a cached entry younger than
@@ -36,15 +35,27 @@ export type Polled<T> = {
 // visibility catch-up, refresh() — always fetches, so the poll cadence and the
 // manual refresh are unaffected.
 const POLLED_FRESH_MS = 30_000
+const MAX_MEMO_ENTRIES = 96
 type MemoEntry = { value: unknown; at: number }
 const memoStore = new Map<string, MemoEntry>()
 
 function memoGet<T>(key: string): { value: T; at: number } | undefined {
-  return memoStore.get(key) as { value: T; at: number } | undefined
+  const entry = memoStore.get(key)
+  if (entry === undefined) return undefined
+  // Map iteration order is the eviction order. A cache hit becomes most recent.
+  memoStore.delete(key)
+  memoStore.set(key, entry)
+  return entry as { value: T; at: number }
 }
 
 function memoSet(key: string, value: unknown): void {
+  memoStore.delete(key)
   memoStore.set(key, { value, at: Date.now() })
+  while (memoStore.size > MAX_MEMO_ENTRIES) {
+    const oldest = memoStore.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    memoStore.delete(oldest)
+  }
 }
 
 /** Test-only: clear the module-level memo between renders so cached results from

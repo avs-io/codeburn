@@ -187,20 +187,18 @@ describe('usePolled', () => {
     }
   })
 
-  it('keeps a payload for the whole session, however many other keys are visited', async () => {
-    const fetcher = vi.fn().mockResolvedValue('x')
-    const { rerender } = renderHook(
-      ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
-      { initialProps: { k: 'first' } },
-    )
-    await act(async () => {})
-    for (let i = 0; i < 40; i++) {
-      rerender({ k: `other-${i}` })
-      await act(async () => {})
-    }
-    // No LRU cap: the very first key is still memoized, so returning to it paints
-    // instantly instead of re-running its aggregation.
-    expect(hasPolledMemo('first')).toBe(true)
+  it('bounds the instant-switch memo and retains recently-used keys', () => {
+    clearPolledMemo()
+    for (let i = 0; i < 96; i++) primePolledMemo(`key-${i}`, i)
+
+    // Re-seeding the oldest key makes it recent before the next insertion.
+    expect(hasPolledMemo('key-0')).toBe(true)
+    primePolledMemo('key-0', 0)
+    primePolledMemo('key-96', 96)
+
+    expect(hasPolledMemo('key-0')).toBe(true)
+    expect(hasPolledMemo('key-1')).toBe(false)
+    expect(hasPolledMemo('key-96')).toBe(true)
   })
 
   it('clears stale data on a switch to an unmemoized key (skeleton, never the prior filter)', async () => {
