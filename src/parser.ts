@@ -2006,11 +2006,12 @@ async function scanProjectDirs(
 
     const cached = section.files[filePath]
     const action = reconcileFile(fp, cached)
-    if (cached && (readOnly || action.action === 'unchanged')) {
+    if (!readOnly && deferToBackgroundFill(filePath, fp, cached)) {
+      continue
+    } else if (cached && (readOnly || action.action === 'unchanged')) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
     } else if (!readOnly) {
-      if (deferToBackgroundFill(filePath, fp, cached)) continue
       if (action.action === 'appended') {
         changedFiles.push({
           filePath,
@@ -3374,11 +3375,12 @@ export async function parseProviderSources(
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
+    if (!readOnly && deferToBackgroundFill(source.path, fp, cached)) {
+      continue
+    } else if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
-      if (deferToBackgroundFill(source.path, fp, cached)) continue
       changedSources.push({ source, fp })
     } else {
       // Read-only with no cache entry at all — see scanProjectDirs.
@@ -5073,6 +5075,11 @@ function singlePassParse(dateRange: DateRange | undefined, providerFilter: strin
 export const FIRST_PAINT_MTIME_MARGIN_MS = 48 * 60 * 60 * 1000
 
 let firstPaintFloorMs: number | null = null
+// The TUI's Today-first paint also defers older entries already normalized in
+// a complete cache. Reading/aggregating those cached turns before Ink renders
+// is precisely the warm-start latency this mode removes. Other progressive
+// consumers keep the historical cold-only rule unless they opt in.
+let firstPaintIncludesCachedFiles = false
 // Files this scope deferred, as a SET of paths: one first paint runs several
 // parses (the scan, the plan window, the durable backfill) and each defers the
 // same old files, so a running count would report a multiple of the real work.
@@ -5118,17 +5125,21 @@ export function sessionHydrationSnapshot(): {
 export async function withColdFirstPaintFloor<T>(
   rangeStart: Date,
   fn: () => Promise<T>,
+  includeCachedFiles = false,
 ): Promise<{ result: T; deferredFiles: number }> {
   const outer = firstPaintFloorMs
   const outerPaths = firstPaintDeferredPaths
+  const outerIncludeCached = firstPaintIncludesCachedFiles
   firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
   firstPaintDeferredPaths = new Set()
+  firstPaintIncludesCachedFiles = includeCachedFiles
   try {
     const result = await fn()
     return { result, deferredFiles: firstPaintDeferredPaths.size }
   } finally {
     firstPaintFloorMs = outer
     firstPaintDeferredPaths = outerPaths
+    firstPaintIncludesCachedFiles = outerIncludeCached
   }
 }
 
@@ -5140,12 +5151,13 @@ export function shouldDeferToBackgroundFill(
   fp: { mtimeMs: number },
   cached: unknown,
   floorMs: number | null,
+  includeCachedFiles = false,
 ): boolean {
-  return floorMs !== null && cached === undefined && fp.mtimeMs < floorMs
+  return floorMs !== null && (includeCachedFiles || cached === undefined) && fp.mtimeMs < floorMs
 }
 
 function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: unknown): boolean {
-  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs)) return false
+  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs, firstPaintIncludesCachedFiles)) return false
   firstPaintDeferredPaths?.add(path)
   firstPaintDeferredThisRun++
   return true
