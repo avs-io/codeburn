@@ -351,9 +351,50 @@ describe('Overview', () => {
       measuredClientWidth = 320
       act(() => resizeCallback?.([], {} as ResizeObserver))
       expect(scroller.scrollLeft).toBe(200)
-      expect(disconnect).toHaveBeenCalledOnce()
+      expect(disconnect).not.toHaveBeenCalled()
 
       scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('keeps following the newest dates across later resizes until the user scrolls away', async () => {
+    let measuredScrollWidth = 520
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resizeCallback = callback }
+      observe = vi.fn()
+      disconnect = vi.fn()
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+      const { container } = render(<Overview period="30days" provider="all" />)
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      measuredClientWidth = 240
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(280)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      measuredClientWidth = 200
       act(() => resizeCallback?.([], {} as ResizeObserver))
       expect(scroller.scrollLeft).toBe(24)
     } finally {

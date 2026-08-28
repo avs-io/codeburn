@@ -125,8 +125,13 @@ const STANDARD_PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all', '
 // Instant-switch memo key for an overview result. Shared by the overview poll
 // and the provider prefetcher so the two never drift out of sync. Exported so
 // the prefetch-storm test can assert warmed keys survive between polls.
-export function overviewMemoKey(provider: string, period: Period, range: DateRange | null, configSource: string | null, scope: Scope = 'local'): string {
-  return `overview|${provider}|${period}|${range?.from ?? ''}-${range?.to ?? ''}|${configSource ?? ''}|${scope}`
+export function overviewMemoKey(provider: string, period: Period, range: DateRange | null, configSource: string | null, scope: Scope = 'local', now = new Date()): string {
+  const boundary = period === 'today'
+    ? localDateKey(now)
+    : period === 'month'
+      ? `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+      : ''
+  return `overview|${provider}|${period}|${range?.from ?? ''}-${range?.to ?? ''}|${configSource ?? ''}|${scope}|${boundary}`
 }
 
 // Prefetch pacing: wait a short idle after the first paint, then warm one
@@ -232,6 +237,7 @@ function AppMain() {
   // a provider/config filter, so onScopeChange forces provider='all' and clears
   // the config scope before this poll runs. Passing scope='local' produces the
   // same flag-free argv as before, so local users are unaffected.
+  const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope, new Date(now))
   const overview = usePolled<MenubarPayload>(
     () => scope === 'combined'
       ? codeburn.getOverview(period, 'all', customRange ?? undefined, undefined, undefined, 'combined')
@@ -241,10 +247,9 @@ function AppMain() {
       ? codeburn.getOverview(period, provider, customRange)
       : codeburn.getOverview(period, provider),
     [period, provider, customRange?.from, customRange?.to, claudeConfigSource, scope],
-    { memoKey: overviewMemoKey(provider, period, customRange, claudeConfigSource, scope) },
+    { memoKey: activeOverviewKey },
   )
   const refreshOverview = overview.refresh
-  const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope)
   // A compact, privacy-minimized last exact headline makes a returning launch or
   // an as-yet-unwarmed period useful immediately. It is never presented as the
   // current answer: the full authoritative fetch starts normally behind it.
@@ -429,7 +434,9 @@ function AppMain() {
           // background priority (5th arg) so this never delays an interactive
           // poll; ignored by an older preload, degrading to current behavior.
           const value = await codeburn.getOverview(target.period, target.provider, undefined, undefined, true)
-          if (!cancelled && configGeneration === configGenerationRef.current) {
+          if (!cancelled
+            && configGeneration === configGenerationRef.current
+            && value.hydration?.complete !== false) {
             primePolledMemo(key, value)
             writeOverviewHeadline(key, value)
             // A cancelled/failed warm did not produce a usable memo entry and

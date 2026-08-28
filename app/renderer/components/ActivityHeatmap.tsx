@@ -101,6 +101,7 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
+  const stickToNewestRef = useRef(true)
 
   // The fixed 26-week grid is wider than the compact hero slot. Start at the
   // newest weeks, then leave the user's scroll position alone.
@@ -108,30 +109,23 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
     const scroller = scrollRef.current
     if (!scroller) return
 
-    let aligned = false
-    const alignNewest = (): boolean => {
-      if (aligned) return true
+    const alignNewest = (): void => {
+      if (!stickToNewestRef.current) return
       const newestOffset = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
-      if (newestOffset === 0) return false
       scroller.scrollLeft = newestOffset
-      aligned = true
-      return true
     }
 
-    if (alignNewest()) return
+    alignNewest()
 
     // Electron can mount this card while its parent still has the wider
-    // skeleton measurement, then compact it before first paint. Wait for that
-    // final width instead of leaving the timeline at its oldest dates.
+    // skeleton measurement, then compact it before first paint. Keep observing
+    // later resizes too while the user remains pinned to newest; once they
+    // deliberately scroll away, their position is left alone.
     const observer = typeof ResizeObserver === 'undefined'
       ? null
-      : new ResizeObserver(() => {
-          if (alignNewest()) observer?.disconnect()
-        })
+      : new ResizeObserver(alignNewest)
     observer?.observe(scroller)
-    const frame = window.requestAnimationFrame(() => {
-      if (alignNewest()) observer?.disconnect()
-    })
+    const frame = window.requestAnimationFrame(alignNewest)
 
     return () => {
       window.cancelAnimationFrame(frame)
@@ -177,6 +171,12 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
         role="region"
         aria-label="Scrollable daily activity timeline"
         tabIndex={0}
+        onScroll={() => {
+          const scroller = scrollRef.current
+          if (!scroller) return
+          const newestOffset = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+          stickToNewestRef.current = Math.abs(scroller.scrollLeft - newestOffset) <= 1
+        }}
       >
         <div className="ov-heatmap-track">
           <div className="ov-heatmap-months" aria-label="Month labels">

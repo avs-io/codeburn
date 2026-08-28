@@ -52,6 +52,13 @@ describe('persisted Overview headline', () => {
     expect(readOverviewHeadline('anything', NOW)).toBeNull()
   })
 
+  it('never persists a partial resident-hydration total as exact', () => {
+    const partial = { ...payload(), hydration: { complete: false, indexedFiles: 4, totalFiles: 10 } }
+
+    expect(writeOverviewHeadline('partial', partial, NOW)).toBeNull()
+    expect(readOverviewHeadline('partial', NOW)).toBeNull()
+  })
+
   it('rejects a snapshot whose embedded identity does not match the requested period key', () => {
     const requestedKey = 'overview|all|week'
     writeOverviewHeadline(requestedKey, payload(), NOW)

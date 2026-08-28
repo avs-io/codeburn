@@ -252,6 +252,19 @@ describe('App shortcuts', () => {
     expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
   })
 
+  it('rolls Today and Month cache identities at their local calendar boundaries', () => {
+    const aug28 = new Date(2026, 7, 28, 23, 59)
+    const aug29 = new Date(2026, 7, 29, 0, 1)
+    const sep1 = new Date(2026, 8, 1, 0, 1)
+
+    expect(overviewMemoKey('all', 'today', null, null, 'local', aug28))
+      .not.toBe(overviewMemoKey('all', 'today', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug28))
+      .toBe(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+      .not.toBe(overviewMemoKey('all', 'month', null, null, 'local', sep1))
+  })
+
   it('releases the sections when the overview fails for a real reason', async () => {
     mocks.getOverview.mockRejectedValue({ kind: 'nonzero', message: 'permission denied' })
     render(<App />)

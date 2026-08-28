@@ -72,6 +72,10 @@ export function readOverviewHeadline(key: string, now = Date.now()): OverviewHea
  * Sessions and every drill-down are intentionally excluded: they require the
  * authoritative parse and the UI labels them as updating until it completes. */
 export function writeOverviewHeadline(key: string, payload: MenubarPayload, capturedAt = Date.now()): OverviewHeadlineSnapshot | null {
+  // Resident serve may answer progressively while a large corpus is still
+  // indexing. Those totals are useful live with an indexing banner, but they
+  // are not a complete exact result and must never survive a restart as one.
+  if (payload.hydration?.complete === false) return null
   const store = storage()
   if (!store) return null
   const current = payload.current
