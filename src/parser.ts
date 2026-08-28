@@ -5080,6 +5080,10 @@ let firstPaintFloorMs: number | null = null
 // is precisely the warm-start latency this mode removes. Other progressive
 // consumers keep the historical cold-only rule unless they opt in.
 let firstPaintIncludesCachedFiles = false
+// A complete, environment-compatible normalized cache can paint an honestly
+// labelled cached Today without waiting for source discovery/reconciliation.
+// The mounted dashboard immediately refreshes sources in the background.
+let firstPaintPrefersCompleteSnapshot = false
 // Files this scope deferred, as a SET of paths: one first paint runs several
 // parses (the scan, the plan window, the durable backfill) and each defers the
 // same old files, so a running count would report a multiple of the real work.
@@ -5126,13 +5130,16 @@ export async function withColdFirstPaintFloor<T>(
   rangeStart: Date,
   fn: () => Promise<T>,
   includeCachedFiles = false,
+  preferCompleteSnapshot = false,
 ): Promise<{ result: T; deferredFiles: number }> {
   const outer = firstPaintFloorMs
   const outerPaths = firstPaintDeferredPaths
   const outerIncludeCached = firstPaintIncludesCachedFiles
+  const outerPreferSnapshot = firstPaintPrefersCompleteSnapshot
   firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
   firstPaintDeferredPaths = new Set()
   firstPaintIncludesCachedFiles = includeCachedFiles
+  firstPaintPrefersCompleteSnapshot = preferCompleteSnapshot
   try {
     const result = await fn()
     return { result, deferredFiles: firstPaintDeferredPaths.size }
@@ -5140,6 +5147,7 @@ export async function withColdFirstPaintFloor<T>(
     firstPaintFloorMs = outer
     firstPaintDeferredPaths = outerPaths
     firstPaintIncludesCachedFiles = outerIncludeCached
+    firstPaintPrefersCompleteSnapshot = outerPreferSnapshot
   }
 }
 
@@ -5171,6 +5179,20 @@ export function parseAllSessions(dateRange?: DateRange, providerFilter?: string)
   // directory even if an embedding host changes the process env mid-parse.
   const codexCacheDir = getCodeburnCacheDir()
   return withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(dateRange, providerFilter))
+}
+
+function canServeCompleteSnapshot(cache: SessionCache, providerFilter?: string): boolean {
+  if (!isCacheComplete(cache)) return false
+  const sections = providerFilter && providerFilter !== 'all'
+    ? ([[providerFilter, cache.providers[providerFilter]]] as const).filter((entry): entry is readonly [string, ProviderSection] => entry[1] != null)
+    : Object.entries(cache.providers)
+  return sections.some(([, section]) => Object.keys(section.files).length > 0)
+    && sections.every(([name, section]) => section.envFingerprint === computeEnvFingerprint(name))
+}
+
+export async function isCompleteSessionSnapshotAvailable(dateRange: DateRange, providerFilter?: string): Promise<boolean> {
+  const diskCache = await loadCache(monthScopeForRange(dateRange.start, dateRange.end))
+  return canServeCompleteSnapshot(diskCache, providerFilter)
 }
 
 async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
@@ -5218,8 +5240,12 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // a proxied key emitted under two providers the attribution can land on a
   // different provider than a full load would pick.
   const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  const cacheLoadStarted = performance.now()
   let diskCache = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: startup timing cache-load=${(performance.now() - cacheLoadStarted).toFixed(1)}ms complete=${isCacheComplete(diskCache)}\n`)
+  }
 
   // Cold-hydration coordination (advisory, cross-process). Engages whenever the
   // on-disk cache is not COMPLETE — an empty cache OR a partial one an interrupted
@@ -5240,6 +5266,15 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     }
   }
 
+  if (firstPaintPrefersCompleteSnapshot && canServeCompleteSnapshot(diskCache, providerFilter)) {
+    return runParse(key, diskCache, dateRange, providerFilter, {
+      readOnly: true,
+      snapshotOnly: true,
+      burstSig,
+      parseStartedAt,
+    })
+  }
+
   // A complete cache refresh is a strict read/reconcile/parse/save transaction.
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
@@ -5251,10 +5286,14 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
   startProgressKeepalive()
   let refresh: RefreshLockOutcome
+  const refreshWaitStarted = performance.now()
   try {
     refresh = await acquireCacheRefreshLock()
   } finally {
     stopProgressKeepalive()
+  }
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: startup timing refresh-lock=${(performance.now() - refreshWaitStarted).toFixed(1)}ms outcome=${refresh.outcome}\n`)
   }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
@@ -5282,6 +5321,7 @@ class RefreshPublicationUnavailableError extends Error {}
 type RunParseOptions = {
   isCold?: boolean
   readOnly?: boolean
+  snapshotOnly?: boolean
   refreshLock?: RefreshLockHandle
   burstSig: string
   parseStartedAt: number
@@ -5311,13 +5351,22 @@ async function runParseInner(
   providerFilter: string | undefined,
   options: RunParseOptions,
 ): Promise<ProjectSummary[]> {
-  const { isCold = false, readOnly = false, refreshLock } = options
+  const { isCold = false, readOnly = false, snapshotOnly = false, refreshLock } = options
+  const timingStarted = performance.now()
+  let timingPrevious = timingStarted
+  const traceTiming = (stage: string, extra = ''): void => {
+    if (process.env['CODEBURN_VERBOSE'] !== '1') return
+    const now = performance.now()
+    process.stderr.write(`codeburn: startup timing ${stage}=${(now - timingPrevious).toFixed(1)}ms total=${(now - timingStarted).toFixed(1)}ms${extra}\n`)
+    timingPrevious = now
+  }
   readOnlyServedStale = false
   deferredRetryableSource = false
   firstPaintDeferredThisRun = 0
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
-  const allSources = await discoverAllSessions(providerFilter)
+  const allSources = snapshotOnly ? [] : await discoverAllSessions(providerFilter)
+  traceTiming('discovery', ` sources=${allSources.length}`)
 
   const claudeSources = allSources.filter(s => s.provider === 'claude')
   const nonClaudeSources = allSources.filter(s => s.provider !== 'claude')
@@ -5382,6 +5431,7 @@ async function runParseInner(
       emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
     }
   }
+  traceTiming('claude')
 
   const otherProjects: ProjectSummary[] = []
   for (const [providerName, sources] of providerGroups) {
@@ -5399,12 +5449,14 @@ async function runParseInner(
     }
     await saveProgress()
   }
+  traceTiming('other-providers', ` providers=${providerGroups.size}`)
 
   // Durable providers with cached data but NO discovered sources (all files pruned
   // by VS Code / the external tool) still need their orphan pass to run so the
   // monthly total never drops. Call parseProviderSources with empty sources for
   // any such provider found in the disk cache.
   const processedProviders = new Set(providerGroups.keys())
+  if (claudeInScope) processedProviders.add('claude')
   for (const providerName of Object.keys(diskCache.providers)) {
     if (processedProviders.has(providerName)) continue
     // Skip if filtered to a different provider
@@ -5415,7 +5467,7 @@ async function runParseInner(
     // processes a durableSources provider) OR the static DURABLE_PROVIDER_NAMES
     // constant — both checks are O(1) and avoid a getProvider() dynamic-import
     // round-trip for every unprocessed provider in the disk cache.
-    if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
+    if (!snapshotOnly && !section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
     const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, saveProgress, readOnly)
     otherProjects.push(...projects)
   }
@@ -5490,5 +5542,6 @@ async function runParseInner(
   correlateCrossProviderPrSessions(result)
   if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
   cachePut(key, result, options.parseStartedAt)
+  traceTiming('aggregate', ` projects=${result.length}`)
   return result
 }

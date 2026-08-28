@@ -3,10 +3,16 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { assembleDashboardFirstPaint, buildDashboardHistoryIndex, selectDashboardHistoryIndex } from '../src/dashboard.js'
+import {
+  assembleDashboardFirstPaint,
+  buildDashboardHistoryIndex,
+  DASHBOARD_COLD_INDEX_PHASES,
+  dashboardIndexSupportsPeriod,
+  selectDashboardHistoryIndex,
+} from '../src/dashboard.js'
 import { getDateRange, type Period } from '../src/cli-date.js'
-import { clearSessionCache, filesParsedFromSourceCount, parseAllSessions } from '../src/parser.js'
-import { clearLoadCacheMemo, isColdCacheOnDisk } from '../src/session-cache.js'
+import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable, parseAllSessions } from '../src/parser.js'
+import { clearLoadCacheMemo, fingerprintFileCount, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildDurablePeriod } from '../src/usage-aggregator.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -58,6 +64,35 @@ async function writeSession(name: string, ageDays: number): Promise<void> {
 }
 
 describe('interactive dashboard progressive startup', () => {
+  it('does not treat an empty cache as a usable complete snapshot', async () => {
+    expect(await isCompleteSessionSnapshotAvailable(getDateRange('today').range, 'all')).toBe(false)
+    await parseAllSessions(getDateRange('today').range, 'all')
+    clearSessionCache()
+    clearLoadCacheMemo()
+    expect(await isCompleteSessionSnapshotAvailable(getDateRange('today').range, 'all')).toBe(false)
+    await writeSession('arrived-after-empty-cache', 0)
+    const paint = await assembleDashboardFirstPaint(
+      'today', 'all', undefined, undefined, null, null, false,
+    )
+    expect(paint.result.filteredProjects.flatMap(project => project.sessions).map(session => session.sessionId))
+      .toEqual(['arrived-after-empty-cache'])
+    clearSessionCache()
+    clearLoadCacheMemo()
+    expect(await isCompleteSessionSnapshotAvailable(getDateRange('today').range, 'codex')).toBe(false)
+  })
+
+  it('discovers current source files when the normalized cache is cold', async () => {
+    await writeSession('today', 0)
+
+    const paint = await assembleDashboardFirstPaint(
+      'today', 'all', undefined, undefined, null, null, false,
+    )
+
+    expect(paint.result.filteredProjects.flatMap(project => project.sessions).map(session => session.sessionId))
+      .toEqual(['today'])
+    expect(filesParsedFromSourceCount()).toBeGreaterThan(0)
+  })
+
   it('paints Today first even when the normalized session cache is already complete', async () => {
     await writeSession('today', 0)
     await writeSession('old', 90)
@@ -74,15 +109,17 @@ describe('interactive dashboard progressive startup', () => {
     clearLoadCacheMemo()
 
     const parsedBefore = filesParsedFromSourceCount()
+    const fingerprintsBefore = fingerprintFileCount()
     const paint = await assembleDashboardFirstPaint(
       'today', 'all', undefined, undefined, null, null, false,
     )
 
     expect(paint.result.period).toBe('today')
-    expect(paint.result.scannedProjects.flatMap(project => project.sessions).map(session => session.sessionId)).toEqual(['today'])
+    expect(paint.result.filteredProjects.flatMap(project => project.sessions).map(session => session.sessionId)).toEqual(['today'])
     expect(paint.result.planUsages).toEqual([])
-    expect(paint.deferredFiles).toBe(1)
+    expect(paint.deferredFiles).toBe(0)
     expect(filesParsedFromSourceCount() - parsedBefore).toBe(0)
+    expect(fingerprintFileCount() - fingerprintsBefore).toBe(0)
   })
 
   it('projects every period from one normalized lifetime index without returning to source files', async () => {
@@ -123,5 +160,53 @@ describe('interactive dashboard progressive startup', () => {
         .toEqual(expected.liveProjects.flatMap(project => project.sessions).map(session => session.sessionId).sort())
     }
     expect(filesParsedFromSourceCount()).toBe(parsedAfterIndex)
+  })
+
+  it('does not let the fast cached snapshot suppress source reconciliation', async () => {
+    await writeSession('today', 0)
+    await writeSession('old', 90)
+    await parseAllSessions(getDateRange('lifetime').range, 'all')
+    clearSessionCache()
+    clearLoadCacheMemo()
+
+    const beforeSnapshot = fingerprintFileCount()
+    await buildDashboardHistoryIndex('all', undefined, undefined, {
+      readyThrough: 'lifetime',
+      preferCompleteSnapshot: true,
+    })
+    const afterSnapshot = fingerprintFileCount()
+    expect(afterSnapshot).toBe(beforeSnapshot)
+
+    await buildDashboardHistoryIndex('all', undefined, undefined)
+    expect(fingerprintFileCount()).toBeGreaterThan(afterSnapshot)
+  })
+
+  it('widens a cold index in readiness order without parsing a source twice', async () => {
+    const periods: Period[] = ['today', ...DASHBOARD_COLD_INDEX_PHASES]
+    await Promise.all([
+      writeSession('today', 0),
+      writeSession('week', 5),
+      writeSession('month', 20),
+      writeSession('older', 45),
+      writeSession('six-months', 120),
+      writeSession('lifetime', 500),
+    ])
+
+    const parsedBefore = filesParsedFromSourceCount()
+    let previousParsed = parsedBefore
+    for (const [position, readyThrough] of DASHBOARD_COLD_INDEX_PHASES.entries()) {
+      const index = await buildDashboardHistoryIndex('all', undefined, undefined, {
+        readyThrough,
+        progressiveSource: true,
+      })
+      for (const [periodPosition, period] of periods.entries()) {
+        expect(dashboardIndexSupportsPeriod(index, period)).toBe(periodPosition <= position + 1)
+      }
+      const parsed = filesParsedFromSourceCount()
+      expect(parsed).toBeGreaterThanOrEqual(previousParsed)
+      previousParsed = parsed
+    }
+
+    expect(filesParsedFromSourceCount() - parsedBefore).toBe(6)
   })
 })

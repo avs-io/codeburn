@@ -122,12 +122,12 @@ async function hydrateCache(): Promise<DailyCache> {
  * session index. The parser callback is only a range projection of `projects`:
  * no source discovery, transcript read, or session-cache parse is repeated.
  */
-export async function hydrateDailyCacheFromNormalizedProjects(projects: ProjectSummary[]): Promise<DailyCache> {
+export async function hydrateDailyCacheFromNormalizedProjects(projects: ProjectSummary[], complete = true): Promise<DailyCache> {
   return ensureCacheHydrated(
     (range) => Promise.resolve(filterProjectsByDateRange(projects, range)),
     aggregateProjectsIntoDays,
     getDailyCacheConfigHash(),
-    () => true,
+    () => complete,
     (rangeProjects, tz) => aggregateProjectsIntoDays(rangeProjects, (iso) => dateKeyInTz(iso, tz)),
   )
 }
@@ -432,12 +432,30 @@ export function buildDurableOverviewFromNormalizedIndex(
   const scanProjects = filterProjectsByDateRange(filteredProjects, periodInfo.range)
   const now = new Date()
   const todayStr = toDateString(now)
-  const todayDays = aggregateProjectsIntoDays(filterProjectsByDays(filteredProjects, new Set([todayStr])))
+  const normalizedDays = aggregateProjectsIntoDays(filteredProjects)
+  const todayDays = normalizedDays
     .filter(day => day.date === todayStr)
   const historicalSlice = hasProjectFilter
     ? (day: DailyEntry): DailyEntry => sliceDayToProject(day, include, exclude)
     : undefined
-  const allDays = unionDaysForPeriod(cache, todayDays, periodInfo, null, historicalSlice)
+  const cachedAllDays = unionDaysForPeriod(cache, todayDays, periodInfo, null, historicalSlice)
+  const cachedDates = new Set(cache.days.map(day => day.date))
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  // A provider-scoped index deliberately does not rewrite the shared all-
+  // provider durable cache. When that cache has no row for a surviving
+  // historical source, fill the missing date from this same normalized index;
+  // existing durable rows stay authoritative so expired history is preserved.
+  const canFillMissingDates = cache.complete !== true || cache.days.length === 0
+  const normalizedHistoricalDays = canFillMissingDates
+    ? normalizedDays.filter(day =>
+        day.date !== todayStr
+        && day.date >= rangeStartStr
+        && day.date <= rangeEndStr
+        && !cachedDates.has(day.date)
+      )
+    : []
+  const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
   const days = pf === 'all' ? allDays : allDays.map(day => sliceDayToProvider(day, pf))
   const data = buildPeriodDataFromDays(days, periodInfo.label)
 
