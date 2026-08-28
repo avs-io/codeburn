@@ -451,7 +451,7 @@ function CountUp({ value, animateKey, animate = true }: { value: number; animate
     return () => { tween.kill() }
   }, [value, animateKey, animate])
 
-  return <div ref={ref} className="ov-hero-num" data-countup={value}>{formatUsd(value)}</div>
+  return <div ref={ref} className="ov-hero-num" data-countup={value} data-countup-animation={animate ? 'enabled' : 'suppressed'}>{formatUsd(value)}</div>
 }
 
 function formatShortDay(date: string): string {
@@ -694,6 +694,20 @@ export function OverviewContent({
   scope?: Scope
   headlineSnapshot?: OverviewHeadlineSnapshot | null
 }) {
+  const { data, error } = overview
+  const heroSelectionKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}|${scope}`
+  // Suppress only the single persisted-headline -> live-data handoff. A stored
+  // headline remains available after that handoff, so testing the snapshot prop
+  // directly would disable every later user-triggered period/provider animation.
+  const pendingSnapshotHandoffRef = useRef<string | null>(null)
+  const suppressHeroReplay = pendingSnapshotHandoffRef.current === heroSelectionKey
+  useLayoutEffect(() => {
+    if (!data && headlineSnapshot) {
+      pendingSnapshotHandoffRef.current = heroSelectionKey
+    } else if (data && pendingSnapshotHandoffRef.current === heroSelectionKey) {
+      pendingSnapshotHandoffRef.current = null
+    }
+  }, [data, headlineSnapshot, heroSelectionKey])
   // Gate secondary spawns on the app-level readiness (first overview resolved),
   // so the cold hydration runs once (via overview) rather than 3 parses at once
   // on boot. Defaults true so standalone renders/tests poll normally.
@@ -710,7 +724,6 @@ export function OverviewContent({
   const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
   const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
   const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: `overview-yield|${period}|${provider}` })
-  const { data, error } = overview
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
   if (!data) {
@@ -752,7 +765,7 @@ export function OverviewContent({
   const heroCost = combined ? combined.combined.cost : data.current.cost
   const heroCalls = combined ? combined.combined.calls : data.current.calls
   const heroSessions = combined ? combined.combined.sessions : data.current.sessions
-  const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}|${scope}`
+  const animateKey = heroSelectionKey
   const stats = deriveStats(data, now)
   const periodDaily = sliceDailyToPeriod(data.history.daily, period, now)
   // Daily chart: contiguous zero-filled calendar window. A custom range spans
@@ -791,7 +804,7 @@ export function OverviewContent({
           {/* A returning launch already showed a truthful persisted headline.
               Replaying the live hero from $0 on handoff makes that exact value
               appear to collapse and recover; snap to the revalidated total. */}
-          <CountUp value={heroCost} animateKey={animateKey} animate={headlineSnapshot == null} />
+          <CountUp value={heroCost} animateKey={animateKey} animate={!suppressHeroReplay} />
           <div className="ov-hero-sub">{heroCalls.toLocaleString('en-US')} calls · {heroSessions.toLocaleString('en-US')} sessions</div>
           {combined
             ? <CombinedDevices usage={combined} />

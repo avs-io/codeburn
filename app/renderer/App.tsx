@@ -414,7 +414,15 @@ function AppMain() {
     const periodTargets = STANDARD_PERIODS
       .filter(targetPeriod => targetPeriod !== period)
       .map(targetPeriod => ({ period: targetPeriod, provider }))
-    const targets = periodTargets
+    // Keep the current-main provider-switch contract while the shared Core
+    // provider snapshot work is still landing: warm each other provider for the
+    // visible period after the active provider's standard horizons. Removing
+    // these targets made the first provider switch regress to a cold CLI parse.
+    const providerTargets = detectedProviders
+      .map(entry => entry.id)
+      .filter(targetProvider => targetProvider !== provider)
+      .map(targetProvider => ({ period, provider: targetProvider }))
+    const targets = [...periodTargets, ...providerTargets]
     if (targets.length === 0) return
     let cancelled = false
     const warm = async () => {

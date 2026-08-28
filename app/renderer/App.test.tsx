@@ -724,13 +724,13 @@ describe('overview idle warming', () => {
     __resetPolledMemo()
   })
 
-  it('warms only the other time horizons in user-priority order', async () => {
+  it('warms other time horizons before provider variants', async () => {
     vi.useFakeTimers()
     try {
       render(<App />)
       // Boot is pinned to 30D in beforeEach. Once it resolves, the idle queue
-      // should warm the remaining horizons in product priority order without
-      // launching expensive per-provider parses in the background.
+      // should warm the remaining horizons in product priority order, then
+      // retain current main's provider-switch warming contract.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
       await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
 
@@ -743,7 +743,7 @@ describe('overview idle warming', () => {
         ['lifetime', 'all'],
       ])
 
-      expect(backgroundSpawns.filter(call => call[1] !== 'all')).toHaveLength(0)
+      expect(backgroundSpawns[5]?.slice(0, 2)).toEqual(['30days', 'claude'])
     } finally {
       vi.useRealTimers()
     }
@@ -790,15 +790,15 @@ describe('overview idle warming', () => {
     }
   })
 
-  it('never prefetches provider variants across 3 poll cycles', async () => {
+  it('prefetches each provider variant once across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the period-warming queue. Provider
-      // variants are deliberately on-demand until they can reuse one hydrated
-      // summary instead of launching a full parse per provider.
+      // Three full 30s poll cycles plus the period-warming queue are long enough
+      // to warm every provider. The once-per-key guard must prevent poll cycles
+      // from spawning the queue again.
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
 
       for (const id of PROVIDERS) {
@@ -806,14 +806,14 @@ describe('overview idle warming', () => {
           // Prefetch warms carry the background-priority flag (5th arg).
           c => c[0] === '30days' && c[1] === id && c[2] === undefined && c[3] === undefined && c[4] === true,
         )
-        expect(spawns.length, `prefetch spawns for ${id}`).toBe(0)
+        expect(spawns.length, `prefetch spawns for ${id}`).toBe(1)
       }
 
       // Sanity: the active 'all' view was polled every cycle (not prefetch-gated).
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')
       expect(allPolls.length).toBeGreaterThanOrEqual(3)
 
-      for (const id of PROVIDERS) expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null))).toBe(false)
+      for (const id of PROVIDERS) expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null))).toBe(true)
     } finally {
       vi.useRealTimers()
     }

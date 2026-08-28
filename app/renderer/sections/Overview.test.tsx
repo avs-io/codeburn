@@ -920,6 +920,42 @@ describe('Overview', () => {
     expect(screen.getByText('€90.00')).toBeInTheDocument()
     expect(screen.getByText('exact Aug 26 at 2:30 PM')).toBeInTheDocument()
   })
+
+  it('suppresses only the persisted-headline handoff, not later filter animations', () => {
+    const now = new Date(2026, 7, 28, 10, 0, 0)
+    const payload = makePayload(now)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: now.getTime(),
+      generated: now.toISOString(),
+      label: 'Last 30 days',
+      cost: payload.current.cost,
+      calls: payload.current.calls,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'USD', symbol: '$', rate: 1 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+    const { container, rerender } = render(
+      <OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />,
+    )
+
+    rerender(<OverviewContent period="30days" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'suppressed')
+
+    rerender(<OverviewContent period="week" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'enabled')
+  })
 })
 
 type WorkflowOverrides = {
