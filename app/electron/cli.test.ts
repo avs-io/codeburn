@@ -729,6 +729,7 @@ describe('resident serve single-flight', () => {
   })
 
   it('falls back instead of crashing when a live resident closes its stdin', async () => {
+    const stdinClosedFile = join(dir, 'resident-stdin-closed')
     fakeBin(
       'closes-stdin-resident.js',
       `const fs = require('node:fs'); const readline = require('node:readline');
@@ -739,6 +740,7 @@ describe('resident serve single-flight', () => {
            process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n', () => {
              rl.close();
              fs.closeSync(0);
+             fs.writeFileSync(${JSON.stringify(stdinClosedFile)}, 'closed');
            });
          });
          setInterval(() => {}, 1000);
@@ -750,7 +752,7 @@ describe('resident serve single-flight', () => {
 
     await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 }))
       .resolves.toEqual({ via: 'serve' })
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await waitFor(() => readMaybe(stdinClosedFile) === 'closed')
     await expect(spawnCli(['models', '--after-stdin-close'], { timeoutMs: 5_000 }))
       .resolves.toEqual({ via: 'spawn' })
   })
