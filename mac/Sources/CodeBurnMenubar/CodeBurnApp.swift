@@ -54,7 +54,6 @@ struct CodeBurnApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var statusItemPlacementRecoveryTask: Task<Void, Never>?
     private var popover: NSPopover!
     private var rightClickMonitor: Any?
     private var lastContextMenuPresentedAt: Date = .distantPast
@@ -92,7 +91,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // is the orphan in #1117. shutdown() still runs for the tidy case.
         ServeChildRegistry.shared.reapAll()
         Task { await ServeConnection.shared.shutdown() }
-        stopStatusItemPlacementRecovery()
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)
             rightClickMonitor = nil
@@ -229,7 +227,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.stopStatusItemPlacementRecovery()
                 self?.prepareRefreshPipelineForSleep()
             }
         }
@@ -246,7 +243,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "wake")
-                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -258,7 +254,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "screen wake")
-                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -272,7 +267,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.displayAsleep = true
-                self?.stopStatusItemPlacementRecovery()
             }
         }
     }
@@ -1037,17 +1031,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     private func setupStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: statusItemWidth)
-        item.autosaveName = StatusItemPlacementPolicy.autosaveName
-        // `autosaveName` makes AppKit restore status-item state across launches.
-        // CodeBurn has no user-facing hide toggle, so explicitly restore the
-        // supported visible state in case Tahoe persisted a hidden/parked item.
-        item.isVisible = true
-        statusItem = item
-        guard let button = statusItem.button else {
-            startStatusItemPlacementRecovery()
-            return
-        }
+        statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
+        guard let button = statusItem.button else { return }
 
         // Set the bundled flame image immediately to ensure the status item renders.
         // On macOS Tahoe, status items may fail to appear if only an attributed title
@@ -1089,135 +1074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // Defer the full attributed title setup to ensure initial render completes
         DispatchQueue.main.async { [weak self] in
             self?.refreshStatusButton()
-            self?.startStatusItemPlacementRecovery()
         }
-    }
-
-    /// Tahoe can park an accessory app's status item at the screen's top-right
-    /// corner when the auto-hidden menu bar is hidden during launch (#1148).
-    /// Wait for the user's pointer to reveal the bar, then perform up to three
-    /// supported visibility pulses. Never remove/recreate the item: repeated
-    /// creation churn is implicated in poisoning the bundle-id state this
-    /// recovery protects.
-    private func startStatusItemPlacementRecovery() {
-        stopStatusItemPlacementRecovery()
-
-        statusItemPlacementRecoveryTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(120))
-            var recovery = StatusItemPlacementRecoveryCoordinator()
-
-            while !Task.isCancelled && clock.now < deadline {
-                let placement = self.statusItemPlacementState
-                let revealed = placement.screen.map { screen in
-                    StatusItemPlacementPolicy.isMenuBarRevealed(
-                        pointer: NSEvent.mouseLocation,
-                        screenFrame: screen.frame,
-                        screenVisibleFrame: screen.visibleFrame
-                    )
-                } ?? false
-                switch recovery.action(
-                    for: placement.geometry,
-                    isMenuBarRevealed: revealed,
-                    revealHasSettled: false
-                ) {
-                case .stopHealthy:
-                    return
-                case .poll, .waitForReveal:
-                    try? await Task.sleep(for: .milliseconds(250))
-                    continue
-                case .stopExhausted:
-                    NSLog("CodeBurn: status item remains parked after bounded retries; run `codeburn menubar --repair-placement`")
-                    return
-                case .settleBeforePulse:
-                    // Let the auto-hide animation finish before asking AppKit
-                    // to place the existing item again.
-                    try? await Task.sleep(for: .milliseconds(500))
-                    guard !Task.isCancelled else { return }
-                    let settledPlacement = self.statusItemPlacementState
-                    let settledReveal = settledPlacement.screen.map { screen in
-                        StatusItemPlacementPolicy.isMenuBarRevealed(
-                            pointer: NSEvent.mouseLocation,
-                            screenFrame: screen.frame,
-                            screenVisibleFrame: screen.visibleFrame
-                        )
-                    } ?? false
-                    switch recovery.action(
-                        for: settledPlacement.geometry,
-                        isMenuBarRevealed: settledReveal,
-                        revealHasSettled: true
-                    ) {
-                    case .stopHealthy:
-                        return
-                    case .poll, .waitForReveal, .settleBeforePulse:
-                        continue
-                    case .stopExhausted:
-                        NSLog("CodeBurn: status item remains parked after bounded retries; run `codeburn menubar --repair-placement`")
-                        return
-                    case .pulse(let attempt):
-                        NSLog("CodeBurn: retrying parked status-item placement after menu bar reveal (\(attempt)/\(recovery.maximumPulseCount))")
-                        await StatusItemVisibilityPulse.run { self.statusItem.isVisible = $0 }
-                        guard !Task.isCancelled else { return }
-                        try? await Task.sleep(for: .milliseconds(250))
-                        continue
-                    }
-                case .pulse:
-                    // A pulse is only emitted after the settle phase above.
-                    assertionFailure("status item pulse emitted before reveal settled")
-                    return
-                }
-            }
-
-            guard !Task.isCancelled else { return }
-            switch self.statusItemPlacementState {
-            case .healthy:
-                return
-            case .unrealized:
-                NSLog("CodeBurn: status item did not realize before placement recovery timed out; run `codeburn menubar --repair-placement`")
-            case .parked:
-                NSLog("CodeBurn: status item stayed parked without a menu-bar reveal; run `codeburn menubar --repair-placement`")
-            }
-        }
-    }
-
-    private func stopStatusItemPlacementRecovery() {
-        statusItemPlacementRecoveryTask?.cancel()
-        statusItemPlacementRecoveryTask = nil
-    }
-
-    private enum StatusItemPlacementState {
-        case unrealized
-        case healthy
-        case parked(NSScreen)
-
-        var geometry: StatusItemPlacementRecoveryGeometry {
-            switch self {
-            case .unrealized: return .unrealized
-            case .healthy: return .healthy
-            case .parked: return .parked
-            }
-        }
-
-        var screen: NSScreen? {
-            if case .parked(let screen) = self { return screen }
-            return nil
-        }
-    }
-
-    private var statusItemPlacementState: StatusItemPlacementState {
-        guard let window = statusItem?.button?.window else { return .unrealized }
-        let frame = window.frame
-        guard !frame.isEmpty else { return .unrealized }
-        guard let screen = window.screen
-                ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) })
-                ?? NSScreen.main else { return .unrealized }
-        let parked = StatusItemPlacementPolicy.isParked(
-            itemFrame: frame,
-            screenFrame: screen.frame,
-            statusBarThickness: NSStatusBar.system.thickness
-        )
-        return parked ? .parked(screen) : .healthy
     }
 
     /// Composes the menubar title as a single attributed string with the flame as an inline
