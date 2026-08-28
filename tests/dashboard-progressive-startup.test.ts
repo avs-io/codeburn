@@ -9,11 +9,13 @@ import {
   DASHBOARD_COLD_INDEX_PHASES,
   dashboardIndexSupportsPeriod,
   selectDashboardHistoryIndex,
+  shouldAutoFallbackToWeek,
 } from '../src/dashboard.js'
 import { getDateRange, type Period } from '../src/cli-date.js'
 import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable, parseAllSessions, sessionMemoPublicationCount } from '../src/parser.js'
 import { clearLoadCacheMemo, fingerprintFileCount, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildDurablePeriod } from '../src/usage-aggregator.js'
+import type { ProjectSummary } from '../src/types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -82,6 +84,26 @@ async function appendSessionCall(name: string, outputTokens: number): Promise<vo
 }
 
 describe('interactive dashboard progressive startup', () => {
+  it('falls back from an all-zero Today on cold and warm indexes, but keeps real usage on Today', () => {
+    const cache = { version: 29, savingsConfigHash: '', lastComputedDate: null, days: [], complete: true } as const
+    const coldWeek = { provider: 'all', normalizedProjects: [], cache, planUsages: [], readyThrough: 'week' as const }
+    const warmLifetime = { ...coldWeek, readyThrough: 'lifetime' as const }
+    const zeroSessionProject = {
+      project: 'zero', projectPath: '/tmp/zero', sessions: [{
+        sessionId: 'zero', project: 'zero', firstTimestamp: '', lastTimestamp: '', totalCostUSD: 0,
+        totalSavingsUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0,
+        totalCacheWriteTokens: 0, apiCalls: 0, turns: [], modelBreakdown: {}, toolBreakdown: {},
+        mcpBreakdown: {}, bashBreakdown: {}, categoryBreakdown: {}, skillBreakdown: {}, subagentBreakdown: {},
+      }], totalCostUSD: 0, totalSavingsUSD: 0, totalApiCalls: 0,
+    } as ProjectSummary
+    const realUsage = { ...zeroSessionProject, totalApiCalls: 1 }
+
+    expect(shouldAutoFallbackToWeek(true, false, 'today', coldWeek, [])).toBe(true)
+    expect(shouldAutoFallbackToWeek(true, false, 'today', warmLifetime, [zeroSessionProject])).toBe(true)
+    expect(shouldAutoFallbackToWeek(true, false, 'today', coldWeek, [realUsage])).toBe(false)
+    expect(shouldAutoFallbackToWeek(true, false, 'today', warmLifetime, [realUsage])).toBe(false)
+  })
+
   it('does not treat an empty cache as a usable complete snapshot', async () => {
     expect(await isCompleteSessionSnapshotAvailable(getDateRange('today').range, 'all')).toBe(false)
     await parseAllSessions(getDateRange('today').range, 'all')

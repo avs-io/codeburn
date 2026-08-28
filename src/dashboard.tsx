@@ -1730,13 +1730,13 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       historyIndexRef.current = index
       setDailyHistoryProjects(filterProjectsByName(index.normalizedProjects, projectFilter, excludeFilter))
       let target = periodRef.current
-      if (
-        !autoFallbackAppliedRef.current
-        && autoFallbackFromEmptyToday
-        && target === 'today'
-        && index.readyThrough === 'week'
-        && !initialProjects.some(project => project.sessions.length > 0)
-      ) {
+      if (shouldAutoFallbackToWeek(
+        autoFallbackFromEmptyToday,
+        autoFallbackAppliedRef.current,
+        target,
+        index,
+        initialProjects,
+      )) {
         autoFallbackAppliedRef.current = true
         target = 'week'
         setPeriod('week')
@@ -1951,9 +1951,11 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       setProjects([])
       setDurable(undefined)
       setLoading(true)
-      setIndexing(true)
       if (debounceRef.current) clearTimeout(debounceRef.current)
-      if (dayDate) void reloadData(period, next, dayDate)
+      // Custom ranges and day views do not run the progressive history effect,
+      // so provider cycling must always own and finish its reload. Setting the
+      // global indexing flag here stranded --from/--to on a permanent skeleton.
+      void reloadData(period, next, dayDate)
       return
     }
     // Period switches reload the underlying data. Disable them while the
@@ -2207,6 +2209,35 @@ function dashboardIndexScanRange(readyThrough: Period): DateRange {
 export function dashboardIndexSupportsPeriod(index: DashboardHistoryIndex, period: Period): boolean {
   const readyThrough = index.readyThrough ?? 'lifetime'
   return PERIODS.indexOf(period) <= PERIODS.indexOf(readyThrough)
+}
+
+/** The unset interactive default moves to 7D only when Today is truly all-zero.
+ * A warm lifetime index follows the same rule as a week-ready cold index. */
+export function shouldAutoFallbackToWeek(
+  enabled: boolean,
+  alreadyApplied: boolean,
+  visiblePeriod: Period,
+  index: DashboardHistoryIndex,
+  todayProjects: ProjectSummary[],
+): boolean {
+  const todayHasUsage = todayProjects.some(project => (
+    project.totalApiCalls > 0
+    || project.totalCostUSD !== 0
+    || (project.totalSavingsUSD ?? 0) !== 0
+    || project.sessions.some(session => (
+      session.apiCalls > 0
+      || session.totalCostUSD !== 0
+      || session.totalInputTokens > 0
+      || session.totalOutputTokens > 0
+      || session.totalCacheReadTokens > 0
+      || session.totalCacheWriteTokens > 0
+    ))
+  ))
+  return enabled
+    && !alreadyApplied
+    && visiblePeriod === 'today'
+    && dashboardIndexSupportsPeriod(index, 'week')
+    && !todayHasUsage
 }
 
 type DashboardHistoryIndexBuildOptions = {
