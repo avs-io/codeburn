@@ -4353,7 +4353,13 @@ export function clearSessionCache(): void {
   singlePassScope?.parses.clear()
 }
 
+let sessionMemoPublications = 0
+export function sessionMemoPublicationCount(): number {
+  return sessionMemoPublications
+}
+
 function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
+  sessionMemoPublications++
   const now = Date.now()
   for (const [k, v] of sessionCache) {
     if (now - v.createdAt > CACHE_TTL_MS) sessionCache.delete(k)
@@ -5540,8 +5546,13 @@ async function runParseInner(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
-  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
-  cachePut(key, result, options.parseStartedAt)
+  // A snapshot is an explicitly stale, source-unvalidated view. Publishing it
+  // into either exact-key or burst reuse can suppress the reconciliation that
+  // the mounted dashboard starts immediately afterward for the full TTL.
+  if (!snapshotOnly) {
+    if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
+    cachePut(key, result, options.parseStartedAt)
+  }
   traceTiming('aggregate', ` projects=${result.length}`)
   return result
 }

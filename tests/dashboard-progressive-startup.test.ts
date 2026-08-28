@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -11,7 +11,7 @@ import {
   selectDashboardHistoryIndex,
 } from '../src/dashboard.js'
 import { getDateRange, type Period } from '../src/cli-date.js'
-import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable, parseAllSessions } from '../src/parser.js'
+import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable, parseAllSessions, sessionMemoPublicationCount } from '../src/parser.js'
 import { clearLoadCacheMemo, fingerprintFileCount, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildDurablePeriod } from '../src/usage-aggregator.js'
 
@@ -41,7 +41,7 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true })
 })
 
-async function writeSession(name: string, ageDays: number): Promise<void> {
+async function writeSession(name: string, ageDays: number, outputTokens = 50): Promise<void> {
   const dir = join(tmpDir, 'projects', 'proj')
   await mkdir(dir, { recursive: true })
   const at = new Date(Date.now() - ageDays * DAY_MS)
@@ -57,10 +57,28 @@ async function writeSession(name: string, ageDays: number): Promise<void> {
       role: 'assistant',
       model: 'claude-sonnet-4-5',
       content: [],
-      usage: { input_tokens: 100, output_tokens: 50 },
+      usage: { input_tokens: 100, output_tokens: outputTokens },
     },
   })}\n`)
   await utimes(path, at, at)
+}
+
+async function appendSessionCall(name: string, outputTokens: number): Promise<void> {
+  const timestamp = new Date().toISOString()
+  await appendFile(join(tmpDir, 'projects', 'proj', `${name}.jsonl`), `${JSON.stringify({
+    type: 'assistant',
+    sessionId: name,
+    timestamp,
+    cwd: '/tmp/proj',
+    message: {
+      id: `msg-${name}-appended`,
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-5',
+      content: [],
+      usage: { input_tokens: 100, output_tokens: outputTokens },
+    },
+  })}\n`)
 }
 
 describe('interactive dashboard progressive startup', () => {
@@ -168,17 +186,27 @@ describe('interactive dashboard progressive startup', () => {
     await parseAllSessions(getDateRange('lifetime').range, 'all')
     clearSessionCache()
     clearLoadCacheMemo()
+    // The source changes before launch, with no resident watcher available to
+    // invalidate an in-process memo. Cached first paint may show the old value;
+    // its immediately-following source reconciliation must replace it.
+    await appendSessionCall('today', 450)
 
     const beforeSnapshot = fingerprintFileCount()
-    await buildDashboardHistoryIndex('all', undefined, undefined, {
+    const memoPublicationsBefore = sessionMemoPublicationCount()
+    const snapshot = await buildDashboardHistoryIndex('all', undefined, undefined, {
       readyThrough: 'lifetime',
       preferCompleteSnapshot: true,
     })
     const afterSnapshot = fingerprintFileCount()
     expect(afterSnapshot).toBe(beforeSnapshot)
+    expect(sessionMemoPublicationCount()).toBe(memoPublicationsBefore)
+    expect(snapshot.normalizedProjects.flatMap(project => project.sessions)
+      .find(session => session.sessionId === 'today')?.totalOutputTokens).toBe(50)
 
-    await buildDashboardHistoryIndex('all', undefined, undefined)
+    const refreshed = await buildDashboardHistoryIndex('all', undefined, undefined)
     expect(fingerprintFileCount()).toBeGreaterThan(afterSnapshot)
+    expect(refreshed.normalizedProjects.flatMap(project => project.sessions)
+      .find(session => session.sessionId === 'today')?.totalOutputTokens).toBe(500)
   })
 
   it('widens a cold index in readiness order without parsing a source twice', async () => {
