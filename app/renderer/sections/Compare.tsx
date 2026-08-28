@@ -5,6 +5,7 @@ import { Dropdown } from '../components/Dropdown'
 import { EmptyNote } from '../components/EmptyState'
 import { Panel } from '../components/Panel'
 import { SectionSkeleton } from '../components/Skeleton'
+import { SwitchingBanner } from '../components/SwitchingBanner'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
@@ -81,6 +82,7 @@ export function Compare({
 
   return (
     <>
+      {models.switching && <SwitchingBanner />}
       {range && <RangeNote />}
       <div className="cmp-picker" aria-label="Models being compared">
         <Dropdown

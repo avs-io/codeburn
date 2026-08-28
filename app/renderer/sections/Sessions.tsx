@@ -8,6 +8,7 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { SegTabs } from '../components/SegTabs'
 import { StaleBanner } from '../components/StaleBanner'
 import { Stat } from '../components/Stat'
+import { SwitchingBanner } from '../components/SwitchingBanner'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatDayLong, formatDayShort, formatDuration, formatUsd, shortenProjectPath } from '../lib/format'
 import { codeburn } from '../lib/ipc'
@@ -188,10 +189,13 @@ export function Sessions({
 
   if (!report.data.length) {
     return (
-      <Panel title="Sessions">
-        <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
-        <EmptyNote>No sessions in this range yet.</EmptyNote>
-      </Panel>
+      <>
+        {report.switching && <SwitchingBanner />}
+        <Panel title="Sessions">
+          <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
+          <EmptyNote>No sessions in this range yet.</EmptyNote>
+        </Panel>
+      </>
     )
   }
 
@@ -201,6 +205,7 @@ export function Sessions({
 
   return (
     <div className="sessions-list-view">
+      {report.switching && <SwitchingBanner />}
       {report.error && <StaleBanner error={report.error} />}
       <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
       <div className="sessions-toolbar">

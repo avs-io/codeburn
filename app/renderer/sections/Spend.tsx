@@ -9,6 +9,7 @@ import { Sankey } from '../components/Sankey'
 import { SectionSkeleton } from '../components/Skeleton'
 import { StackedBars } from '../components/StackedBars'
 import { StaleBanner } from '../components/StaleBanner'
+import { SwitchingBanner } from '../components/SwitchingBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
@@ -169,6 +170,7 @@ function SpendPage({
 
   return (
     <>
+      {flow.switching && <SwitchingBanner />}
       {staleError && <StaleBanner error={staleError} />}
       <div className="spend-top-row">
         <Panel title="Daily spend by model" className="spend-chart-panel">
