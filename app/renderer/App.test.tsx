@@ -418,9 +418,6 @@ describe('App shortcuts', () => {
     expect((await screen.findAllByText('Settings')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Back')).not.toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '.', ...chord })
-    expect(await screen.findByRole('heading', { name: 'Plugins' })).toBeInTheDocument()
-
     const overviewCalls = mocks.getOverview.mock.calls.length
     fireEvent.keyDown(document, { key: 'r', ...chord })
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
@@ -877,21 +874,27 @@ describe('overview idle warming', () => {
   it('prefetches each provider variant once across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {
+      // Give the serial idle queue a clean runway. Once it is warm, the long
+      // cadence soak below proves completed provider keys are not respawned.
+      localStorage.setItem('codeburn.refreshInterval', '10m')
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the period-warming queue are long enough
-      // to warm every provider. The once-per-key guard must prevent poll cycles
-      // from spawning the queue again.
-      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
+      fireEvent.click(screen.getByRole('button', { name: 'Providers' }))
+      expect(screen.getByRole('option', { name: 'Codewhale' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'Openrouter' })).toBeInTheDocument()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      // The all-destination queue intentionally leaves a five-second cooling
+      // window between heavy report reads. Let that queue finish before the first
+      // cadence tick, then soak three ten-minute polling cycles.
+      await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30 * 60_000) })
 
-      for (const id of PROVIDERS) {
-        const spawns = mocks.getOverview.mock.calls.filter(
-          // Prefetch warms carry the background-priority flag (5th arg).
-          c => c[0] === '30days' && c[1] === id && c[2] === undefined && c[3] === undefined && c[4] === true,
-        )
-        expect(spawns.length, `prefetch spawns for ${id}`).toBe(1)
-      }
+      const warmedProviders = mocks.getOverview.mock.calls
+        // Prefetch warms carry the background-priority flag (5th arg).
+        .filter(c => c[0] === '30days' && c[1] !== 'all' && c[2] === undefined && c[3] === undefined && c[4] === true)
+        .map(c => c[1])
+      expect(warmedProviders).toEqual(PROVIDERS)
 
       // Sanity: the active 'all' view was polled every cycle (not prefetch-gated).
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')

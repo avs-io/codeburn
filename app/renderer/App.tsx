@@ -610,7 +610,6 @@ function AppMain() {
       else if (key === '7') navigate('compare')
       else if (key === '8') navigate('plans')
       else if (key === ',') navigate('settings')
-      else if (key === '.') navigate('plugins')
       else if (key === 'r') refreshVisible()
       else return
       event.preventDefault()

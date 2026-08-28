@@ -195,8 +195,8 @@ export function primePolledMemo(key: string, value: unknown): void {
   memoSet(key, value)
 }
 
-/** Whether a live result is already memoized for `key` (does not affect recency).
- *  Lets the prefetcher skip providers it has already warmed. */
+/** Whether a live result is already memoized for `key`. A durable hit is promoted
+ *  into the bounded memory LRU so the prefetcher can skip work already warmed. */
 export function hasPolledMemo(key: string): boolean {
   return memoGet(key) !== undefined
 }
