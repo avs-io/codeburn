@@ -225,6 +225,7 @@ final class CapacityDockController {
         }
         panel.contentView = hosting
         panel.makeContentTransparent()
+        panel.acceptsMouseMovedEvents = true
         hosting.clipsToBounds = true
         railPanel = panel
     }
@@ -259,6 +260,7 @@ final class CapacityDockController {
         }
         panel.contentView = hosting
         panel.makeContentTransparent()
+        panel.acceptsMouseMovedEvents = true
         hosting.clipsToBounds = true
         panel.alphaValue = 0
         detailPanel = panel
@@ -267,10 +269,12 @@ final class CapacityDockController {
     private func startEventMonitoring() {
         guard localEventMonitor == nil, globalMouseMonitor == nil else { return }
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+            matching: [.leftMouseDown, .rightMouseDown, .keyDown, .mouseMoved]
         ) { [weak self] event in
             guard let self else { return event }
-            if event.type == .keyDown, event.keyCode == 53 {
+            if event.type == .mouseMoved {
+                self.updateMouseEventPassthrough(at: NSEvent.mouseLocation)
+            } else if event.type == .keyDown, event.keyCode == 53 {
                 if self.model.interaction.handleEscape() {
                     self.hideDetail(animated: false)
                     self.layoutRail(animate: false)
@@ -281,15 +285,22 @@ final class CapacityDockController {
             return event
         }
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] _ in
+            matching: [.leftMouseDown, .rightMouseDown, .mouseMoved]
+        ) { [weak self] event in
             DispatchQueue.main.async { [weak self] in
-                self?.dismissIfOutside(point: NSEvent.mouseLocation)
+                guard let self else { return }
+                let point = NSEvent.mouseLocation
+                self.updateMouseEventPassthrough(at: point)
+                if event.type != .mouseMoved {
+                    self.dismissIfOutside(point: point)
+                }
             }
         }
     }
 
     private func stopEventMonitoring() {
+        railPanel?.ignoresMouseEvents = false
+        detailPanel?.ignoresMouseEvents = false
         if let localEventMonitor {
             NSEvent.removeMonitor(localEventMonitor)
             self.localEventMonitor = nil
@@ -297,6 +308,33 @@ final class CapacityDockController {
         if let globalMouseMonitor {
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
+        }
+    }
+
+    /// `NSHostingView.hitTest` can reject a transparent pixel, but AppKit still
+    /// routes that click to the owning window. Make the whole panel ignore mouse
+    /// events while the pointer is over one of those pixels; the global movement
+    /// monitor turns interaction back on as soon as the pointer reaches the
+    /// visible silhouette again.
+    private func updateMouseEventPassthrough(at point: CGPoint = NSEvent.mouseLocation) {
+        let dragging = model.interaction.isDragging
+        if let railPanel {
+            let shouldIgnore = railPanel.isVisible
+                && railPanel.frame.contains(point)
+                && !railContains(screenPoint: point)
+                && !dragging
+            if railPanel.ignoresMouseEvents != shouldIgnore {
+                railPanel.ignoresMouseEvents = shouldIgnore
+            }
+        }
+        if let detailPanel {
+            let shouldIgnore = detailPanel.isVisible
+                && detailPanel.frame.contains(point)
+                && !detailContains(screenPoint: point)
+                && !dragging
+            if detailPanel.ignoresMouseEvents != shouldIgnore {
+                detailPanel.ignoresMouseEvents = shouldIgnore
+            }
         }
     }
 
@@ -490,6 +528,7 @@ final class CapacityDockController {
             stopRailMotion()
             stopDetailMotion()
             model.interaction.beginDragging()
+            railPanel.ignoresMouseEvents = false
             hideDetail(animated: false)
             dragStartFrame = railPanel.frame
             dragVisibleFrame = screen.visibleFrame
@@ -581,6 +620,7 @@ final class CapacityDockController {
         }
         railPanel.setFrame(frame, display: false)
         railPanel.contentView?.needsDisplay = true
+        updateMouseEventPassthrough(at: pointerLocation)
         lastKnownRailTop = frame.maxY
     }
 
@@ -678,7 +718,8 @@ final class CapacityDockController {
             defaults: defaults
         )
 
-        let hovering = railPanel.frame.contains(NSEvent.mouseLocation)
+        let hovering = railContains(screenPoint: NSEvent.mouseLocation)
+        updateMouseEventPassthrough()
         pointerInsideRail = hovering
         if hovering {
             if !model.interaction.isRailHovered {
@@ -774,6 +815,7 @@ final class CapacityDockController {
             railPanel.setFrame(target, display: true)
         }
         if model.preferences.isEnabled { railPanel.orderFrontRegardless() }
+        updateMouseEventPassthrough()
         if !detailIsDismissing, let provider = model.hoveredProvider {
             layoutDetail(for: provider)
         }
@@ -850,6 +892,7 @@ final class CapacityDockController {
             stopDetailMotion()
             detailPanel.alphaValue = 1
             detailPanel.setFrame(target, display: true)
+            updateMouseEventPassthrough()
         }
     }
 
@@ -928,6 +971,7 @@ final class CapacityDockController {
                 }
                 railPanel?.contentView?.needsDisplay = true
                 railPanel?.alphaValue = alpha
+                self.updateMouseEventPassthrough()
             },
             completion: { [weak self] in
                 guard let self, generation == self.railMotionGeneration,
@@ -951,6 +995,7 @@ final class CapacityDockController {
                 if self.model.attachmentProgress != attachmentTo {
                     self.model.attachmentProgress = attachmentTo
                 }
+                self.updateMouseEventPassthrough()
                 if !self.detailIsDismissing, let provider = self.model.hoveredProvider {
                     self.layoutDetail(for: provider, transaction: .detailFollow)
                 }
@@ -980,10 +1025,11 @@ final class CapacityDockController {
             duration: CapacityDockMotion.duration(for: transaction, reduceMotion: reduceMotion),
             transaction: transaction,
             topAnchored: false,
-            update: { [weak detailPanel] frame, alpha, _ in
+            update: { [weak self, weak detailPanel] frame, alpha, _ in
                 detailPanel?.setFrame(frame, display: false)
                 detailPanel?.contentView?.needsDisplay = true
                 detailPanel?.alphaValue = alpha
+                self?.updateMouseEventPassthrough()
             },
             completion: { [weak self] in
                 guard let self, generation == self.detailMotionGeneration else { return }
@@ -997,6 +1043,7 @@ final class CapacityDockController {
                     self.detailPanel?.setFrame(target, display: true)
                     self.detailPanel?.alphaValue = 1
                 }
+                self.updateMouseEventPassthrough()
             }
         )
         detailMotion?.start()

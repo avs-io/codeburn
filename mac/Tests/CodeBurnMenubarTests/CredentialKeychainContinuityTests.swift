@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import CodeBurnMenubar
 
+private final class SendableUserDefaults: @unchecked Sendable {
+    let value: UserDefaults
+
+    init(_ value: UserDefaults) {
+        self.value = value
+    }
+}
+
 /// Implementation-continuity tests for option-3 evidence bar.
 /// Uses only InMemory/Controllable Keychain backends and temp Application Support —
 /// never the operator login Keychain or live credential files.
@@ -155,6 +163,30 @@ struct CredentialKeychainContinuityTests {
             #expect(try CapacityDockProviderCredentialStore.load(for: "clinepass").isEmpty)
             #expect(try CapacityDockProviderCredentialStore.load(for: "opencodego") == openCodeGo)
         }
+    }
+
+    @Test("concurrent provider-presence updates do not lose identifiers")
+    func providerPresenceUpdatesAreAtomic() async {
+        let suiteName = "codeburn.capacity-dock-presence.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let defaultsBox = SendableUserDefaults(defaults)
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let providerIDs = Array(CapacityDockPreferences.supportedProviders.prefix(24).map(\.id))
+
+        await withTaskGroup(of: Void.self) { group in
+            for providerID in providerIDs {
+                group.addTask {
+                    CapacityDockProviderCredentialPresence.set(
+                        true,
+                        for: providerID,
+                        defaults: defaultsBox.value
+                    )
+                }
+            }
+        }
+
+        #expect(CapacityDockProviderCredentialPresence.providerIDs(defaults: defaults) == Set(providerIDs))
     }
 
     @Test("ClinePass override survives a credential-store restart")

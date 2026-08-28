@@ -143,6 +143,58 @@ struct CapacityDockPlacementTests {
         #expect(repeated == first)
     }
 
+    @Test("detached dragging stays inside the usable desktop")
+    func detachedDragUsesVisibleFrame() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let usable = CGRect(x: 72, y: 80, width: 1368, height: 795)
+        let aboveMenuBar = CGRect(x: 500, y: 850, width: 88, height: 100)
+        let behindSideDock = CGRect(x: 50, y: 300, width: 88, height: 100)
+        let behindBottomDock = CGRect(x: 500, y: 50, width: 88, height: 100)
+
+        let topClamped = CapacityDockPlacement.clampedDragFrame(
+            aboveMenuBar,
+            screenFrame: screen,
+            visibleFrame: usable
+        )
+        let sideClamped = CapacityDockPlacement.clampedDragFrame(
+            behindSideDock,
+            screenFrame: screen,
+            visibleFrame: usable
+        )
+        let bottomClamped = CapacityDockPlacement.clampedDragFrame(
+            behindBottomDock,
+            screenFrame: screen,
+            visibleFrame: usable
+        )
+
+        #expect(topClamped.maxY == usable.maxY)
+        #expect(sideClamped.minX == usable.minX)
+        #expect(bottomClamped.minY == usable.minY)
+    }
+
+    @Test("an active edge snap may reach the physical edge while its other axis stays usable")
+    func edgeSnapPreservesRecoverability() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let usable = CGRect(x: 72, y: 48, width: 1368, height: 827)
+        let nearBottom = CGRect(x: 500, y: 8, width: 88, height: 100)
+        let nearRightAboveMenuBar = CGRect(x: 1360, y: 850, width: 88, height: 100)
+
+        let bottom = CapacityDockPlacement.clampedDragFrame(
+            nearBottom,
+            screenFrame: screen,
+            visibleFrame: usable
+        )
+        let right = CapacityDockPlacement.clampedDragFrame(
+            nearRightAboveMenuBar,
+            screenFrame: screen,
+            visibleFrame: usable
+        )
+
+        #expect(bottom.minY == 8)
+        #expect(right.maxX == screen.maxX)
+        #expect(right.maxY == usable.maxY)
+    }
+
     @Test("dragging selects the display currently containing the pointer")
     func dragCanCrossDisplays() {
         let screens = [

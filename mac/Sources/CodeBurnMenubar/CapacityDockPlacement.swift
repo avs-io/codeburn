@@ -199,12 +199,25 @@ enum CapacityDockPlacement {
         screenFrame: CGRect,
         visibleFrame: CGRect
     ) -> CGRect {
+        let candidate = attachmentCandidate(
+            railFrame: frame,
+            screenFrame: screenFrame,
+            visibleFrame: visibleFrame
+        )
         var result = frame
-        let lowestLeading = screenFrame.minX
-        let highestLeading = max(lowestLeading, screenFrame.maxX - result.width)
+        let horizontalBounds = switch candidate?.edge {
+        case .left, .right: screenFrame
+        case .top, .bottom, nil: visibleFrame
+        }
+        let verticalBounds = switch candidate?.edge {
+        case .bottom: screenFrame
+        case .left, .right, .top, nil: visibleFrame
+        }
+        let lowestLeading = horizontalBounds.minX
+        let highestLeading = max(lowestLeading, horizontalBounds.maxX - result.width)
         result.origin.x = min(max(result.minX, lowestLeading), highestLeading)
-        let lowestBottom = screenFrame.minY
-        let highestBottom = max(lowestBottom, screenFrame.maxY - result.height)
+        let lowestBottom = verticalBounds.minY
+        let highestBottom = max(lowestBottom, verticalBounds.maxY - result.height)
         result.origin.y = min(max(result.minY, lowestBottom), highestBottom)
         return result
     }
@@ -262,10 +275,31 @@ enum CapacityDockPlacement {
                 height: fittedSize.height
             )
         }
-        return PopoverPlacement.clampedFrame(
-            frame: desired,
-            visibleFrame: visibleFrame,
+        return clampedFrame(
+            desired,
+            to: visibleFrame,
             inset: detailInset
+        )
+    }
+
+    private static func clampedFrame(
+        _ frame: CGRect,
+        to visibleFrame: CGRect,
+        inset: CGFloat
+    ) -> CGRect {
+        let availableWidth = max(0, visibleFrame.width - inset * 2)
+        let availableHeight = max(0, visibleFrame.height - inset * 2)
+        let width = min(frame.width, availableWidth)
+        let height = min(frame.height, availableHeight)
+        let minX = visibleFrame.minX + inset
+        let maxX = max(minX, visibleFrame.maxX - inset - width)
+        let minY = visibleFrame.minY + inset
+        let maxY = max(minY, visibleFrame.maxY - inset - height)
+        return CGRect(
+            x: min(max(frame.minX, minX), maxX),
+            y: min(max(frame.minY, minY), maxY),
+            width: width,
+            height: height
         )
     }
 

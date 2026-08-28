@@ -188,8 +188,15 @@ enum CapacityDockProviderCredentialStore {
 /// index, and a missing item or explicit delete removes it.
 enum CapacityDockProviderCredentialPresence {
     static let key = "CodeBurnCapacityDockCredentialProviderIDs"
+    private static let lock = NSLock()
 
     static func providerIDs(defaults: UserDefaults = .standard) -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return providerIDsWithoutLock(defaults: defaults)
+    }
+
+    private static func providerIDsWithoutLock(defaults: UserDefaults) -> Set<String> {
         let known = Set(CapacityDockPreferences.supportedProviders.map(\.id))
         return Set(defaults.stringArray(forKey: key) ?? []).intersection(known)
     }
@@ -204,7 +211,8 @@ enum CapacityDockProviderCredentialPresence {
         defaults: UserDefaults = .standard
     ) {
         guard CapacityDockProvider(rawValue: providerID) != nil else { return }
-        var identifiers = providerIDs(defaults: defaults)
+        lock.lock()
+        var identifiers = providerIDsWithoutLock(defaults: defaults)
         if present {
             identifiers.insert(providerID)
         } else {
@@ -214,6 +222,7 @@ enum CapacityDockProviderCredentialPresence {
             .map(\.id)
             .filter(identifiers.contains)
         defaults.set(ordered, forKey: key)
+        lock.unlock()
         if Thread.isMainThread {
             NotificationCenter.default.post(
                 name: .capacityDockCredentialPresenceDidChange,
