@@ -19,7 +19,8 @@
 // fresh — the app `stage-cli` script does exactly that.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { cpSync, copyFileSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import electronPath from 'electron'
@@ -128,62 +129,86 @@ if (missing.length) {
 // a complete ready frame from resident serve; stop the child as soon as that
 // frame arrives so provider watcher shutdown latency is not part of packaging.
 const launchPath = join(stage, 'dist', 'launch.js')
-const electronEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
-const modelsHelp = execFileSync(electronPath, [launchPath, 'models', '--help'], {
-  env: electronEnv,
-  encoding: 'utf8',
-  timeout: 5_000,
-})
-if (!/^Usage: codeburn models\b/m.test(modelsHelp)) {
-  throw new Error('stage-cli: Electron launch shim lost ordinary CLI arguments')
+const smokeRoot = mkdtempSync(join(tmpdir(), 'codeburn-stage-smoke-'))
+// Packaging must not discover a developer's real provider corpus or inherit
+// provider-specific path overrides. Keep only process-launch essentials, then
+// point every standard user-data root at the disposable smoke directory.
+const electronEnv = {}
+for (const key of ['PATH', 'TMPDIR', 'TMP', 'TEMP', 'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'LANG', 'LC_ALL', 'LC_CTYPE']) {
+  if (process.env[key] !== undefined) electronEnv[key] = process.env[key]
 }
-
-await new Promise((resolve, reject) => {
-  const child = spawn(electronPath, [launchPath, 'serve', '--stdio'], {
-    env: electronEnv,
-    // Keep stdin open until readiness is observed. An ignored stdin is already
-    // at EOF, which starts serve shutdown while the gate is still reading the
-    // ready frame and makes a valid package race its own cleanup.
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  let stdout = ''
-  let stderr = ''
-  let settled = false
-  const finish = (error) => {
-    if (settled) return
-    settled = true
-    clearTimeout(timer)
-    child.kill()
-    if (error) reject(error)
-    else resolve()
-  }
-  const timer = setTimeout(() => {
-    finish(new Error(`stage-cli: Electron launch shim did not enter resident serve within 5s${stderr ? `: ${stderr.trim()}` : ''}`))
-  }, 5_000)
-  child.stderr.setEncoding('utf8')
-  child.stderr.on('data', chunk => { stderr += chunk })
-  child.stdout.setEncoding('utf8')
-  child.stdout.on('data', chunk => {
-    stdout += chunk
-    for (;;) {
-      const newline = stdout.indexOf('\n')
-      if (newline < 0) break
-      const line = stdout.slice(0, newline)
-      stdout = stdout.slice(newline + 1)
-      try {
-        const frame = JSON.parse(line)
-        if (frame?.ready === true) finish()
-      } catch {
-        finish(new Error('stage-cli: Electron resident serve emitted a malformed JSON frame'))
-      }
-    }
-  })
-  child.on('error', error => finish(new Error(`stage-cli: Electron resident serve failed to launch: ${error.message}`)))
-  // `close` waits for piped stdout to drain; `exit` can arrive first even when
-  // the valid ready frame is already buffered in the pipe.
-  child.on('close', code => {
-    if (!settled) finish(new Error(`stage-cli: Electron resident serve exited before ready (exit ${String(code)})`))
-  })
+Object.assign(electronEnv, {
+  ELECTRON_RUN_AS_NODE: '1',
+  HOME: smokeRoot,
+  USERPROFILE: smokeRoot,
+  APPDATA: join(smokeRoot, 'AppData', 'Roaming'),
+  LOCALAPPDATA: join(smokeRoot, 'AppData', 'Local'),
+  XDG_CACHE_HOME: join(smokeRoot, '.cache'),
+  XDG_CONFIG_HOME: join(smokeRoot, '.config'),
+  XDG_DATA_HOME: join(smokeRoot, '.local', 'share'),
+  CODEBURN_CACHE_DIR: join(smokeRoot, '.codeburn-cache'),
+  CODEBURN_DESKTOP_SESSIONS_DIR: join(smokeRoot, '.codeburn-desktop-sessions'),
 })
+
+try {
+  const modelsHelp = execFileSync(electronPath, [launchPath, 'models', '--help'], {
+    env: electronEnv,
+    encoding: 'utf8',
+    timeout: 5_000,
+  })
+  if (!/^Usage: codeburn models\b/m.test(modelsHelp)) {
+    throw new Error('stage-cli: Electron launch shim lost ordinary CLI arguments')
+  }
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(electronPath, [launchPath, 'serve', '--stdio'], {
+      env: electronEnv,
+      // Keep stdin open until readiness is observed. An ignored stdin is already
+      // at EOF, which starts serve shutdown while the gate is still reading the
+      // ready frame and makes a valid package race its own cleanup.
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const finish = (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.kill()
+      if (error) reject(error)
+      else resolve()
+    }
+    const timer = setTimeout(() => {
+      finish(new Error(`stage-cli: Electron launch shim did not enter resident serve within 5s${stderr ? `: ${stderr.trim()}` : ''}`))
+    }, 5_000)
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      stdout += chunk
+      for (;;) {
+        const newline = stdout.indexOf('\n')
+        if (newline < 0) break
+        const line = stdout.slice(0, newline)
+        stdout = stdout.slice(newline + 1)
+        try {
+          const frame = JSON.parse(line)
+          if (frame?.ready === true) finish()
+        } catch {
+          finish(new Error('stage-cli: Electron resident serve emitted a malformed JSON frame'))
+        }
+      }
+    })
+    child.on('error', error => finish(new Error(`stage-cli: Electron resident serve failed to launch: ${error.message}`)))
+    // `close` waits for piped stdout to drain; `exit` can arrive first even when
+    // the valid ready frame is already buffered in the pipe.
+    child.on('close', code => {
+      if (!settled) finish(new Error(`stage-cli: Electron resident serve exited before ready (exit ${String(code)})`))
+    })
+  })
+} finally {
+  rmSync(smokeRoot, { recursive: true, force: true })
+}
 
 console.log(`stage-cli: staged ${topLevel.size} production packages -> ${stage}`)
