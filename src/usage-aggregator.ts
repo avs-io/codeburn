@@ -456,7 +456,19 @@ export function buildDurableOverviewFromNormalizedIndex(
       )
     : []
   const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
-  const days = pf === 'all' ? allDays : allDays.map(day => sliceDayToProvider(day, pf))
+  const normalizedByDate = new Map(normalizedDays.map(day => [day.date, day]))
+  const days = pf === 'all' ? allDays : allDays.map(day => {
+    if (Object.hasOwn(day.providers, pf)) return sliceDayToProvider(day, pf)
+    const normalized = normalizedByDate.get(day.date)
+    // The shared cache can be complete for a date while lacking this selected
+    // provider's slice (for example, Claude was cached before Codex appeared).
+    // Fill only that absent slice from the provider-scoped normalized index.
+    // An existing slice remains authoritative, retaining carried/expired money
+    // and preventing the surviving source from being counted twice.
+    return normalized && Object.hasOwn(normalized.providers, pf)
+      ? sliceDayToProvider(normalized, pf)
+      : sliceDayToProvider(day, pf)
+  })
   const data = buildPeriodDataFromDays(days, periodInfo.label)
 
   // Fields whose durable day rows cannot project under a project filter come

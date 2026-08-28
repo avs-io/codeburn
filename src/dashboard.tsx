@@ -1832,6 +1832,13 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const selectIndexedPeriod = useCallback((np: Period): boolean => {
     const index = historyIndexRef.current
     if (!index || index.provider !== activeProvider || !dashboardIndexSupportsPeriod(index, np)) return false
+    // Indexed selection publishes synchronously, so it must also supersede any
+    // async day/period reload already in flight. Otherwise that older request
+    // can pass its generation checks later and paint day-only data under this
+    // newly selected period label.
+    reloadGenerationRef.current++
+    pendingReloadRef.current = null
+    if (debounceRef.current) clearTimeout(debounceRef.current)
     const selected = selectDashboardHistoryIndex(index, np)
     setPeriod(np)
     setDailyHistoryCursor(0)

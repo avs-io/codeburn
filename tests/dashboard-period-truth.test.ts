@@ -7,6 +7,7 @@ import { describe, expect, it, onTestFinished } from 'vitest'
 
 import { InteractiveDashboard, selectDashboardHistoryIndex, type DashboardHistoryIndex } from '../src/dashboard.js'
 import type { DailyCache } from '../src/daily-cache.js'
+import { aggregateProjectsIntoDays } from '../src/day-aggregator.js'
 import type { ProjectSummary, SessionSummary } from '../src/types.js'
 
 const EMPTY_BREAKDOWN = {
@@ -41,21 +42,25 @@ function emptyDailyCache(): DailyCache {
   return { version: 29, savingsConfigHash: '', lastComputedDate: null, days: [], complete: true }
 }
 
-function historicalProviderProject(): ProjectSummary {
-  const timestamp = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString()
+function historicalProviderProject(
+  provider = 'claude',
+  cost = 7,
+  timestamp = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+): ProjectSummary {
+  const id = `${provider}-historical-${cost}`
   const call = {
-    provider: 'claude', model: 'claude-sonnet-4-5', costUSD: 7, timestamp,
+    provider, model: `${provider}-model`, costUSD: cost, timestamp,
     usage: { inputTokens: 10, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0 },
     tools: [], mcpTools: [], skills: [], subagentTypes: [], hasAgentSpawn: false,
-    hasPlanMode: false, speed: 'standard' as const, bashCommands: [], deduplicationKey: 'claude-historical',
+    hasPlanMode: false, speed: 'standard' as const, bashCommands: [], deduplicationKey: id,
   }
   return {
-    project: 'p', projectPath: '/tmp/p', totalCostUSD: 7, totalApiCalls: 1,
+    project: 'p', projectPath: '/tmp/p', totalCostUSD: cost, totalApiCalls: 1,
     sessions: [{
-      sessionId: 'claude-historical', project: 'p', firstTimestamp: timestamp, lastTimestamp: timestamp,
-      totalCostUSD: 7, totalSavingsUSD: 0, totalInputTokens: 10, totalOutputTokens: 5,
+      sessionId: id, project: 'p', firstTimestamp: timestamp, lastTimestamp: timestamp,
+      totalCostUSD: cost, totalSavingsUSD: 0, totalInputTokens: 10, totalOutputTokens: 5,
       totalCacheReadTokens: 0, totalCacheWriteTokens: 0, apiCalls: 1,
-      turns: [{ userMessage: 'hi', timestamp, sessionId: 'claude-historical', category: 'coding', retries: 0, hasEdits: false, assistantCalls: [call] }],
+      turns: [{ userMessage: 'hi', timestamp, sessionId: id, category: 'coding', retries: 0, hasEdits: false, assistantCalls: [call] }],
       modelBreakdown: {}, toolBreakdown: {}, mcpBreakdown: {}, bashBreakdown: {},
       categoryBreakdown: { ...EMPTY_BREAKDOWN }, skillBreakdown: {}, subagentBreakdown: {},
     }],
@@ -73,6 +78,32 @@ describe('interactive period truth', () => {
       calls: 1,
       sessions: 1,
     })
+  })
+
+  it('fills only a missing provider slice on a complete shared historical day', () => {
+    const timestamp = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString()
+    const claude = historicalProviderProject('claude', 3, timestamp)
+    const codex = historicalProviderProject('codex', 7, timestamp)
+    const sharedCache: DailyCache = {
+      ...emptyDailyCache(),
+      days: aggregateProjectsIntoDays([claude]),
+    }
+
+    expect(selectDashboardHistoryIndex({
+      provider: 'codex', normalizedProjects: [codex], cache: sharedCache, planUsages: [], readyThrough: 'lifetime',
+    }, 'lifetime').durable).toMatchObject({ cost: 7, calls: 1, sessions: 1 })
+
+    const cachedCodex = historicalProviderProject('codex', 4, timestamp)
+    const cacheWithCodex: DailyCache = {
+      ...emptyDailyCache(),
+      days: aggregateProjectsIntoDays([claude, cachedCodex]),
+    }
+    expect(selectDashboardHistoryIndex({
+      provider: 'codex', normalizedProjects: [codex], cache: cacheWithCodex, planUsages: [], readyThrough: 'lifetime',
+    }, 'lifetime').durable).toMatchObject({ cost: 4, calls: 1, sessions: 1 })
+    expect(selectDashboardHistoryIndex({
+      provider: 'codex', normalizedProjects: [], cache: cacheWithCodex, planUsages: [], readyThrough: 'lifetime',
+    }, 'lifetime').durable).toMatchObject({ cost: 4, calls: 1, sessions: 1 })
   })
 
   it('warns honestly before a large first history index', async () => {
