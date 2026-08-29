@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- **A today-only status query no longer waits on the 365-day daily-history backfill.** Headlines for `--period today` parse today and load whatever durable days are already on disk. 7D / 30D / month / lifetime still hydrate the cache so carried history and gap-fill stay exact.
+
 ## 0.9.23 - 2026-08-29
 
 ### Added
