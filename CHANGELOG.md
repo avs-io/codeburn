@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- **A warm unfiltered 7D / 30D / month status query no longer re-parses historical session files when the daily cache is already complete.** Headlines still union that cache with a live today parse, so carried expired-source days stay in the total; session-derived details (workflow, top sessions, PR rows) describe today. Incomplete caches, --project/--exclude, and --days keep the previous full-range parse.
+
 ## 0.9.23 - 2026-08-29
 
 ### Added

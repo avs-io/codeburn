@@ -544,6 +544,16 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const isTodayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
 
   const cache = await hydrateCache()
+  // A complete daily cache already holds every historical day through yesterday.
+  // Re-parsing the full 7D/30D/month range on a warm switch only rebuilds
+  // session-derived details (workflow, top sessions, PR rows) while the
+  // headline still unions cache + today. When the cache is complete, parse
+  // today for the live half and leave history on the durable days. Incomplete
+  // caches keep the full-range parse so backfill can still fill gaps.
+  const projectInclude = (opts.project ?? []).map(s => s.toLowerCase())
+  const projectExclude = (opts.exclude ?? []).map(s => s.toLowerCase())
+  const hasProjectFilter = projectInclude.length > 0 || projectExclude.length > 0
+  const historyFromCompleteCache = cache.complete === true && !isTodayOnly && !hasProjectFilter && !daysSelection
 
   // Today's live data always comes from an all-provider parse so the union (and
   // any per-provider slice of it) sees every provider's today. `todayAllDays` is
@@ -554,6 +564,11 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   let scanRange: DateRange
   if (pf === 'all') {
     if (isTodayOnly) {
+      const raw = fp(await parseAllSessions(todayRange, 'all'))
+      liveProjects = raw
+      scanRange = todayRange
+      todayAllDays = aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
+    } else if (historyFromCompleteCache) {
       const raw = fp(await parseAllSessions(todayRange, 'all'))
       liveProjects = raw
       scanRange = todayRange
@@ -577,18 +592,16 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
     // Provider-filtered: today's all-provider parse feeds the union (sliced
     // below); the provider-scoped parse feeds the detail/enrichment fields.
     todayAllDays = aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
-    const rawProv = fp(await parseAllSessions(isTodayOnly ? todayRange : periodInfo.range, pf))
-    liveProjects = daysSelection && !isTodayOnly ? filterProjectsByDays(rawProv, daysSelection.days) : rawProv
-    scanRange = isTodayOnly ? todayRange : periodInfo.range
+    const providerRange = isTodayOnly || historyFromCompleteCache ? todayRange : periodInfo.range
+    const rawProv = fp(await parseAllSessions(providerRange, pf))
+    liveProjects = daysSelection && providerRange !== todayRange ? filterProjectsByDays(rawProv, daysSelection.days) : rawProv
+    scanRange = providerRange
   }
 
   // Name filters must reach the cache-sourced days too. Today's parse is already
   // name-filtered above (`fp`), but the historical remainder comes straight out
   // of the day cache, so without this slice a --project/--exclude headline
   // counted every expired-source day whole while the detail panels did not.
-  const projectInclude = (opts.project ?? []).map(s => s.toLowerCase())
-  const projectExclude = (opts.exclude ?? []).map(s => s.toLowerCase())
-  const hasProjectFilter = projectInclude.length > 0 || projectExclude.length > 0
   // What a filtered total cannot claim, and therefore has to leave out: a cached
   // day with no project split at all, or — with a provider filter also active,
   // since the headline then reads that provider's slice — a slice carried from a
