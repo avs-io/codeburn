@@ -7,7 +7,7 @@
 - **A today-only status query no longer waits on the 365-day daily-history backfill.** Headlines for `--period today` parse today and load whatever durable days are already on disk. 7D / 30D / month / lifetime still hydrate the cache so carried history and gap-fill stay exact.
 - **A today-only status query defers files whose mtime predates today (plus the existing 48h clock-skew margin) on a cold cache.** Same first-paint floor the TUI/serve already use. Honest when session-log mtimes are not newer than their last event; the perf fixture now stamps mtimes from event timestamps so the hill can see it.
 - **A today-only first-paint status query no longer runs optimize detection.** Headlines still come from the floored today parse plus any on-disk daily cache. The optimize block is empty until a later unfloored fill; --no-optimize is unchanged.
-- **A cold menubar-json query no longer fingerprints the whole corpus before first paint when no status snapshot exists.** A complete payload is fingerprinted after the parse, so later polls keep the fast path. A today-only first-paint may now persist that snapshot: historical files deferred by the 48h floor are outside today. Multi-day first paints stay unsaved.
+- **A cold menubar-json query no longer fingerprints the whole corpus before first paint when no status snapshot exists.** A complete payload is fingerprinted after the parse, so later polls keep the fast path.
 - **A today-only first-paint menubar-json query now persists its status snapshot.** Historical files deferred by the 48h floor are outside today, so the payload is a complete answer for --period today. Later identical polls reuse it. Multi-day first paints stay unsaved.
 
 ## 0.9.23 - 2026-08-29
