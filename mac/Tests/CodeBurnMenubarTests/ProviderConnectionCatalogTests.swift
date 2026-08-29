@@ -49,28 +49,6 @@ struct ProviderConnectionCatalogTests {
         #expect(live == ["antigravity", "claude", "clinepass", "codex", "copilot", "gemini", "kimi"])
     }
 
-    @Test("manual cookie and workspace fields are explicit catalog metadata")
-    func explicitCapabilityMetadata() {
-        #expect(Set(ProviderConnectionCatalog.providers.filter(\.supportsManualCookie).map(\.id)) == [
-            "abacus", "alibaba", "alibabatokenplan", "amp", "augment", "commandcode", "copilot",
-            "cursor", "factory", "grok", "kimi", "longcat", "manus", "minimax", "mimo", "mistral",
-            "notion", "ollama", "opencode", "opencodego", "perplexity", "qoder", "qwencloud",
-            "stepfun", "t3chat", "windsurf", "zoommate",
-        ])
-        #expect(Set(ProviderConnectionCatalog.providers.filter(\.supportsWorkspaceID).map(\.id)) == [
-            "azureopenai", "deepgram", "devin", "notion", "openai", "opencode", "opencodego", "xai",
-        ])
-
-        #expect(ProviderConnectionCapabilities.supportsManualCookie("commandcode"))
-        #expect(ProviderConnectionCapabilities.supportsManualCookie("opencode"))
-        #expect(!ProviderConnectionCapabilities.supportsManualCookie("devin"))
-        #expect(!ProviderConnectionCapabilities.supportsManualCookie("groq"))
-        #expect(ProviderConnectionCapabilities.supportsWorkspaceID("notion"))
-        #expect(ProviderConnectionCapabilities.supportsWorkspaceID("deepgram"))
-        #expect(!ProviderConnectionCapabilities.supportsWorkspaceID("clinepass"))
-        #expect(!ProviderConnectionCapabilities.supportsManualCookie("missing-provider"))
-        #expect(!ProviderConnectionCapabilities.supportsWorkspaceID("missing-provider"))
-    }
 }
 
 private extension Array where Element == ProviderConnectionCatalogEntry {

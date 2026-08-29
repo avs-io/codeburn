@@ -1001,6 +1001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 self.pendingRefreshWork?.cancel()
                 let work = DispatchWorkItem { [weak self] in
                     self?.refreshStatusButton()
+                    self?.seedCapacityDockFromConnectedProviders()
                     self?.capacityDockController?.refreshQuotaPresentation()
                     self?.observeStore()
                 }
@@ -1008,6 +1009,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
             }
         }
+    }
+
+    /// Fresh-install default: mirror the connected subscriptions (capped) into
+    /// the dock until the user first edits the set. Cheap — reads cached quota
+    /// state — and no-ops once seeded or once the user takes over.
+    private func seedCapacityDockFromConnectedProviders() {
+        let connected = CapacityDockPreferences.supportedProviders
+            .filter { store.capacityDockProviderIsConnected($0) }
+        CapacityDockPreferences.autoSeedFromConnected(connected)
     }
 
     // MARK: - Status Item
@@ -1462,6 +1472,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
         menu.addItem(settingsItem)
 
+        let dockSettingsItem = NSMenuItem(title: "Capacity Dock Settings…", action: #selector(openCapacityDockSettings), keyEquivalent: "")
+        dockSettingsItem.target = self
+        dockSettingsItem.image = NSImage(systemSymbolName: "rectangle.trailinghalf.inset.filled.arrow.trailing", accessibilityDescription: "Capacity Dock")
+        menu.addItem(dockSettingsItem)
+
         let refreshNow = NSMenuItem(title: "Refresh Now", action: #selector(refreshNowAction), keyEquivalent: "")
         refreshNow.target = self
         menu.addItem(refreshNow)
@@ -1527,6 +1542,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         openSettings()
     }
 
+    @objc private func openCapacityDockSettings() {
+        // The Capacity Dock controls live in the General pane; jump straight there.
+        store.settingsTab = "general"
+        openSettings()
+    }
+
     @objc private func openSettings() {
         // Accessory-policy apps (no Dock icon, no main menu) don't get the
         // SwiftUI Settings scene wired into the responder chain reliably, so
@@ -1555,6 +1576,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         settingsWindowController = controller
         NSApp.activate(ignoringOtherApps: true)
         controller.showWindow(nil)
+        // SwiftUI resizes the window past the initial contentRect after first
+        // layout, which drifts the earlier center(). Re-center once that settles.
+        DispatchQueue.main.async { [weak window] in window?.center() }
     }
 
     @objc private func refreshNowAction() {

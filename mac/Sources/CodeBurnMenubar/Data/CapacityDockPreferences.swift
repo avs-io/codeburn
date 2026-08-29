@@ -155,9 +155,11 @@ enum CapacityDockPreferences {
     static let scaleKey = "CodeBurnCapacityDockScale"
     static let themeKey = "CodeBurnCapacityDockTheme"
     static let gaugeShapeKey = "CodeBurnCapacityDockGaugeShape"
+    static let manualSelectionKey = "CodeBurnCapacityDockManualSelection"
 
     static let defaultProvider: CapacityDockProvider = .codex
     static let supportedProviders = CapacityDockProvider.allCases
+    static let maxAutoProviders = 5
     static let defaultScale = 0.85
     static let scaleRange = 0.7 ... 1.2
 
@@ -229,7 +231,7 @@ enum CapacityDockPreferences {
             theme: defaults.string(forKey: themeKey)
                 .flatMap(CapacityDockTheme.init(rawValue:)) ?? .graphite,
             gaugeShape: defaults.string(forKey: gaugeShapeKey)
-                .flatMap(CapacityDockGaugeShape.init(rawValue:)) ?? .circle
+                .flatMap(CapacityDockGaugeShape.init(rawValue:)) ?? .squircle
         )
     }
 
@@ -248,6 +250,32 @@ enum CapacityDockPreferences {
             .flatMap(CapacityDockProvider.init(rawValue:))
         let preferred = normalizedPreferred(currentPreferred, selected: normalized)
         defaults.set(normalized.map(\.rawValue), forKey: selectedProvidersKey)
+        defaults.set(preferred.rawValue, forKey: preferredProviderKey)
+        // The user has taken over the dock provider set, so stop auto-seeding
+        // from connected subscriptions and respect their choice from now on.
+        defaults.set(true, forKey: manualSelectionKey)
+        notifyChanged()
+    }
+
+    /// Until the user manually edits the dock set, mirror the connected
+    /// subscriptions (capped) so a fresh install shows what's actually active.
+    /// No-ops once `manualSelectionKey` latches or the set already matches.
+    static func autoSeedFromConnected(
+        _ connected: [CapacityDockProvider],
+        defaults: UserDefaults = .standard
+    ) {
+        guard !defaults.bool(forKey: manualSelectionKey) else { return }
+        let desired = supportedProviders
+            .filter(connected.contains)
+            .prefix(maxAutoProviders)
+        let desiredIDs = desired.map(\.rawValue)
+        guard !desiredIDs.isEmpty else { return }  // nothing active yet — wait
+        guard defaults.stringArray(forKey: selectedProvidersKey) != desiredIDs else { return }
+        defaults.set(desiredIDs, forKey: selectedProvidersKey)
+        let preferred = normalizedPreferred(
+            defaults.string(forKey: preferredProviderKey).flatMap(CapacityDockProvider.init(rawValue:)),
+            selected: Array(desired)
+        )
         defaults.set(preferred.rawValue, forKey: preferredProviderKey)
         notifyChanged()
     }

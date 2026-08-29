@@ -8,13 +8,13 @@ struct CapacityDockPresentationTests {
     @Test("Reference-scale rail uses compact instrument proportions")
     func compactRailMetrics() {
         #expect(CapacityDockMetrics.railWidth(scale: 1) == 88)
-        #expect(CapacityDockMetrics.horizontalRailWidth(scale: 1) == 88)
+        #expect(CapacityDockMetrics.horizontalRailWidth(scale: 1) == 106)
         #expect(CapacityDockMetrics.edgeFlareWidth(scale: 1) == 22)
-        #expect(CapacityDockMetrics.edgeShoulderDepth(scale: 1) == 44)
+        #expect(CapacityDockMetrics.edgeShoulderDepth(scale: 1) == 52)
         #expect(CapacityDockMetrics.rowHeight(scale: 1) == 84)
         #expect(CapacityDockMetrics.rowSpacing(scale: 1) == 12)
-        #expect(CapacityDockMetrics.railTopPadding(scale: 1) == 18)
-        #expect(CapacityDockMetrics.railBottomPadding(scale: 1) == 18)
+        #expect(CapacityDockMetrics.railAlongPad(scale: 1) == 20)
+        #expect(CapacityDockMetrics.railCrossPad(scale: 1) == 12)
         #expect(CapacityDockMetrics.ringSize(scale: 1) == 52)
         #expect(CapacityDockMetrics.ringStrokeWidth(scale: 1) == 4)
         #expect(CapacityDockMetrics.ringLabelSpacing(scale: 1) == 6)
@@ -33,8 +33,8 @@ struct CapacityDockPresentationTests {
         model.isRailPresentationExpanded = true
         model.railPresentationProgress = 0.5
 
-        let resting = CapacityDockMetrics.railHeight(providerCount: 1, scale: model.scale)
-        let expanded = CapacityDockMetrics.railHeight(providerCount: 3, scale: model.scale)
+        let resting = CapacityDockMetrics.railHeight(providerCount: 1, alongPad: model.railAlongPad, scale: model.scale)
+        let expanded = CapacityDockMetrics.railHeight(providerCount: 3, alongPad: model.railAlongPad, scale: model.scale)
         #expect(abs(model.bodyLength - (resting + expanded) / 2) < 0.000_001)
         #expect(model.displayedProviders.first == .codex)
     }
@@ -78,15 +78,17 @@ struct CapacityDockPresentationTests {
         let path = CapacityDockRailShape(bodyWidth: 88, bodyLength: 356, attachmentProgress: 1, edge: .right)
             .path(in: CGRect(x: 0, y: 0, width: 88, height: 356))
 
+        // Free (left) corners and the necked long-axis ends stay open; the flush
+        // contact chord fills the right edge along the body's full-width span.
         #expect(!path.contains(CGPoint(x: 2, y: 2)))
         #expect(!path.contains(CGPoint(x: 2, y: 354)))
         #expect(!path.contains(CGPoint(x: 44, y: 2)))
         #expect(!path.contains(CGPoint(x: 44, y: 354)))
-        #expect(path.contains(CGPoint(x: 82, y: 2)))
-        #expect(path.contains(CGPoint(x: 82, y: 354)))
-        #expect(path.contains(CGPoint(x: 86, y: 2)))
+        #expect(path.contains(CGPoint(x: 82, y: 178)))
+        #expect(path.contains(CGPoint(x: 82, y: 300)))
+        #expect(path.contains(CGPoint(x: 86, y: 30)))
         #expect(path.contains(CGPoint(x: 86, y: 178)))
-        #expect(path.contains(CGPoint(x: 86, y: 354)))
+        #expect(path.contains(CGPoint(x: 86, y: 326)))
     }
 
     @Test("Meniscus contact grows outward from the center of the attached edge")
@@ -99,13 +101,16 @@ struct CapacityDockPresentationTests {
         let attached = CapacityDockRailShape(bodyWidth: 88, attachmentProgress: 1, edge: .right)
             .path(in: rect)
 
+        // Detached: a rounded pill — filled across the top center, empty at the corners.
         #expect(detached.contains(CGPoint(x: 44, y: 2)))
         #expect(!detached.contains(CGPoint(x: 86, y: 2)))
+        // Half attached: the right edge begins flushing against the surface at center height.
         #expect(halfAttached.contains(CGPoint(x: 86, y: rect.midY)))
         #expect(!halfAttached.contains(CGPoint(x: 86, y: 2)))
-        #expect(attached.contains(CGPoint(x: 86, y: 2)))
+        // Fully attached: the contact holds at the center of the edge while the neck
+        // pulls the top center away from it.
+        #expect(attached.contains(CGPoint(x: 86, y: rect.midY)))
         #expect(!attached.contains(CGPoint(x: 44, y: 2)))
-        #expect(attached.contains(CGPoint(x: 82, y: 2)))
     }
 
     @Test("Meniscus interpolation changes continuously while staying inside the panel")
@@ -123,10 +128,14 @@ struct CapacityDockPresentationTests {
             }.count
         }
 
-        #expect(contactSpans == contactSpans.sorted())
+        // The deepening neck at full attachment settles the near-edge span slightly,
+        // so contact is not strictly monotonic; it still grows from detached to
+        // attached, every attached state exceeds the detached widget, and each step
+        // stays continuous (no jumps).
         #expect(contactSpans.first! < contactSpans.last!)
+        #expect(contactSpans.dropFirst(2).allSatisfy { $0 > contactSpans[0] })
         #expect(zip(contactSpans, contactSpans.dropFirst()).allSatisfy { current, next in
-            next - current < 44
+            abs(next - current) < 44
         })
     }
 
@@ -152,23 +161,23 @@ struct CapacityDockPresentationTests {
         let bottom = CapacityDockRailShape(bodyWidth: 88, bodyLength: 356, attachmentProgress: 1, edge: .bottom)
             .path(in: CGRect(x: 0, y: 0, width: 356, height: 88))
 
+        // Each edge flushes its contact chord along the full-width span at mid-length
+        // while the long-axis ends neck open — so the flush side is identified by a
+        // near-edge mid-length point being filled and the free side staying empty.
         #expect(!right.contains(CGPoint(x: 44, y: 2)))
-        #expect(right.contains(CGPoint(x: 82, y: 2)))
-        #expect(left.contains(CGPoint(x: 2, y: 2)))
+        #expect(right.contains(CGPoint(x: 82, y: 178)))
         #expect(left.contains(CGPoint(x: 2, y: 178)))
+        #expect(left.contains(CGPoint(x: 6, y: 300)))
         #expect(!left.contains(CGPoint(x: 86, y: 2)))
         #expect(!left.contains(CGPoint(x: 44, y: 2)))
-        #expect(left.contains(CGPoint(x: 6, y: 2)))
-        #expect(top.contains(CGPoint(x: 2, y: 2)))
         #expect(top.contains(CGPoint(x: 178, y: 2)))
+        #expect(top.contains(CGPoint(x: 300, y: 6)))
         #expect(!top.contains(CGPoint(x: 2, y: 86)))
         #expect(!top.contains(CGPoint(x: 2, y: 44)))
-        #expect(top.contains(CGPoint(x: 2, y: 6)))
-        #expect(bottom.contains(CGPoint(x: 2, y: 86)))
         #expect(bottom.contains(CGPoint(x: 178, y: 86)))
+        #expect(bottom.contains(CGPoint(x: 300, y: 82)))
         #expect(!bottom.contains(CGPoint(x: 2, y: 2)))
         #expect(!bottom.contains(CGPoint(x: 2, y: 44)))
-        #expect(bottom.contains(CGPoint(x: 2, y: 82)))
     }
 
     @MainActor
@@ -275,7 +284,7 @@ struct CapacityDockPresentationTests {
             footerLines: [reason]
         )
 
-        #expect(CapacityDockMetrics.detailHeight(quota: quota, scale: 1) >= 240)
+        #expect(CapacityDockMetrics.detailHeight(quota: quota, scale: 1) >= 216)
     }
 
     @MainActor

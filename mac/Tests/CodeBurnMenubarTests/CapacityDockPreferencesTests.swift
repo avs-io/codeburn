@@ -24,7 +24,7 @@ struct CapacityDockPreferencesTests {
         #expect(snapshot.normalizedVerticalOffset == nil)
         #expect(snapshot.scale == 0.85)
         #expect(snapshot.theme == .graphite)
-        #expect(snapshot.gaugeShape == .circle)
+        #expect(snapshot.gaugeShape == .squircle)
     }
 
     @Test("dock material theme persists independently from placement")
@@ -154,5 +154,37 @@ struct CapacityDockPreferencesTests {
 
         CapacityDockPreferences.setScale(0.8, defaults: defaults)
         #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.8)
+    }
+
+    @Test("auto-seed mirrors connected subscriptions in product order, capped at five")
+    func autoSeedCapsAndOrders() {
+        let defaults = defaults()
+        let connected = Array(CapacityDockPreferences.supportedProviders.prefix(6)).reversed()
+
+        CapacityDockPreferences.autoSeedFromConnected(Array(connected), defaults: defaults)
+
+        let expected = Array(CapacityDockPreferences.supportedProviders.prefix(CapacityDockPreferences.maxAutoProviders))
+        let snapshot = CapacityDockPreferences.load(defaults: defaults)
+        #expect(snapshot.selectedProviders == expected)
+        #expect(snapshot.selectedProviders.count == 5)
+    }
+
+    @Test("auto-seed no-ops once the user has manually chosen providers")
+    func autoSeedRespectsManualLatch() {
+        let defaults = defaults()
+        CapacityDockPreferences.setSelectedProviders([.claude], defaults: defaults)
+
+        CapacityDockPreferences.autoSeedFromConnected([.codex, .gemini], defaults: defaults)
+
+        #expect(CapacityDockPreferences.load(defaults: defaults).selectedProviders == [.claude])
+    }
+
+    @Test("auto-seed no-ops when nothing is connected yet")
+    func autoSeedIgnoresEmptyConnected() {
+        let defaults = defaults()
+
+        CapacityDockPreferences.autoSeedFromConnected([], defaults: defaults)
+
+        #expect(CapacityDockPreferences.load(defaults: defaults).selectedProviders == [.codex])
     }
 }

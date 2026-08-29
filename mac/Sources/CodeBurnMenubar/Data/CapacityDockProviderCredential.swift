@@ -5,19 +5,13 @@ import Foundation
 struct CapacityDockProviderCredential: Codable, Equatable, Sendable {
     var sourceMode: String = ProviderReferenceSourceMode.automatic.rawValue
     var apiKey: String = ""
-    var secretKey: String = ""
-    var cookieHeader: String = ""
-    var region: String = ""
-    var workspaceID: String = ""
-    var enterpriseHost: String = ""
 
     var resolvedSourceMode: ProviderReferenceSourceMode {
         ProviderReferenceSourceMode(rawValue: sourceMode) ?? .automatic
     }
 
     var isEmpty: Bool {
-        [apiKey, secretKey, cookieHeader, region, workspaceID, enterpriseHost]
-            .allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && resolvedSourceMode == .automatic
     }
 
@@ -27,13 +21,7 @@ struct CapacityDockProviderCredential: Codable, Equatable, Sendable {
     var sanitizedOverride: CapacityDockProviderCredentialOverride {
         CapacityDockProviderCredentialOverride(
             sourceMode: resolvedSourceMode,
-            apiKey: cleaned(apiKey),
-            secretKey: cleaned(secretKey),
-            cookieHeader: cleaned(cookieHeader),
-            usesManualCookie: cleaned(cookieHeader) != nil,
-            region: cleaned(region),
-            workspaceID: cleaned(workspaceID),
-            enterpriseHost: cleaned(enterpriseHost)
+            apiKey: cleaned(apiKey)
         )
     }
 
@@ -46,12 +34,6 @@ struct CapacityDockProviderCredential: Codable, Equatable, Sendable {
 struct CapacityDockProviderCredentialOverride: Equatable, Sendable {
     var sourceMode: ProviderReferenceSourceMode
     var apiKey: String?
-    var secretKey: String?
-    var cookieHeader: String?
-    var usesManualCookie: Bool
-    var region: String?
-    var workspaceID: String?
-    var enterpriseHost: String?
 }
 
 enum CapacityDockProviderCredentialStoreError: LocalizedError, Equatable {

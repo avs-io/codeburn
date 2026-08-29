@@ -76,10 +76,10 @@ enum CapacityDockPlacement {
         let top: CGFloat
         switch dockedEdge {
         case .top:
-            // The physical top edge is occupied by the menu bar. Treat the
-            // usable edge immediately below it as the top docking surface so
-            // the rail remains visible and the snap lane is reachable.
-            top = visibleFrame.maxY
+            // Sit flush against the physical top edge (the notch/menu-bar band),
+            // like the system notch, so the concave shoulders neck into the very
+            // top of the screen with no gap below the menu bar.
+            top = screenFrame.maxY
         case .bottom:
             top = screenFrame.minY + fittedSize.height
         case .left, .right, nil:
@@ -150,7 +150,7 @@ enum CapacityDockPlacement {
         let distances: [(CapacityDockEdge, CGFloat)] = [
             (.left, abs(railFrame.minX - screenFrame.minX)),
             (.right, abs(screenFrame.maxX - railFrame.maxX)),
-            (.top, abs(visibleFrame.maxY - railFrame.maxY)),
+            (.top, max(0, visibleFrame.maxY - railFrame.maxY)),
             (.bottom, abs(railFrame.minY - screenFrame.minY)),
         ]
         return distances
@@ -167,7 +167,7 @@ enum CapacityDockPlacement {
         let distances: [(CapacityDockEdge, CGFloat)] = [
             (.left, abs(railFrame.minX - screenFrame.minX)),
             (.right, abs(screenFrame.maxX - railFrame.maxX)),
-            (.top, abs(visibleFrame.maxY - railFrame.maxY)),
+            (.top, max(0, visibleFrame.maxY - railFrame.maxY)),
             (.bottom, abs(railFrame.minY - screenFrame.minY)),
         ]
         guard let nearest = distances.min(by: { $0.1 < $1.1 }),

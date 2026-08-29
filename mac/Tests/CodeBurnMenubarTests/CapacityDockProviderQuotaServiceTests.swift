@@ -18,8 +18,7 @@ struct CapacityDockProviderQuotaServiceTests {
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
         let credential = CapacityDockProviderCredential(
             sourceMode: "api",
-            apiKey: "  synthetic-clinepass-key  ",
-            secretKey: "must-not-be-used"
+            apiKey: "  synthetic-clinepass-key  "
         )
 
         let result = try await service.fetch(provider: provider, credential: credential)

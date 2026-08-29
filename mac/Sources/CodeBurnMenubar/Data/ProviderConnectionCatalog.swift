@@ -40,11 +40,6 @@ struct ProviderConnectionCatalogEntry: Equatable, Sendable {
     let sourceModes: Set<ProviderReferenceSourceMode>
     let authMethods: Set<ProviderAuthMethod>
     let hasLiveCodeBurnQuotaAdapter: Bool
-    let supportsManualCookie: Bool
-    let supportsWorkspaceID: Bool
-    let usesSecretKey: Bool
-    let usesRegion: Bool
-    let supportsEnterpriseHost: Bool
 }
 
 /// Declarative connection inventory owned by CodeBurn. The live flag identifies
@@ -155,42 +150,13 @@ enum ProviderConnectionCatalog {
             displayName: displayName,
             sourceModes: sourceModes,
             authMethods: authMethods,
-            hasLiveCodeBurnQuotaAdapter: live,
-            supportsManualCookie: manualCookieIDs.contains(id),
-            supportsWorkspaceID: workspaceIDIDs.contains(id),
-            usesSecretKey: secretKeyIDs.contains(id),
-            usesRegion: regionIDs.contains(id),
-            supportsEnterpriseHost: enterpriseHostIDs.contains(id)
+            hasLiveCodeBurnQuotaAdapter: live
         )
     }
 
     static func entry(id: String) -> ProviderConnectionCatalogEntry? {
         providers.first { $0.id == id }
     }
-
-    private static let manualCookieIDs: Set<String> = [
-        "abacus", "alibaba", "alibabatokenplan", "amp", "augment", "commandcode", "copilot",
-        "cursor", "factory", "grok", "kimi", "longcat", "manus", "minimax", "mimo", "mistral",
-        "notion", "ollama", "opencode", "opencodego", "perplexity", "qoder", "qwencloud",
-        "stepfun", "t3chat", "windsurf", "zoommate",
-    ]
-
-    private static let workspaceIDIDs: Set<String> = [
-        "azureopenai", "deepgram", "devin", "notion", "openai", "opencode", "opencodego", "xai",
-    ]
-
-    private static let secretKeyIDs: Set<String> = [
-        "bedrock", "doubao",
-    ]
-
-    private static let regionIDs: Set<String> = [
-        "alibaba", "alibabatokenplan", "bedrock", "doubao", "minimax", "moonshot", "zai",
-    ]
-
-    private static let enterpriseHostIDs: Set<String> = [
-        "azureopenai", "clawrouter", "copilot", "kimi", "litellm", "llmproxy", "openrouter",
-        "sub2api", "wayfinder",
-    ]
 }
 
 enum ProviderConnectionGuidance {
@@ -256,14 +222,3 @@ enum ProviderConnectionSubmissionPolicy {
     }
 }
 
-/// Optional Settings controls are explicit catalog metadata, not runtime
-/// introspection of an upstream descriptor.
-enum ProviderConnectionCapabilities {
-    static func supportsManualCookie(_ providerID: String) -> Bool {
-        ProviderConnectionCatalog.entry(id: providerID)?.supportsManualCookie == true
-    }
-
-    static func supportsWorkspaceID(_ providerID: String) -> Bool {
-        ProviderConnectionCatalog.entry(id: providerID)?.supportsWorkspaceID == true
-    }
-}

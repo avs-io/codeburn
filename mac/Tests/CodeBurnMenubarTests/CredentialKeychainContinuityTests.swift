@@ -143,8 +143,7 @@ struct CredentialKeychainContinuityTests {
             )
             let openCodeGo = CapacityDockProviderCredential(
                 sourceMode: ProviderReferenceSourceMode.api.rawValue,
-                apiKey: "synthetic-opencodego-key",
-                workspaceID: "synthetic-opencodego-workspace"
+                apiKey: "synthetic-opencodego-key"
             )
 
             try CapacityDockProviderCredentialStore.save(clinePass, for: "clinepass")

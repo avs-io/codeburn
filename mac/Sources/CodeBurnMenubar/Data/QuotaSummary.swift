@@ -38,28 +38,34 @@ struct QuotaSummary: Equatable {
     /// to "you're over" (red) — matches what the user expects from a warning
     /// indicator in the menu bar.
     static func severity(for percent: Double) -> Severity {
-        if percent >= 1.0 { return .danger }
-        if percent >= 0.9 { return .critical }
-        if percent >= 0.7 { return .warning }
+        if percent >= 0.9 { return .danger }
+        if percent >= 0.75 { return .critical }
+        if percent >= 0.5 { return .warning }
         return .normal
     }
 
     enum Severity {
-        case normal     // <70%
-        case warning    // 70-90%
-        case critical   // 90-100%
-        case danger     // >=100%
+        case normal     // <50%   green
+        case warning    // 50-75% yellow
+        case critical   // 75-90% orange
+        case danger     // >=90%  red
     }
 
-    /// The glance value for Capacity Dock. A provider can expose several
-    /// independent rate windows; the one nearest exhaustion is the honest
-    /// headline even when a different window is the provider's historical
-    /// `primary`. Empty data stays nil rather than masquerading as 0%.
+    /// The glance value (percent + color) for Capacity Dock. Every provider is
+    /// put on the same billing horizon: the weekly window if one exists, else the
+    /// monthly window. Only when a provider exposes neither does it fall back to
+    /// the window nearest exhaustion. Empty data stays nil rather than
+    /// masquerading as 0%.
     var headlineWindow: Window? {
         var candidates = details
         if let primary, !candidates.contains(primary) {
             candidates.append(primary)
         }
+        func firstMatching(_ needle: String) -> Window? {
+            candidates.first { $0.label.range(of: needle, options: .caseInsensitive) != nil }
+        }
+        if let weekly = firstMatching("week") { return weekly }
+        if let monthly = firstMatching("month") { return monthly }
         return candidates.max { lhs, rhs in lhs.percent < rhs.percent }
     }
 }

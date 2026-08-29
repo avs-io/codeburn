@@ -4,8 +4,8 @@ import Testing
 
 @Suite("Quota summary headline")
 struct QuotaSummaryHeadlineTests {
-    @Test("the most constrained known window drives the glance value")
-    func choosesHighestUtilization() {
+    @Test("the weekly billing window drives the glance value even when a shorter window is busier")
+    func choosesWeeklyWindow() {
         let reset = Date(timeIntervalSince1970: 1_800_000_000)
         let weekly = QuotaSummary.Window(label: "Weekly", percent: 0.21, resetsAt: reset)
         let session = QuotaSummary.Window(label: "Current session", percent: 0.73, resetsAt: reset)
@@ -15,6 +15,38 @@ struct QuotaSummaryHeadlineTests {
             primary: weekly,
             details: [session, weekly],
             planLabel: "Max",
+            footerLines: []
+        )
+
+        #expect(summary.headlineWindow == weekly)
+    }
+
+    @Test("weekly wins over a higher-percent monthly window")
+    func weeklyOutranksMonthly() {
+        let monthly = QuotaSummary.Window(label: "Monthly", percent: 0.88, resetsAt: nil)
+        let weekly = QuotaSummary.Window(label: "This week", percent: 0.12, resetsAt: nil)
+        let summary = QuotaSummary(
+            providerFilter: .claude,
+            connection: .connected,
+            primary: nil,
+            details: [monthly, weekly],
+            planLabel: nil,
+            footerLines: []
+        )
+
+        #expect(summary.headlineWindow == weekly)
+    }
+
+    @Test("falls back to the busiest window when no billing label is present")
+    func fallsBackToBusiestWindow() {
+        let session = QuotaSummary.Window(label: "Current session", percent: 0.73, resetsAt: nil)
+        let daily = QuotaSummary.Window(label: "Today", percent: 0.4, resetsAt: nil)
+        let summary = QuotaSummary(
+            providerFilter: .claude,
+            connection: .connected,
+            primary: nil,
+            details: [daily, session],
+            planLabel: nil,
             footerLines: []
         )
 
@@ -48,5 +80,15 @@ struct QuotaSummaryHeadlineTests {
         )
 
         #expect(summary.headlineWindow == nil)
+    }
+
+    @Test("severity steps at the 0.50 / 0.75 / 0.90 band boundaries")
+    func severityBoundaries() {
+        #expect(QuotaSummary.severity(for: 0.49) == .normal)
+        #expect(QuotaSummary.severity(for: 0.50) == .warning)
+        #expect(QuotaSummary.severity(for: 0.74) == .warning)
+        #expect(QuotaSummary.severity(for: 0.75) == .critical)
+        #expect(QuotaSummary.severity(for: 0.89) == .critical)
+        #expect(QuotaSummary.severity(for: 0.90) == .danger)
     }
 }

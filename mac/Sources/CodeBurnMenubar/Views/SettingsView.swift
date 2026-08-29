@@ -200,19 +200,8 @@ private struct SettingsSidebarPaneRow: View {
 private struct SettingsSidebarAboutRow: View {
     var body: some View {
         HStack(spacing: 8) {
-            // Bare brand mark, no chip container — the binary flame reads
-            // better at this size than the boxed app icon.
-            Group {
-                if let flame = ProviderIconCache.image(named: "flame-solid") {
-                    Image(nsImage: flame)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
-                }
-            }
-            .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
-            .accessibilityHidden(true)
+            // Standard info glyph in a chip, matching the General row's style.
+            SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
             Text("About")
         }
         .tag("about")
@@ -1724,10 +1713,6 @@ private struct GenericProviderConnectionSections: View {
         provider.catalogEntry.authMethods.contains(.apiTokenOrCloudCredentials)
     }
 
-    private var supportsCookieHeader: Bool {
-        ProviderConnectionCapabilities.supportsManualCookie(provider.id)
-    }
-
     var body: some View {
         Group {
             Section {
@@ -1798,21 +1783,6 @@ private struct GenericProviderConnectionSections: View {
 
                 if supportsAPIKey {
                     SecureField("API key or token", text: $editor.credential.apiKey)
-                }
-                if provider.catalogEntry.usesSecretKey {
-                    SecureField("Secret key", text: $editor.credential.secretKey)
-                }
-                if supportsCookieHeader {
-                    SecureField("Manual cookie header", text: $editor.credential.cookieHeader)
-                }
-                if provider.catalogEntry.usesRegion {
-                    TextField("Region", text: $editor.credential.region)
-                }
-                if ProviderConnectionCapabilities.supportsWorkspaceID(provider.id) {
-                    TextField("Workspace or project ID", text: $editor.credential.workspaceID)
-                }
-                if provider.catalogEntry.supportsEnterpriseHost {
-                    TextField("Enterprise host", text: $editor.credential.enterpriseHost)
                 }
 
                 HStack {

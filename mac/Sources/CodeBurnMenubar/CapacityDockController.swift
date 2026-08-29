@@ -210,6 +210,10 @@ final class CapacityDockController {
         let panel = CapacityDockPanel()
         let hosting = CapacityDockHostingView(rootView: view.environment(store))
         hosting.autoresizingMask = [.width, .height]
+        // At the top edge the menu-bar/notch safe-area inset would push the rail
+        // down, leaving a gap the bottom edge never shows. Opt the rail out of
+        // safe area so it sits flush at the physical top like the system notch.
+        hosting.safeAreaRegions = []
         hosting.interactiveShapeContains = { [weak model] point, bounds in
             guard let model else { return false }
             let swiftUIPoint = CGPoint(x: point.x, y: bounds.height - point.y)
@@ -1131,7 +1135,7 @@ private extension CGRect {
         switch edge {
         case .left: result.origin.x = screenFrame.minX
         case .right: result.origin.x = screenFrame.maxX - width
-        case .top: result.origin.y = visibleFrame.maxY - height
+        case .top: result.origin.y = screenFrame.maxY - height
         case .bottom: result.origin.y = screenFrame.minY
         }
         return result
@@ -1269,7 +1273,11 @@ private final class CapacityDockPanel: NSPanel {
             backing: .buffered,
             defer: false
         )
-        level = .floating
+        // The system menu bar sits above .mainMenu levels on recent macOS, so a
+        // top-docked rail was clipped below it. Use the shielding level (as the
+        // system notch apps do) so the rail can render flush at the very top edge.
+        isFloatingPanel = true
+        level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
@@ -1280,7 +1288,7 @@ private final class CapacityDockPanel: NSPanel {
         isExcludedFromWindowsMenu = true
         becomesKeyOnlyIfNeeded = true
         animationBehavior = .none
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
     }
 
     override var canBecomeKey: Bool { false }

@@ -280,7 +280,8 @@ struct CapacityDockPlacementTests {
             normalizedHorizontalOffset: 0.5,
             normalizedTopOffset: nil
         )
-        #expect(settled.maxY == usable.maxY)
+        // Top-docked rails sit flush with the physical top edge, not the menu-bar inset.
+        #expect(settled.maxY == screen.maxY)
     }
 
     @Test("left-docked rail is exactly flush with the physical screen edge")

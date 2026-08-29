@@ -2,14 +2,24 @@ import AppKit
 import Observation
 import SwiftUI
 
+private extension Color {
+    /// Warm off-white for Capacity Dock text: a very mild orange tint so bright
+    /// labels on the dark card read softer than pure white and do not stress the eyes.
+    static let capacityDockText = Color(red: 0.98, green: 0.95, blue: 0.90)
+}
+
 enum CapacityDockMetrics {
     private static let baseRailWidth: CGFloat = 88
+    // Horizontal rails stack the ring above its label, so their cross-extent (the
+    // pill height) needs more room than a vertical rail's width to give the same
+    // top/bottom breathing space around the gauge.
+    private static let baseHorizontalRailWidth: CGFloat = 106
     private static let baseEdgeFlareWidth: CGFloat = 22
-    private static let baseEdgeShoulderDepth: CGFloat = 44
+    private static let baseEdgeShoulderDepth: CGFloat = 52
     private static let baseRowHeight: CGFloat = 84
     private static let baseRowSpacing: CGFloat = 12
-    private static let baseRailTopPadding: CGFloat = 18
-    private static let baseRailBottomPadding: CGFloat = 18
+    private static let baseRailAlongPad: CGFloat = 20
+    private static let baseRailCrossPad: CGFloat = 12
     private static let baseRingSize: CGFloat = 52
     private static let baseRingStrokeWidth: CGFloat = 4
     private static let baseRingLabelSpacing: CGFloat = 6
@@ -18,13 +28,13 @@ enum CapacityDockMetrics {
     private static let baseDetailWidth: CGFloat = 350
 
     static func railWidth(scale: CGFloat) -> CGFloat { baseRailWidth * scale }
-    static func horizontalRailWidth(scale: CGFloat) -> CGFloat { baseRailWidth * scale }
+    static func horizontalRailWidth(scale: CGFloat) -> CGFloat { baseHorizontalRailWidth * scale }
     static func edgeFlareWidth(scale: CGFloat) -> CGFloat { baseEdgeFlareWidth * scale }
     static func edgeShoulderDepth(scale: CGFloat) -> CGFloat { baseEdgeShoulderDepth * scale }
     static func rowHeight(scale: CGFloat) -> CGFloat { baseRowHeight * scale }
     static func rowSpacing(scale: CGFloat) -> CGFloat { baseRowSpacing * scale }
-    static func railTopPadding(scale: CGFloat) -> CGFloat { baseRailTopPadding * scale }
-    static func railBottomPadding(scale: CGFloat) -> CGFloat { baseRailBottomPadding * scale }
+    static func railAlongPad(scale: CGFloat) -> CGFloat { baseRailAlongPad * scale }
+    static func railCrossPad(scale: CGFloat) -> CGFloat { baseRailCrossPad * scale }
     static func ringSize(scale: CGFloat) -> CGFloat { baseRingSize * scale }
     static func ringStrokeWidth(scale: CGFloat) -> CGFloat { baseRingStrokeWidth * scale }
     static func ringLabelSpacing(scale: CGFloat) -> CGFloat { baseRingLabelSpacing * scale }
@@ -32,12 +42,12 @@ enum CapacityDockMetrics {
     static func percentageTextSize(scale: CGFloat) -> CGFloat { basePercentageTextSize * scale }
     static func detailWidth(scale: CGFloat) -> CGFloat { baseDetailWidth * scale }
 
-    static func railHeight(providerCount: Int, scale: CGFloat) -> CGFloat {
+    static func railHeight(providerCount: Int, alongPad: CGFloat, scale: CGFloat) -> CGFloat {
         let count = max(providerCount, 1)
-        return railTopPadding(scale: scale)
+        return alongPad
             + CGFloat(count) * rowHeight(scale: scale)
             + CGFloat(max(0, count - 1)) * rowSpacing(scale: scale)
-            + railBottomPadding(scale: scale)
+            + alongPad
     }
 
     static func detailHeight(quota: QuotaSummary?, scale: CGFloat) -> CGFloat {
@@ -47,7 +57,7 @@ enum CapacityDockMetrics {
             quota.footerLines,
             connection: quota.connection
         )
-        let footer = visibleFooter.isEmpty ? 0 : min(visibleFooter.count, 2) * 18 + 10
+        let footer = visibleFooter.isEmpty ? 0 : min(visibleFooter.count, 2) * 16 + 4
         let actionExtra: CGFloat = CapacityDockConnectionAction.resolve(quota: quota) == nil ? 0 : 38
         let connectionExtra: CGFloat = switch quota.connection {
         case .terminalFailure: 90
@@ -57,7 +67,7 @@ enum CapacityDockMetrics {
         }
         let base = min(
             470,
-            max(176, 116 + CGFloat(rows) * 60 + CGFloat(footer) + actionExtra + connectionExtra)
+            max(132, 88 + CGFloat(rows) * 50 + CGFloat(footer) + actionExtra + connectionExtra)
         )
         return base * scale
     }
@@ -94,11 +104,12 @@ final class CapacityDockViewModel {
     }
 
     var restingBodyLength: CGFloat {
-        CapacityDockMetrics.railHeight(providerCount: 1, scale: scale)
+        CapacityDockMetrics.railHeight(providerCount: 1, alongPad: railAlongPad, scale: scale)
     }
     var expandedBodyLength: CGFloat {
         CapacityDockMetrics.railHeight(
             providerCount: preferences.selectedProviders.count,
+            alongPad: railAlongPad,
             scale: scale
         )
     }
@@ -142,8 +153,19 @@ final class CapacityDockViewModel {
     }
     var rowHeight: CGFloat { CapacityDockMetrics.rowHeight(scale: scale) }
     var rowSpacing: CGFloat { CapacityDockMetrics.rowSpacing(scale: scale) }
-    var railTopPadding: CGFloat { CapacityDockMetrics.railTopPadding(scale: scale) }
-    var railBottomPadding: CGFloat { CapacityDockMetrics.railBottomPadding(scale: scale) }
+    // Along-axis content padding: small when floating, plus the docked concave
+    // flare depth so content never crowds a necked edge. Cross-axis is a small
+    // fixed margin. railTop/BottomPadding stay as the names the controller's
+    // detail-tail math reads.
+    var flareCompensation: CGFloat {
+        let p = min(max(attachmentProgress, 0), 1)
+        let eased = p * p * (3 - 2 * p)
+        return CapacityDockMetrics.edgeShoulderDepth(scale: scale) * 0.6 * eased
+    }
+    var railAlongPad: CGFloat { CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation }
+    var railCrossPad: CGFloat { CapacityDockMetrics.railCrossPad(scale: scale) }
+    var railTopPadding: CGFloat { railAlongPad }
+    var railBottomPadding: CGFloat { railAlongPad }
     var detailWidth: CGFloat { CapacityDockMetrics.detailWidth(scale: detailScale) }
 
     func presentationOpacity(for provider: CapacityDockProvider) -> CGFloat {
@@ -198,10 +220,10 @@ struct CapacityDockView: View {
                 )
             }
         }
-        .padding(.top, model.isVertical ? model.railTopPadding : 0)
-        .padding(.bottom, model.isVertical ? model.railBottomPadding : 0)
-        .padding(.leading, model.isVertical ? 0 : model.railTopPadding)
-        .padding(.trailing, model.isVertical ? 0 : model.railBottomPadding)
+        .padding(.top, model.isVertical ? model.railAlongPad : model.railCrossPad)
+        .padding(.bottom, model.isVertical ? model.railAlongPad : model.railCrossPad)
+        .padding(.leading, model.isVertical ? model.railCrossPad : model.railAlongPad)
+        .padding(.trailing, model.isVertical ? model.railCrossPad : model.railAlongPad)
         // Keep the preferred row pinned to the reveal origin. Without an
         // explicit axis alignment, SwiftUI centers the already-expanded stack
         // inside the interpolating frame and makes the first ring look as if it
@@ -291,7 +313,7 @@ private struct CapacityDockProviderRow: View {
                 ZStack {
                     CapacityDockUsageRing(
                         progress: percent,
-                        color: provider.ringColor,
+                        color: headlineRingColor,
                         scale: scale,
                         gaugeShape: gaugeShape
                     )
@@ -344,9 +366,21 @@ private struct CapacityDockProviderRow: View {
     }
 
     private var headlinePercentColor: Color {
-        guard let percent else { return .white.opacity(0.72) }
+        guard let percent else { return Color.capacityDockText.opacity(0.72) }
         switch QuotaSummary.severity(for: percent) {
-        case .normal: return .white
+        case .normal: return Color.capacityDockText
+        case .warning: return .yellow
+        case .critical: return .orange
+        case .danger: return .red
+        }
+    }
+
+    // The ring reflects the weekly (else monthly) limit's status, not a brand
+    // colour: green while there is headroom, stepping to red as it is exhausted.
+    private var headlineRingColor: Color {
+        guard let percent else { return Color.capacityDockText.opacity(0.35) }
+        switch QuotaSummary.severity(for: percent) {
+        case .normal: return .green
         case .warning: return .yellow
         case .critical: return .orange
         case .danger: return .red
@@ -382,34 +416,12 @@ private struct CapacityDockUsageRing: View {
 
             if let progress {
                 let amount = min(max(progress, 0), 1)
+                // Plain solid progress arc, no neon glow or gradient sheen.
                 CapacityDockGaugePath(kind: gaugeShape)
                     .trim(from: 0, to: amount)
                     .stroke(
-                        color.opacity(0.40),
-                        style: StrokeStyle(lineWidth: strokeWidth + 2 * scale, lineCap: .round)
-                    )
-                    .blur(radius: 2 * scale)
-                    .rotationEffect(.degrees(-90))
-                CapacityDockGaugePath(kind: gaugeShape)
-                    .trim(from: 0, to: amount)
-                    .stroke(
-                        LinearGradient(
-                            colors: [color.opacity(0.78), color, color.opacity(0.86)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
+                        color,
                         style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(-90))
-                CapacityDockGaugePath(kind: gaugeShape)
-                    .trim(from: 0, to: amount)
-                    .stroke(
-                        LinearGradient(
-                            colors: [.white.opacity(0.52), .white.opacity(0.10), .clear],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        style: StrokeStyle(lineWidth: max(0.8, 1.15 * scale), lineCap: .round)
                     )
                     .rotationEffect(.degrees(-90))
             } else {
@@ -501,8 +513,8 @@ struct CapacityDockDetailView: View {
     }
 
     private var detailInsets: EdgeInsets {
-        let horizontal = 24 * model.detailScale
-        let vertical = 22 * model.detailScale
+        let horizontal = 22 * model.detailScale
+        let vertical = 16 * model.detailScale
         let tailAllowance = 18 * model.detailScale
         return EdgeInsets(
             top: vertical + (model.detailTailEdge == .top ? tailAllowance : 0),
@@ -514,23 +526,23 @@ struct CapacityDockDetailView: View {
 
     @ViewBuilder
     private func detail(for provider: CapacityDockProvider, quota: QuotaSummary?) -> some View {
-        VStack(alignment: .leading, spacing: 14 * model.detailScale) {
+        VStack(alignment: .leading, spacing: 11 * model.detailScale) {
             HStack(spacing: 8 * model.detailScale) {
                 if let image = ProviderIconCache.image(named: provider.iconName) {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
-                        .foregroundStyle(.white)
+                        .foregroundStyle(Color.capacityDockText)
                         .frame(width: 24 * model.detailScale, height: 24 * model.detailScale)
                 }
                 Text("\(provider.displayName) Usage")
                     .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color.capacityDockText)
                 Spacer(minLength: 8)
                 if let plan = quota?.planLabel, !plan.isEmpty {
                     Text(plan)
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.62))
+                        .foregroundStyle(Color.capacityDockText.opacity(0.62))
                         .lineLimit(1)
                 }
             }
@@ -540,14 +552,12 @@ struct CapacityDockDetailView: View {
                 if quota.details.isEmpty, let primary = quota.primary {
                     CapacityDockQuotaRow(
                         window: primary,
-                        color: provider.ringColor,
                         scale: model.detailScale
                     )
                 } else {
                     ForEach(Array(quota.details.prefix(5).enumerated()), id: \.offset) { _, window in
                         CapacityDockQuotaRow(
                             window: window,
-                            color: provider.ringColor,
                             scale: model.detailScale
                         )
                     }
@@ -557,17 +567,17 @@ struct CapacityDockDetailView: View {
                     connection: quota.connection
                 )
                 if !footerLines.isEmpty {
-                    Divider().overlay(Color.white.opacity(0.12))
+                    Divider().overlay(Color.capacityDockText.opacity(0.12))
                     ForEach(Array(footerLines.prefix(2).enumerated()), id: \.offset) { _, line in
                         Text(line)
                             .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.58))
+                            .foregroundStyle(Color.capacityDockText.opacity(0.58))
                     }
                 }
             } else {
                 Text(ProviderConnectionGuidance.dockInstruction(for: provider))
                     .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.62))
+                    .foregroundStyle(Color.capacityDockText.opacity(0.62))
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -594,7 +604,7 @@ struct CapacityDockDetailView: View {
         case .loading:
             Text("Refreshing…")
                 .font(.system(size: 10))
-                .foregroundStyle(.white.opacity(0.52))
+                .foregroundStyle(Color.capacityDockText.opacity(0.52))
         case .stale:
             Text("Last known usage · refreshing")
                 .font(.system(size: 10))
@@ -606,7 +616,7 @@ struct CapacityDockDetailView: View {
         case .disconnected:
             Text("Not connected")
                 .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.6))
+                .foregroundStyle(Color.capacityDockText.opacity(0.6))
         case .terminalFailure(let reason):
             VStack(alignment: .leading, spacing: 3 * model.detailScale) {
                 Text("Reconnect required")
@@ -615,12 +625,12 @@ struct CapacityDockDetailView: View {
                 if let reason, !reason.isEmpty {
                     Text(reason)
                         .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.58))
+                        .foregroundStyle(Color.capacityDockText.opacity(0.58))
                         .lineLimit(2)
                 }
                 Text(ProviderConnectionGuidance.dockInstruction(for: provider))
                     .font(.system(size: 10))
-                    .foregroundStyle(.white.opacity(0.72))
+                    .foregroundStyle(Color.capacityDockText.opacity(0.72))
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -630,7 +640,6 @@ struct CapacityDockDetailView: View {
 
 private struct CapacityDockQuotaRow: View {
     let window: QuotaSummary.Window
-    let color: Color
     let scale: CGFloat
 
     var body: some View {
@@ -638,18 +647,18 @@ private struct CapacityDockQuotaRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
                 Text(CapacityDockQuotaPresentation.displayLabel(window.label))
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.82))
+                    .foregroundStyle(Color.capacityDockText.opacity(0.82))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 8)
                 Text(window.percentLabel)
                     .font(.system(size: 12, weight: .medium))
                     .monospacedDigit()
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color.capacityDockText)
             }
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.14))
+                    Capsule().fill(Color.capacityDockText.opacity(0.14))
                     Capsule()
                         .fill(progressColor)
                         .frame(width: max(2, geometry.size.width * min(max(window.percent, 0), 1)))
@@ -660,7 +669,7 @@ private struct CapacityDockQuotaRow: View {
                 Text("Resets in \(window.resetsInLabel)")
                     .font(.system(size: 10))
                     .monospacedDigit()
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(Color.capacityDockText.opacity(0.5))
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
@@ -668,7 +677,7 @@ private struct CapacityDockQuotaRow: View {
 
     private var progressColor: Color {
         switch QuotaSummary.severity(for: window.percent) {
-        case .normal: return color
+        case .normal: return .green
         case .warning: return .yellow
         case .critical: return .orange
         case .danger: return .red
@@ -724,6 +733,11 @@ private struct CapacityDockNativeGlassSurface<S: Shape>: View {
     var body: some View {
         Color.clear
             .glassEffect(.regular.interactive(), in: shape)
+            // Native glass tracks the wallpaper, so over a light background it
+            // turns pale and the light text disappears. A gentle dark scrim keeps
+            // the surface dark enough for the labels on any background while still
+            // reading as glass.
+            .overlay(shape.fill(Color.black.opacity(0.24)))
     }
 }
 
@@ -784,87 +798,51 @@ struct CapacityDockRailShape: Shape {
 
     private func rightFlarePath(in rect: CGRect) -> Path {
         let progress = min(max(attachmentProgress, 0), 1)
-        let radius = min(28, bodyWidth * 0.32, rect.height * 0.25)
         let eased = progress * progress * (3 - 2 * progress)
-        let attachedRadius = radius * (1 - eased)
-        // Wetting the screen edge pulls the rail's top and bottom surfaces
-        // inward on the free side while the contact chord opens toward both
-        // panel corners. The resulting shoulders flare *into* the touched
-        // edge, rather than adding horns outside the panel. Every point and
-        // control point stays within `rect`, so attachment cannot change the
-        // panel length or reveal a screen-coloured sliver at scaled sizes.
-        let shoulderInset = min(
-            radius * 0.5,
-            shoulderDepth * 0.34,
-            rect.height * 0.12
-        ) * eased
-        let topStart = CGPoint(
-            x: rect.minX + radius,
-            y: rect.minY + shoulderInset
-        )
-        let topEnd = CGPoint(
-            x: rect.maxX - attachedRadius,
-            y: rect.minY
-        )
-        let topRun = max(0, topEnd.x - topStart.x)
-        let shoulderRun = min(shoulderDepth, topRun)
-        let topCurveStart = CGPoint(
-            x: topEnd.x - shoulderRun,
-            y: topStart.y
-        )
-        let bottomStart = CGPoint(
-            x: rect.maxX - attachedRadius,
-            y: rect.maxY
-        )
-        let bottomEnd = CGPoint(
-            x: rect.minX + radius,
-            y: rect.maxY - shoulderInset
-        )
+        // The system-notch technique (Helm / notchi): one quad curve per corner,
+        // control point at the corner. Free (left) side has convex rounded
+        // corners; the contact (right) side necks concavely into the touched
+        // edge when docked. Depth scales with panel length and is clamped below
+        // half of it, so a short single-item rail necks gently and never lets the
+        // two shoulders meet or swallow the gauge.
+        // freeR: convex rounded corners on the free (left) side. contactR: the
+        // small concave flare where the body necks out to the flush contact
+        // (right) edge — the body is inset from top and bottom by contactR, and
+        // the flare connects that inset to the flush corner (Helm's structure).
+        let freeR = min(22, rect.height / 2, bodyWidth * 0.45)
+        // Not attached to an edge: a plain rounded pill, every corner rounded.
+        // The concave contact-edge flares only exist once docked.
+        if eased < 0.5 {
+            return Path(roundedRect: rect, cornerRadius: freeR)
+        }
+        let contactR = min(shoulderDepth * 0.6, rect.height * 0.22, max(0, rect.height / 2 - freeR)) * eased
 
         var path = Path()
-        path.move(to: topStart)
-        path.addLine(to: topCurveStart)
-        path.addCurve(
-            to: topEnd,
-            control1: CGPoint(
-                x: topCurveStart.x + shoulderRun * 0.38,
-                y: topCurveStart.y
-            ),
-            control2: CGPoint(
-                x: topEnd.x - shoulderRun * 0.22,
-                y: topEnd.y
-            )
-        )
+        // Flush top-right corner, then concave flare into the inset body top
+        path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
         path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.minY + attachedRadius),
-            control: CGPoint(x: rect.maxX, y: rect.minY)
+            to: CGPoint(x: rect.maxX - contactR, y: rect.minY + contactR),
+            control: CGPoint(x: rect.maxX, y: rect.minY + contactR)
         )
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - attachedRadius))
+        // Body top edge to the free-side top corner (convex)
+        path.addLine(to: CGPoint(x: rect.minX + freeR, y: rect.minY + contactR))
         path.addQuadCurve(
-            to: bottomStart,
-            control: CGPoint(x: rect.maxX, y: rect.maxY)
+            to: CGPoint(x: rect.minX, y: rect.minY + contactR + freeR),
+            control: CGPoint(x: rect.minX, y: rect.minY + contactR)
         )
-        path.addCurve(
-            to: CGPoint(x: topCurveStart.x, y: bottomEnd.y),
-            control1: CGPoint(
-                x: bottomStart.x - shoulderRun * 0.22,
-                y: bottomStart.y
-            ),
-            control2: CGPoint(
-                x: topCurveStart.x + shoulderRun * 0.38,
-                y: bottomEnd.y
-            )
-        )
-        path.addLine(to: bottomEnd)
+        // Free (left) edge down to the bottom-left corner (convex)
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - contactR - freeR))
         path.addQuadCurve(
-            to: CGPoint(x: rect.minX, y: bottomEnd.y - radius),
-            control: CGPoint(x: rect.minX, y: bottomEnd.y)
+            to: CGPoint(x: rect.minX + freeR, y: rect.maxY - contactR),
+            control: CGPoint(x: rect.minX, y: rect.maxY - contactR)
         )
-        path.addLine(to: CGPoint(x: rect.minX, y: topStart.y + radius))
+        // Body bottom edge, then concave flare out to the flush bottom-right
+        path.addLine(to: CGPoint(x: rect.maxX - contactR, y: rect.maxY - contactR))
         path.addQuadCurve(
-            to: topStart,
-            control: CGPoint(x: rect.minX, y: topStart.y)
+            to: CGPoint(x: rect.maxX, y: rect.maxY),
+            control: CGPoint(x: rect.maxX, y: rect.maxY - contactR)
         )
+        // Flush contact (right) edge back up to the start
         path.closeSubpath()
         return path
     }
