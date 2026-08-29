@@ -15,7 +15,7 @@ import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, compu
 import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
 import { callBillableOutputTokens, sessionBillableOutputTokens } from './session-output.js'
-import { getDaysInRange, ensureCacheHydrated, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
+import { getDaysInRange, ensureCacheHydrated, emptyCache, loadDailyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
 import { buildGranularHistory } from './granular-history.js'
 
 // Row caps for the by-PR / by-branch payload aggregations, ranked by cost.
@@ -543,7 +543,12 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const rangeEndStr = toDateString(periodInfo.range.end)
   const isTodayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
 
-  const cache = await hydrateCache()
+  // Today never needs the 365-day history backfill to answer. That parse is
+  // what made a cold `--period today` cost as much as a lifetime scan.
+  // Load whatever durable days are already on disk (possibly empty / incomplete)
+  // and parse today live. Multi-day queries still hydrate so the union can
+  // fill gaps and finalize the watermark.
+  const cache = isTodayOnly ? await loadDailyCache() : await hydrateCache()
   // A complete daily cache already holds every historical day through yesterday.
   // Re-parsing the full 7D/30D/month range on a warm switch only rebuilds
   // session-derived details (workflow, top sessions, PR rows) while the
