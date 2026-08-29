@@ -875,7 +875,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     )
     dailyHistory = dailyEntriesToHistory(aggregateProjectsIntoDays(historyProjects))
   } else if (isAllProviders) {
-    const todayDays = (await getTodayAllDays()).filter(d => d.date === todayStr)
+    // Reuse the durable today slice when we already built one. A second
+    // unfloored parseAllSessions(today) is what doubled live 7D (~5s then ~5s).
+    const todayDays = (todayAllDays ?? await getTodayAllDays()).filter(d => d.date === todayStr)
     const fullHistory = [...allCacheDays, ...todayDays]
     dailyHistory = dailyEntriesToHistory(fullHistory)
   } else {

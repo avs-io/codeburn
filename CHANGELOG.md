@@ -10,6 +10,7 @@
 - **A cold menubar-json query no longer fingerprints the whole corpus before first paint when no status snapshot exists.** A complete payload is fingerprinted after the parse, so later polls keep the fast path.
 - **A today-only first-paint menubar-json query now persists its status snapshot.** Historical files deferred by the 48h floor are outside today, so the payload is a complete answer for --period today. Later identical polls reuse it. Multi-day first paints stay unsaved.
 - **A warm unfiltered 7D / 30D / month live today-parse now uses the same 48h mtime floor, including files already in the session cache.** Headlines still union the complete daily cache with today. Incomplete caches keep the previous full-range parse.
+- **A 7D / 30D menubar-json query no longer fingerprints the whole corpus when there is no status snapshot to hit and the first-paint cannot be persisted.** Today-only snapshots still fingerprint before the parse so a later append cannot poison the hash. Daily history reuses the durable today slice instead of a second unfloored today parse.
 
 ## 0.9.23 - 2026-08-29
 

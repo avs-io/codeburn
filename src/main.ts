@@ -1203,14 +1203,18 @@ program
       // always recomputes fresh. One-shot and serve-child behavior are
       // identical for both optimize values.
       const useSnapshot = !queryScope.optimize
-      // Fingerprinting every source file is a full corpus walk. On a cold
-      // first-paint there is no snapshot to hit, and a deferred today parse
-      // cannot be persisted anyway (hydration incomplete). Probe first;
-      // fingerprint only when a file might exist, or after a complete payload
-      // that we are actually allowed to save.
+      // Fingerprinting every source file is a full corpus walk. Skip it when
+      // there is no snapshot to hit AND this query cannot persist one (a
+      // deferred multi-day first-paint). Today-only first-paint may persist,
+      // so it still fingerprints BEFORE the parse: hashing after the payload
+      // can stamp a stale answer under a newer corpus.
+      const todayStartForSnapshot = new Date()
+      todayStartForSnapshot.setHours(0, 0, 0, 0)
+      const todayOnlyQuery = toDateString(periodInfo.range.start) === toDateString(todayStartForSnapshot)
+        && toDateString(periodInfo.range.end) === toDateString(todayStartForSnapshot)
       let corpus: Awaited<ReturnType<typeof computeCorpusFingerprint>> | null = null
       let snapshot: unknown = null
-      if (useSnapshot && await statusSnapshotFileExists()) {
+      if (useSnapshot && (todayOnlyQuery || await statusSnapshotFileExists())) {
         corpus = await computeCorpusFingerprint(pf)
         snapshot = await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY)
       }
@@ -1233,15 +1237,12 @@ program
       // still a complete answer for --period today (the floor is the period),
       // so later identical polls can reuse it. Multi-day first paints stay
       // unsaved: they would pin a partial 7D/30D as if it were the period.
-      const todayStart = new Date()
-      todayStart.setHours(0, 0, 0, 0)
-      const todayOnlyQuery = toDateString(periodInfo.range.start) === toDateString(todayStart)
-        && toDateString(periodInfo.range.end) === toDateString(todayStart)
       const canPersistFirstPaintToday = todayOnlyQuery && payload.stale !== true
       if (useSnapshot && !snapshot && payload.stale !== true && payload.hydration === undefined
         && (isSessionHydrationComplete() || canPersistFirstPaintToday)) {
-        corpus = corpus ?? await computeCorpusFingerprint(pf)
-        await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
+        if (corpus) {
+          await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
+        }
       }
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
