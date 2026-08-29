@@ -11,6 +11,7 @@
 - **A today-only first-paint menubar-json query now persists its status snapshot.** Historical files deferred by the 48h floor are outside today, so the payload is a complete answer for --period today. Later identical polls reuse it. Multi-day first paints stay unsaved.
 - **A warm unfiltered 7D / 30D / month live today-parse now uses the same 48h mtime floor, including files already in the session cache.** Headlines still union the complete daily cache with today. Incomplete caches keep the previous full-range parse.
 - **A 7D / 30D menubar-json query no longer fingerprints the whole corpus when there is no status snapshot to hit and the first-paint cannot be persisted.** Today-only snapshots still fingerprint before the parse so a later append cannot poison the hash. Daily history reuses the durable today slice instead of a second unfloored today parse.
+- **A complete-cache 7D / 30D today-parse prefers the normalized session snapshot when it is complete.** That skips source discovery and the 12k-file fingerprint walk for first paint; headlines still union the daily cache with today, and an incomplete cache keeps the previous full-range parse.
 
 ## 0.9.23 - 2026-08-29
 

@@ -15,7 +15,7 @@ const ENV_KEYS = ['HOME', 'CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CON
 let savedEnv: Record<string, string | undefined>
 
 const parseRanges: Array<{ start: string; end: string }> = []
-const paintFloors: Array<{ includeCachedFiles: boolean }> = []
+const paintFloors: Array<{ includeCachedFiles: boolean; preferCompleteSnapshot: boolean }> = []
 
 vi.mock('../src/parser.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/parser.js')>()
@@ -29,9 +29,17 @@ vi.mock('../src/parser.js', async (importOriginal) => {
       }
       return []
     }),
-    withColdFirstPaintFloor: vi.fn(async (rangeStart: Date, fn: () => Promise<unknown>, includeCachedFiles = false) => {
-      paintFloors.push({ includeCachedFiles: includeCachedFiles === true })
-      return mod.withColdFirstPaintFloor(rangeStart, fn, includeCachedFiles)
+    withColdFirstPaintFloor: vi.fn(async (
+      rangeStart: Date,
+      fn: () => Promise<unknown>,
+      includeCachedFiles = false,
+      preferCompleteSnapshot = false,
+    ) => {
+      paintFloors.push({
+        includeCachedFiles: includeCachedFiles === true,
+        preferCompleteSnapshot: preferCompleteSnapshot === true,
+      })
+      return mod.withColdFirstPaintFloor(rangeStart, fn, includeCachedFiles, preferCompleteSnapshot)
     }),
     isSessionHydrationComplete: vi.fn(() => true),
     sessionHydrationSnapshot: vi.fn(() => ({
@@ -144,6 +152,7 @@ describe('buildDurablePeriod complete-cache today-only live parse', () => {
     paintFloors.length = 0
     await buildDurablePeriod(getDateRange('week'), { provider: 'all' })
     expect(paintFloors.some(floor => floor.includeCachedFiles)).toBe(true)
+    expect(paintFloors.some(floor => floor.preferCompleteSnapshot)).toBe(true)
   })
 
   it('still parses the full range under --project even when the daily cache is complete', async () => {

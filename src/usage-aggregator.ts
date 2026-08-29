@@ -579,6 +579,7 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
       todayStart,
       () => parseAllSessions(todayRange, provider),
       historyFromCompleteCache,
+      historyFromCompleteCache,
     )
     return painted.result
   }
