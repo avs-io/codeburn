@@ -1229,7 +1229,17 @@ program
       // every later parse (this function's own history re-parse included),
       // so re-reading it here can bless a payload whose stale flag says
       // degraded and pin its under-reported totals until the corpus changes.
-      if (useSnapshot && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
+      // A today-only first-paint may defer historical files. That payload is
+      // still a complete answer for --period today (the floor is the period),
+      // so later identical polls can reuse it. Multi-day first paints stay
+      // unsaved: they would pin a partial 7D/30D as if it were the period.
+      const todayStart = new Date()
+      todayStart.setHours(0, 0, 0, 0)
+      const todayOnlyQuery = toDateString(periodInfo.range.start) === toDateString(todayStart)
+        && toDateString(periodInfo.range.end) === toDateString(todayStart)
+      const canPersistFirstPaintToday = todayOnlyQuery && payload.stale !== true
+      if (useSnapshot && !snapshot && payload.stale !== true && payload.hydration === undefined
+        && (isSessionHydrationComplete() || canPersistFirstPaintToday)) {
         corpus = corpus ?? await computeCorpusFingerprint(pf)
         await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
       }

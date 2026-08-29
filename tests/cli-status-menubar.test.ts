@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
@@ -779,6 +779,43 @@ describe('codeburn status --format menubar-json', () => {
       expect(settled.status, `stderr: ${settled.stderr}`).toBe(0)
       const settledPayload = JSON.parse(settled.stdout) as { current: { calls: number } }
       expect(settledPayload.current.calls).toBe(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('persists a today-only first-paint snapshot even when historical files were deferred', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-today-floor-snap-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const today = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const old = new Date(today.getTime() - 30 * 24 * 3600_000)
+      const ts = (d: Date) => d.toISOString().replace(/\.\d+Z$/, 'Z')
+
+      await writeFile(
+        join(projectDir, 'today.jsonl'),
+        [userLine('today', ts(today)), assistantLine('today', ts(new Date(today.getTime() + 60_000)), 'msg-today')].join('\n'),
+      )
+      await writeFile(
+        join(projectDir, 'old.jsonl'),
+        [userLine('old', ts(old)), assistantLine('old', ts(new Date(old.getTime() + 60_000)), 'msg-old')].join('\n'),
+      )
+      await utimes(join(projectDir, 'old.jsonl'), old, old)
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+      const firstPayload = JSON.parse(first.stdout) as { current: { calls: number } }
+      expect(firstPayload.current.calls).toBe(1)
+      expect(findSnapshotFiles(join(home, '.cache', 'codeburn'))).toHaveLength(1)
+
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      expect(second.stdout).toBe(first.stdout)
     } finally {
       await rm(home, { recursive: true, force: true })
     }
