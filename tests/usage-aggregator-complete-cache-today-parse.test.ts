@@ -15,6 +15,7 @@ const ENV_KEYS = ['HOME', 'CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CON
 let savedEnv: Record<string, string | undefined>
 
 const parseRanges: Array<{ start: string; end: string }> = []
+const paintFloors: Array<{ includeCachedFiles: boolean }> = []
 
 vi.mock('../src/parser.js', async (importOriginal) => {
   const mod = await importOriginal<typeof import('../src/parser.js')>()
@@ -27,6 +28,10 @@ vi.mock('../src/parser.js', async (importOriginal) => {
         parseRanges.push({ start: 'none', end: 'none' })
       }
       return []
+    }),
+    withColdFirstPaintFloor: vi.fn(async (rangeStart: Date, fn: () => Promise<unknown>, includeCachedFiles = false) => {
+      paintFloors.push({ includeCachedFiles: includeCachedFiles === true })
+      return mod.withColdFirstPaintFloor(rangeStart, fn, includeCachedFiles)
     }),
     isSessionHydrationComplete: vi.fn(() => true),
     sessionHydrationSnapshot: vi.fn(() => ({
@@ -72,6 +77,7 @@ function cachedDay(date: string, cost: number): DailyEntry {
 beforeEach(async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]))
   parseRanges.length = 0
+  paintFloors.length = 0
   await mkdir(join(ROOT, 'home', '.claude'), { recursive: true })
   await mkdir(join(ROOT, 'cache'), { recursive: true })
   await mkdir(join(ROOT, 'no-desktop-sessions'), { recursive: true })
@@ -121,6 +127,23 @@ describe('buildDurablePeriod complete-cache today-only live parse', () => {
     expect(durable.data.cost).toBeCloseTo(60, 8)
     expect(durable.data.calls).toBe(60)
     expect(durable.scanRange.start.getTime()).toBe(todayStart.getTime())
+  })
+
+  it('floors the complete-cache 7D today parse including cached historical files', async () => {
+    const days = [6, 5, 4, 3, 2, 1].map(n => cachedDay(daysAgoStr(n), 10))
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: getDailyCacheConfigHash(),
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days,
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(ROOT, 'cache', `daily-cache.v${DAILY_CACHE_VERSION}.json`), JSON.stringify(cache), 'utf-8')
+    paintFloors.length = 0
+    await buildDurablePeriod(getDateRange('week'), { provider: 'all' })
+    expect(paintFloors.some(floor => floor.includeCachedFiles)).toBe(true)
   })
 
   it('still parses the full range under --project even when the daily cache is complete', async () => {

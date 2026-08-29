@@ -571,8 +571,15 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const parseToday = async (provider: string): Promise<ProjectSummary[]> => {
     // First-paint floor is today-only. A 7D/30D query that reuses today's
     // parse still needs a complete today scan, not a deferred historical one.
-    if (!isTodayOnly) return parseAllSessions(todayRange, provider)
-    const painted = await withColdFirstPaintFloor(todayStart, () => parseAllSessions(todayRange, provider))
+    // When the daily cache already holds yesterday and earlier, a 7D/30D
+    // "today" live parse is still a today question. Floor it the same way,
+    // including cached historical files: re-reading those only to throw them
+    // out of today is what made a warm 7D walk 12k sources.
+    const painted = await withColdFirstPaintFloor(
+      todayStart,
+      () => parseAllSessions(todayRange, provider),
+      historyFromCompleteCache,
+    )
     return painted.result
   }
   if (pf === 'all') {
