@@ -1169,7 +1169,13 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     }
   })()
 
-  const optimize = opts.optimize === false ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
+  // scanAndDetect re-walks Claude jsonl independently of the 48h first-paint
+  // floor (mtime >= range start, not the deferred-file set). On a floored
+  // today query that walk is either a lie (today-only findings presented as
+  // complete) or a ~tens-of-ms wait after parse. Headlines do not need it;
+  // leave the optimize block empty until the unfloored fill.
+  const skipOptimize = opts.optimize === false || hydration?.deferredForFirstPaint === true
+  const optimize = skipOptimize ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
   const granularRange = opts.daysSelection?.range ?? scanRange
   const granularHistory = opts.timeline === false ? undefined : buildGranularHistory(scanProjects, granularRange)
   // `stale` keeps its original meaning: a read-only serve that could not see

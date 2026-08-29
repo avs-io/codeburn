@@ -6,6 +6,7 @@
 - **A warm unfiltered 7D / 30D / month status query no longer re-parses historical session files when the daily cache is already complete.** Headlines still union that cache with a live today parse, so carried expired-source days stay in the total. Session-derived extras that would otherwise look like the whole period (top sessions, model efficiency, PR rows, per-project session details) stay omitted; workflow still describes the live today parse. Incomplete caches, --project/--exclude, --days, and --day/--from/--to ranges that do not include today keep the previous full-range parse.
 - **A today-only status query no longer waits on the 365-day daily-history backfill.** Headlines for `--period today` parse today and load whatever durable days are already on disk. 7D / 30D / month / lifetime still hydrate the cache so carried history and gap-fill stay exact.
 - **A today-only status query defers files whose mtime predates today (plus the existing 48h clock-skew margin) on a cold cache.** Same first-paint floor the TUI/serve already use. Honest when session-log mtimes are not newer than their last event; the perf fixture now stamps mtimes from event timestamps so the hill can see it.
+- **A today-only first-paint status query no longer runs optimize detection.** Headlines still come from the floored today parse plus any on-disk daily cache. The optimize block is empty until a later unfloored fill; --no-optimize is unchanged.
 
 ## 0.9.23 - 2026-08-29
 

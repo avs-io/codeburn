@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, rm, utimes, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { tmpdir } from 'os'
@@ -6,8 +6,23 @@ import { join } from 'path'
 
 import { getDateRange } from '../src/cli-date.js'
 import { loadPricing } from '../src/models.js'
-import { buildDurablePeriod } from '../src/usage-aggregator.js'
+import { buildDurablePeriod, buildMenubarPayloadForRange } from '../src/usage-aggregator.js'
 import { clearSessionCache, filesParsedFromSourceCount } from '../src/parser.js'
+
+const { scanAndDetect } = vi.hoisted(() => ({
+  scanAndDetect: vi.fn(async () => ({
+    findings: [{ id: 'should-not-run' }],
+    costRate: 1,
+    healthScore: 1,
+    healthGrade: 'F',
+    modelRecommendations: [],
+  })),
+}))
+
+vi.mock('../src/optimize.js', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../src/optimize.js')>()
+  return { ...mod, scanAndDetect }
+})
 
 const ROOT = join(tmpdir(), `codeburn-today-mtime-floor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
 const ENV_KEYS = ['HOME', 'CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEX_HOME', 'USERPROFILE', 'KIMI_CODE_HOME', 'CODEBURN_DESKTOP_SESSIONS_DIR'] as const
@@ -70,5 +85,22 @@ describe('today-only first-paint mtime floor', () => {
     const durable = await buildDurablePeriod(getDateRange('today'), { provider: 'all' })
     expect(durable.data.sessions).toBe(1)
     expect(filesParsedFromSourceCount() - before).toBe(1)
+  })
+
+  it('skips scanAndDetect on a deferred today first-paint', async () => {
+    await writeSession('today', 0)
+    await writeSession('old', 30)
+    scanAndDetect.mockClear()
+    const payload = await buildMenubarPayloadForRange(getDateRange('today'), { provider: 'all', timeline: false })
+    expect(payload.current.sessions).toBe(1)
+    expect(payload.optimize).toEqual({ findingCount: 0, savingsUSD: 0, topFindings: [] })
+    expect(scanAndDetect).not.toHaveBeenCalled()
+  })
+
+  it('still runs scanAndDetect when the today floor deferred nothing', async () => {
+    await writeSession('today', 0)
+    scanAndDetect.mockClear()
+    await buildMenubarPayloadForRange(getDateRange('today'), { provider: 'all', timeline: false })
+    expect(scanAndDetect).toHaveBeenCalledTimes(1)
   })
 })
