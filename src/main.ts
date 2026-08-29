@@ -1,4 +1,5 @@
 import { isAbsolute } from 'path'
+import { readdir } from 'fs/promises'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
@@ -10,6 +11,7 @@ import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { DAILY_CACHE_VERSION, toDateString } from './daily-cache.js'
+import { getCodeburnCacheDir } from './cache-dir.js'
 import { dateKey } from './day-aggregator.js'
 import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
@@ -71,6 +73,15 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
 function collect(val: string, acc: string[]): string[] {
   acc.push(val)
   return acc
+}
+
+async function statusSnapshotFileExists(): Promise<boolean> {
+  try {
+    const names = await readdir(getCodeburnCacheDir())
+    return names.some(name => name.startsWith('status-snapshot.') && name.endsWith('.json'))
+  } catch {
+    return false
+  }
 }
 
 function parseNumber(value: string): number {
@@ -1192,8 +1203,17 @@ program
       // always recomputes fresh. One-shot and serve-child behavior are
       // identical for both optimize values.
       const useSnapshot = !queryScope.optimize
-      const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
-      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
+      // Fingerprinting every source file is a full corpus walk. On a cold
+      // first-paint there is no snapshot to hit, and a deferred today parse
+      // cannot be persisted anyway (hydration incomplete). Probe first;
+      // fingerprint only when a file might exist, or after a complete payload
+      // that we are actually allowed to save.
+      let corpus: Awaited<ReturnType<typeof computeCorpusFingerprint>> | null = null
+      let snapshot: unknown = null
+      if (useSnapshot && await statusSnapshotFileExists()) {
+        corpus = await computeCorpusFingerprint(pf)
+        snapshot = await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY)
+      }
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
         ...queryScope,
         daysSelection,
@@ -1209,7 +1229,8 @@ program
       // every later parse (this function's own history re-parse included),
       // so re-reading it here can bless a payload whose stale flag says
       // degraded and pin its under-reported totals until the corpus changes.
-      if (useSnapshot && corpus && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
+      if (useSnapshot && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
+        corpus = corpus ?? await computeCorpusFingerprint(pf)
         await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
       }
       if (opts.scope === 'combined') {
