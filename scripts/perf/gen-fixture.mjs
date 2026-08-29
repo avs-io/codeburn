@@ -7,7 +7,7 @@
 // Layout matches provider default paths under HOME so the harness only has to
 // set HOME + CODEBURN_CACHE_DIR (same isolation as scripts/upgrade-path).
 
-import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, statSync, utimesSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { assertIsolatedHome, fixtureBytes } from './lib.mjs'
 
@@ -42,6 +42,19 @@ function mulberry(seed) {
 function writeLines(path, lines) {
   mkdirSync(join(path, '..'), { recursive: true })
   writeFileSync(path, lines.join('\n') + '\n')
+  let last = Date.now()
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line)
+      const ts = parsed.timestamp ?? parsed.payload?.timestamp
+      const ms = typeof ts === 'string' ? Date.parse(ts) : NaN
+      if (Number.isFinite(ms)) last = ms
+    } catch {
+      // keep previous
+    }
+  }
+  const stamped = new Date(last)
+  utimesSync(path, stamped, stamped)
 }
 
 function walkBytes(root) {

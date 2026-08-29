@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,6 +30,24 @@ describe('perf harness phase 0', () => {
       expect(existsSync(join(home, '.claude', 'projects'))).toBe(true)
       expect(existsSync(join(home, '.codex', 'sessions'))).toBe(true)
       expect(JSON.stringify(marker)).not.toMatch(/Users\/a\/(?:\.codex|Documents)/)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('stamps jsonl mtimes from event timestamps so first-paint floors can skip history', () => {
+    const home = mkdtempSync(join(tmpdir(), 'codeburn-perf-mtime-'))
+    try {
+      const result = spawnSync(process.execPath, [join(repo, 'scripts/perf/gen-fixture.mjs'), '--home', home, '--target-mb', '1'], {
+        encoding: 'utf8',
+      })
+      expect(result.status, result.stderr).toBe(0)
+      const sample = join(home, '.claude', 'projects', '-work-api-gateway', 'perf-00000.jsonl')
+      expect(existsSync(sample)).toBe(true)
+      const first = JSON.parse(readFileSync(sample, 'utf8').split('\n')[0]!)
+      const eventMs = Date.parse(first.timestamp)
+      expect(Number.isFinite(eventMs)).toBe(true)
+      expect(Math.abs(statSync(sample).mtimeMs - eventMs)).toBeLessThan(24 * 60 * 60 * 1000)
     } finally {
       rmSync(home, { recursive: true, force: true })
     }

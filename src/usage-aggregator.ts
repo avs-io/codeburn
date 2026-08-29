@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot, withColdFirstPaintFloor } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
@@ -567,14 +567,21 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   let liveProjects: ProjectSummary[]
   let todayAllDays: DailyEntry[]
   let scanRange: DateRange
+  const parseToday = async (provider: string): Promise<ProjectSummary[]> => {
+    // First-paint floor is today-only. A 7D/30D query that reuses today's
+    // parse still needs a complete today scan, not a deferred historical one.
+    if (!isTodayOnly) return parseAllSessions(todayRange, provider)
+    const painted = await withColdFirstPaintFloor(todayStart, () => parseAllSessions(todayRange, provider))
+    return painted.result
+  }
   if (pf === 'all') {
     if (isTodayOnly) {
-      const raw = fp(await parseAllSessions(todayRange, 'all'))
+      const raw = fp(await parseToday('all'))
       liveProjects = raw
       scanRange = todayRange
       todayAllDays = aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
     } else if (historyFromCompleteCache) {
-      const raw = fp(await parseAllSessions(todayRange, 'all'))
+      const raw = fp(await parseToday('all'))
       liveProjects = raw
       scanRange = todayRange
       todayAllDays = aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
@@ -591,14 +598,14 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
       // JSON daily turn count while the per-call cost/calls still bucket to today.
       todayAllDays = rangeEndStr >= todayStr
         ? aggregateProjectsIntoDays(filterProjectsByDays(raw, new Set([todayStr]))).filter(d => d.date === todayStr)
-        : aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
+        : aggregateProjectsIntoDays(fp(await parseToday('all'))).filter(d => d.date === todayStr)
     }
   } else {
     // Provider-filtered: today's all-provider parse feeds the union (sliced
     // below); the provider-scoped parse feeds the detail/enrichment fields.
-    todayAllDays = aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
+    todayAllDays = aggregateProjectsIntoDays(fp(await parseToday('all'))).filter(d => d.date === todayStr)
     const providerRange = isTodayOnly || historyFromCompleteCache ? todayRange : periodInfo.range
-    const rawProv = fp(await parseAllSessions(providerRange, pf))
+    const rawProv = fp(await (providerRange === todayRange ? parseToday(pf) : parseAllSessions(periodInfo.range, pf)))
     liveProjects = daysSelection && providerRange !== todayRange ? filterProjectsByDays(rawProv, daysSelection.days) : rawProv
     scanRange = providerRange
   }
@@ -696,7 +703,15 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
 
   const getTodayAllProjects = async (): Promise<ProjectSummary[]> => {
     if (!todayAllProjects) {
-      todayAllProjects = fp(await parseAllSessions(todayRange, 'all'))
+      const rangeStartStr = toDateString(periodInfo.range.start)
+      const rangeEndStr = toDateString(periodInfo.range.end)
+      const todayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
+      if (todayOnly) {
+        const painted = await withColdFirstPaintFloor(todayStart, () => parseAllSessions(todayRange, 'all'))
+        todayAllProjects = fp(painted.result)
+      } else {
+        todayAllProjects = fp(await parseAllSessions(todayRange, 'all'))
+      }
     }
     return todayAllProjects
   }
