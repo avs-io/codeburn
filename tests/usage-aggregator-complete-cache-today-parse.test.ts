@@ -158,4 +158,29 @@ describe('buildDurablePeriod complete-cache today-only live parse', () => {
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
     expect(parseRanges.some(range => new Date(range.start).getTime() < todayStart.getTime())).toBe(true)
   })
+
+  it('still parses a historical --day range even when the daily cache is complete', async () => {
+    const days = [6, 5, 4, 3, 2, 1].map(n => cachedDay(daysAgoStr(n), 10))
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: getDailyCacheConfigHash(),
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days,
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(ROOT, 'cache', `daily-cache.v${DAILY_CACHE_VERSION}.json`), JSON.stringify(cache), 'utf-8')
+
+    const dayStart = new Date(2026, 3, 10)
+    const dayEnd = new Date(2026, 3, 10, 23, 59, 59, 999)
+    parseRanges.length = 0
+    const durable = await buildDurablePeriod(
+      { range: { start: dayStart, end: dayEnd }, label: 'Day (2026-04-10)' },
+      { provider: 'all' },
+    )
+    expect(parseRanges.some(range => new Date(range.start).getTime() === dayStart.getTime())).toBe(true)
+    expect(durable.scanRange.start.getTime()).toBe(dayStart.getTime())
+    expect(durable.scanRange.end.getTime()).toBe(dayEnd.getTime())
+  })
 })

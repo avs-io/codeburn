@@ -558,7 +558,8 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const projectInclude = (opts.project ?? []).map(s => s.toLowerCase())
   const projectExclude = (opts.exclude ?? []).map(s => s.toLowerCase())
   const hasProjectFilter = projectInclude.length > 0 || projectExclude.length > 0
-  const historyFromCompleteCache = cache.complete === true && !isTodayOnly && !hasProjectFilter && !daysSelection
+  const rangeIncludesToday = rangeStartStr <= todayStr && rangeEndStr >= todayStr
+  const historyFromCompleteCache = cache.complete === true && !isTodayOnly && rangeIncludesToday && !hasProjectFilter && !daysSelection
 
   // Today's live data always comes from an all-provider parse so the union (and
   // any per-provider slice of it) sees every provider's today. `todayAllDays` is
@@ -649,6 +650,8 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   data.pricingCoverage = scanData.pricingCoverage
   // Cache buckets a session on its START day, the scan on any ACTIVE day; both
   // are lower bounds of distinct sessions, so max is the tightest safe bound.
+  // When the live parse is today-only, today.sessions cannot exceed the cached
+  // period's session count in any honest corpus, so this remains a lower bound.
   data.sessions = Math.max(data.sessions, scanData.sessions)
   // Tokens/models/categories have no per-project split in the day cache, so
   // sliceDayToProject drops them (see there). Under a project filter they come
@@ -785,6 +788,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     todayAllDays = durable.todayAllDays
   }
   claudeConfigs = claudeConfigs ?? await claudeConfigSelector(scanProjects, null)
+  const liveCoversRequestedPeriod = scanRange.start.getTime() <= periodInfo.range.start.getTime()
 
   // Codex credits for the period. Reuses the models aggregation (billable output
   // already includes reasoning for codex, keeps non-cached input + cached-read
@@ -956,7 +960,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
         // max for the same reason as the headline: start-day bucketing vs
         // active-day counting, both lower bounds of distinct sessions.
         sessions: Math.max(cached?.sessions ?? 0, live?.sessions.length ?? 0),
-        ...(live ? { sessionDetails: sessionDetailsOf(live) } : {}),
+        ...(live && liveCoversRequestedPeriod ? { sessionDetails: sessionDetailsOf(live) } : {}),
       }
     }).sort((a, b) => b.cost - a.cost)
   } else {
@@ -970,11 +974,13 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   }
 
   const effMap = aggregateModelEfficiency(scanProjects)
-  currentData.modelEfficiency = [...effMap.entries()].map(([name, eff]) => ({
-    name,
-    costPerEdit: eff.costPerEditUSD,
-    oneShotRate: eff.oneShotRate,
-  }))
+  currentData.modelEfficiency = liveCoversRequestedPeriod
+    ? [...effMap.entries()].map(([name, eff]) => ({
+        name,
+        costPerEdit: eff.costPerEditUSD,
+        oneShotRate: eff.oneShotRate,
+      }))
+    : []
 
   const retryTaxByModel = [...effMap.values()]
     .filter(m => m.retries > 0 && m.editTurns > 0)
@@ -992,15 +998,17 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     byModel: retryTaxByModel.slice(0, 5),
   }
 
-  currentData.topSessions = scanProjects.flatMap(p =>
-    p.sessions.map(s => ({
-      project: friendlyProject(p),
-      cost: s.totalCostUSD,
-      savingsUSD: s.totalSavingsUSD,
-      calls: s.apiCalls,
-      date: s.firstTimestamp?.split('T')[0] ?? '',
-    }))
-  ).sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD)).slice(0, 5)
+  currentData.topSessions = liveCoversRequestedPeriod
+    ? scanProjects.flatMap(p =>
+        p.sessions.map(s => ({
+          project: friendlyProject(p),
+          cost: s.totalCostUSD,
+          savingsUSD: s.totalSavingsUSD,
+          calls: s.apiCalls,
+          date: s.firstTimestamp?.split('T')[0] ?? '',
+        }))
+      ).sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD)).slice(0, 5)
+    : []
 
   // PULL REQUESTS + BRANCHES (all-provider path only). Both are session-layer
   // aggregations over the surviving-session parse, so carried history cannot
@@ -1011,7 +1019,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // quiet empty state) whenever there is nothing to show. Excluded on the
   // Claude-config-scoped path (which replaces scanProjects with one config's
   // sessions) so this stays the genuine unscoped all-provider aggregation.
-  if (isAllProviders && !effectivelyScoped) {
+  if (isAllProviders && !effectivelyScoped && liveCoversRequestedPeriod) {
     // One pass yields both rows and totals, so they never disagree.
     const { rows: prRows, totals: prTotals } = buildPrAttribution(scanProjects)
     if (prRows.length > 0) {

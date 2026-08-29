@@ -6,3 +6,4 @@ Date | branch/PR | metric | before → after | verdict | mechanism
 2026-08-30 | perf/period-switch-cache-today | period-switch first 7D/30D | 120.9/166.3 → 62.8/64.3 ms | kept | complete daily-cache 7D/30D live-parse is today-only
 2026-08-30 | perf/today-skip-history-backfill | cold-start-cli desktop/menubar p50 | 1651/1510 → 1375/1203 ms | kept | today-only status loads on-disk daily cache, skips 365d backfill
 2026-08-30 | perf/today-mtime-floor-dated | cold-start-cli desktop/menubar p50 | 1171/1177 → 616/546 ms | kept | today-only first-paint mtime floor + fixture mtimes stamped from event timestamps; 2509 files → 81
+2026-08-30 | perf/today-mtime-floor-dated extras | cold-start-cli honesty-gate | 554/556 → 562/556 ms (tsx, dated fixture) | kept (correctness) | rangeIncludesToday so --day/--from/--to keep full-range parse; omit 7D extras that would pretend today is the period; fingerprint skip reverted (wait-path still process-exit)
