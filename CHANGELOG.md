@@ -13,6 +13,7 @@
 - **A 7D / 30D menubar-json query no longer fingerprints the whole corpus when there is no status snapshot to hit and the first-paint cannot be persisted.** Today-only snapshots still fingerprint before the parse so a later append cannot poison the hash. Daily history reuses the durable today slice instead of a second unfloored today parse.
 - **A complete-cache 7D / 30D today-parse prefers the normalized session snapshot when it is complete.** That skips source discovery and the 12k-file fingerprint walk for first paint; headlines still union the daily cache with today, and an incomplete cache keeps the previous full-range parse.
 - **A resident-serve first paint of a complete-cache 7D / 30D answers from the daily cache without loading session shards.** Today is filled in the background; one-shot CLI still parses today. The payload is labelled incomplete until that fill so it is never memoized as exact.
+- **A resident-serve fill of a complete-cache 7D now memoizes the complete payload for the next identical poll even if session roots went dirty during that fill.** First paint stays incomplete and unmemoized. Fill itself is unfloored so the memo is a complete answer. One dirty hit is allowed; later dirty events still reparse.
 
 ## 0.9.23 - 2026-08-29
 

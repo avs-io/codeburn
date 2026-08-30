@@ -582,6 +582,12 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
     // "today" live parse is still a today question. Floor it the same way,
     // including cached historical files: re-reading those only to throw them
     // out of today is what made a warm 7D walk 12k sources.
+    // Background fill is the unfloored half of first paint. Snapshot-first
+    // and the 48h mtime floor are first-paint only; leaving them on here
+    // produces an incomplete payload that serve must not memoize.
+    if (process.env['CODEBURN_SERVE_FILL'] === '1') {
+      return parseAllSessions(todayRange, provider)
+    }
     const painted = await withColdFirstPaintFloor(
       todayStart,
       () => parseAllSessions(todayRange, provider),

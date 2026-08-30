@@ -55,6 +55,7 @@ type OutputMemoEntry = {
   validatedFrom: number
   output: string
   configFingerprint: string
+  allowDirtyOnce?: boolean
 }
 
 // Kept as a small seam so the ordering contract can be tested without relying
@@ -65,8 +66,41 @@ export function createOutputMemoEntry(
   parseCompletedAt: number,
   output: string,
   configFingerprint: string,
+  options?: { allowDirtyOnce?: boolean },
 ): OutputMemoEntry {
-  return { createdAt: parseCompletedAt, validatedFrom: parseStartedAt, output, configFingerprint }
+  return {
+    createdAt: parseCompletedAt,
+    validatedFrom: parseStartedAt,
+    output,
+    configFingerprint,
+    ...(options?.allowDirtyOnce ? { allowDirtyOnce: true } : {}),
+  }
+}
+
+/// Fill writes the converged payload so the next identical poll can answer
+/// without re-deriving. Live session roots often keep firing during that fill
+/// (and in the few seconds after it), which would otherwise classify the memo
+/// as dirty and force a second full serve. One dirty hit is allowed; later
+/// dirty events still reparse.
+export function consumeOutputMemo(
+  memo: OutputMemoEntry | undefined,
+  args: {
+    configFingerprint: string | null
+    now: number
+    capMs: number
+    reuse: ParseReuseValidation | undefined
+  },
+): { hit: boolean } {
+  if (!memo || args.configFingerprint === null) return { hit: false }
+  if (memo.configFingerprint !== args.configFingerprint) return { hit: false }
+  if (args.now - memo.createdAt >= args.capMs) return { hit: false }
+  if (args.reuse === 'clean' || (args.reuse === 'dirty' && memo.allowDirtyOnce)) {
+    // Consume the fill grace on the first successful hit, including a clean
+    // one. Leaving it armed would let a later real write reuse a stale fill.
+    if (memo.allowDirtyOnce) memo.allowDirtyOnce = false
+    return { hit: true }
+  }
+  return { hit: false }
 }
 
 type ServeOptionKind = 'flag' | 'value'
@@ -501,7 +535,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           // Memoized so the poll that follows the fill answers instantly with
           // the converged payload instead of re-deriving it.
           if (code === 0 && fingerprint !== null) {
-            outputMemo.set(args.join('\u0000'), createOutputMemoEntry(startedAt, Date.now(), output, fingerprint))
+            if (!payloadNeedsTodayFill(output)) {
+              outputMemo.set(args.join('\u0000'), createOutputMemoEntry(startedAt, Date.now(), output, fingerprint, { allowDirtyOnce: true }))
+            }
           }
         } catch {
           // Best effort. A failed fill leaves the cache incomplete, which is
@@ -550,12 +586,13 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
 
       const memoKey = request.args.join('\u0000')
       const memoHit = outputMemo.get(memoKey)
-      if (
-        configFingerprint !== null
-        && memoHit?.configFingerprint === configFingerprint
-        && Date.now() - memoHit.createdAt < OUTPUT_MEMO_CAP_MS
-        && rootReuseValidation?.(memoHit.validatedFrom) === 'clean'
-      ) {
+      const reuse = memoHit ? rootReuseValidation?.(memoHit.validatedFrom) : undefined
+      if (consumeOutputMemo(memoHit, {
+        configFingerprint,
+        now: Date.now(),
+        capMs: OUTPUT_MEMO_CAP_MS,
+        reuse,
+      }).hit && memoHit) {
         write({ id: request.id, ok: true, output: memoHit.output })
         return
       }
