@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, type ChildProcess } from 'child_process'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo } from '../src/serve.js'
+import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo, canBypassFillWithLastGood } from '../src/serve.js'
 
 it('timestamps a completed output memo before parsing begins', () => {
   const parseStartedAt = 100
@@ -27,27 +27,23 @@ it('classifies watcher gaps as unknown without confusing them with dirty roots',
   expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 99, healthy: true })).toBe('clean')
 })
 
-it('lets a fill memo answer the next identical poll once even if roots went dirty', () => {
-  const memo = createOutputMemoEntry(100, 200, 'filled', 'config', { allowDirtyOnce: true })
-  const args = { configFingerprint: 'config', now: 250, capMs: 5 * 60 * 1000, reuse: 'dirty' as const }
-  expect(consumeOutputMemo(memo, args).hit).toBe(true)
-  expect(consumeOutputMemo(memo, args).hit).toBe(false)
+it('serves last-good incomplete only while a fill is pending for that argv', () => {
+  const lastGood = { configFingerprint: 'config' }
+  expect(canBypassFillWithLastGood({ fillPending: false, lastGood, configFingerprint: 'config' })).toBe(false)
+  expect(canBypassFillWithLastGood({ fillPending: true, lastGood: undefined, configFingerprint: 'config' })).toBe(false)
+  expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: 'other' })).toBe(false)
+  expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: null })).toBe(false)
+  expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: 'config' })).toBe(true)
 })
 
-it('consumes the fill grace on a clean hit so a later dirty poll reparses', () => {
-  const memo = createOutputMemoEntry(100, 200, 'filled', 'config', { allowDirtyOnce: true })
-  expect(consumeOutputMemo(memo, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'clean' }).hit).toBe(true)
-  expect(consumeOutputMemo(memo, { configFingerprint: 'config', now: 260, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
-})
-
-it('still refuses a dirty ordinary memo and an unknown fill memo', () => {
+it('refuses dirty and unknown memos, including a fill memo', () => {
   const ordinary = createOutputMemoEntry(100, 200, 'ordinary', 'config')
-  const filled = createOutputMemoEntry(100, 200, 'filled', 'config', { allowDirtyOnce: true })
+  const filled = createOutputMemoEntry(100, 200, 'filled', 'config')
   expect(consumeOutputMemo(ordinary, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
   expect(consumeOutputMemo(ordinary, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'clean' }).hit).toBe(true)
   expect(consumeOutputMemo(filled, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'unknown' }).hit).toBe(false)
-  expect(consumeOutputMemo(filled, { configFingerprint: 'other', now: 250, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
-  expect(consumeOutputMemo(filled, { configFingerprint: 'config', now: 200 + 60_000, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
+  expect(consumeOutputMemo(filled, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
+  expect(consumeOutputMemo(filled, { configFingerprint: 'other', now: 250, capMs: 60_000, reuse: 'clean' }).hit).toBe(false)
 })
 
 // End-to-end protocol test for `codeburn serve --stdio` (the desktop app's

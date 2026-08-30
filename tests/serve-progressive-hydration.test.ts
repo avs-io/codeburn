@@ -107,10 +107,16 @@ describe('codeburn serve --stdio progressive cold start', () => {
     expect(partial.hydration!.totalFiles).toBeGreaterThan(partial.hydration!.indexedFiles)
     expect(partial.stale).toBeUndefined()
 
-    // Poll the way every consumer does. The partial answer is never memoized,
-    // so a later poll re-derives (or picks up the fill's converged payload).
+    // An identical poll while fill is pending must reuse the labelled partial
+    // immediately instead of waiting on the serialized fill.
+    const duringFill = await request(2, PAYLOAD_ARGS)
+    expect(duringFill["ok"]).toBe(true)
+    expect(duringFill["output"]).toBe(first["output"])
+
+    // Poll the way every consumer does. The partial answer is never memoized
+    // as exact, so a later poll still converges to the fill payload.
     let converged: { hydration?: { complete: boolean; indexedFiles: number; totalFiles: number } } | null = null
-    for (let id = 2; id < 40; id++) {
+    for (let id = 3; id < 40; id++) {
       const response = await request(id, PAYLOAD_ARGS)
       const payload = JSON.parse(response['output'] as string)
       // Convergence = the hydration block disappears (absence means complete).

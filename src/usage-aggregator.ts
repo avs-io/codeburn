@@ -585,7 +585,7 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
     // Background fill is the unfloored half of first paint. Snapshot-first
     // and the 48h mtime floor are first-paint only; leaving them on here
     // produces an incomplete payload that serve must not memoize.
-    if (process.env['CODEBURN_SERVE_FILL'] === '1') {
+    if (process.env['CODEBURN_SERVE_FILL_ACTIVE'] === '1') {
       return parseAllSessions(todayRange, provider)
     }
     const painted = await withColdFirstPaintFloor(

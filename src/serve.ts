@@ -55,7 +55,6 @@ type OutputMemoEntry = {
   validatedFrom: number
   output: string
   configFingerprint: string
-  allowDirtyOnce?: boolean
 }
 
 // Kept as a small seam so the ordering contract can be tested without relying
@@ -66,22 +65,10 @@ export function createOutputMemoEntry(
   parseCompletedAt: number,
   output: string,
   configFingerprint: string,
-  options?: { allowDirtyOnce?: boolean },
 ): OutputMemoEntry {
-  return {
-    createdAt: parseCompletedAt,
-    validatedFrom: parseStartedAt,
-    output,
-    configFingerprint,
-    ...(options?.allowDirtyOnce ? { allowDirtyOnce: true } : {}),
-  }
+  return { createdAt: parseCompletedAt, validatedFrom: parseStartedAt, output, configFingerprint }
 }
 
-/// Fill writes the converged payload so the next identical poll can answer
-/// without re-deriving. Live session roots often keep firing during that fill
-/// (and in the few seconds after it), which would otherwise classify the memo
-/// as dirty and force a second full serve. One dirty hit is allowed; later
-/// dirty events still reparse.
 export function consumeOutputMemo(
   memo: OutputMemoEntry | undefined,
   args: {
@@ -94,13 +81,24 @@ export function consumeOutputMemo(
   if (!memo || args.configFingerprint === null) return { hit: false }
   if (memo.configFingerprint !== args.configFingerprint) return { hit: false }
   if (args.now - memo.createdAt >= args.capMs) return { hit: false }
-  if (args.reuse === 'clean' || (args.reuse === 'dirty' && memo.allowDirtyOnce)) {
-    // Consume the fill grace on the first successful hit, including a clean
-    // one. Leaving it armed would let a later real write reuse a stale fill.
-    if (memo.allowDirtyOnce) memo.allowDirtyOnce = false
-    return { hit: true }
-  }
-  return { hit: false }
+  // Dirty/unknown is a real root event (or a coverage gap). Serving the fill
+  // memo anyway would hide a transcript write that landed during or after fill.
+  return { hit: args.reuse === 'clean' }
+}
+
+/// While a background fill holds the serialized queue, an identical-argv poll
+/// must not wait on that fill. The incomplete first paint is already labelled
+/// hydration.complete false; serving it again is honest and keeps the client
+/// off the fill. The fill still replaces this with a complete memo.
+export function canBypassFillWithLastGood(opts: {
+  fillPending: boolean
+  lastGood: { configFingerprint: string } | undefined
+  configFingerprint: string | null
+}): boolean {
+  return opts.fillPending
+    && opts.lastGood != null
+    && opts.configFingerprint !== null
+    && opts.lastGood.configFingerprint === opts.configFingerprint
 }
 
 type ServeOptionKind = 'flag' | 'value'
@@ -499,6 +497,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // the ordinary full path.
   let firstPaintSettled = false
   let fillTimer: ReturnType<typeof setTimeout> | undefined
+  const fillPendingKeys = new Set<string>()
+  const lastGoodPartial = new Map<string, { output: string; configFingerprint: string }>()
 
   // The other half of the first paint: the same request, unfloored. It is an
   // ordinary parse, so what it writes to the session and daily caches is
@@ -507,6 +507,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // mid-fill, nothing is stamped complete and the next launch re-enters cold.
   const scheduleBackgroundFill = (args: string[]): void => {
     if (fillTimer) return
+    const fillKey = args.join('\u0000')
+    fillPendingKeys.add(fillKey)
     const delayMs = Number(process.env['CODEBURN_SERVE_FILL_DELAY_MS']) || DEFAULT_FILL_DELAY_MS
     fillTimer = setTimeout(() => {
       queue = queue.then(async () => {
@@ -516,6 +518,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         try {
           const prevFill = process.env['CODEBURN_SERVE_FILL']
           process.env['CODEBURN_SERVE_FILL'] = '1'
+          process.env['CODEBURN_SERVE_FILL_ACTIVE'] = '1'
           let output = ''
           let code = 1
           try {
@@ -523,7 +526,10 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
             output = captured.output
             code = captured.code
           } finally {
+            delete process.env['CODEBURN_SERVE_FILL_ACTIVE']
             if (code === 0) {
+              // Persist FILL so later polls parse today instead of skipping it.
+              // Do not leave FILL_ACTIVE set: that unfloors only this fill run.
               process.env['CODEBURN_SERVE_FILL'] = '1'
             } else if (prevFill === undefined) {
               delete process.env['CODEBURN_SERVE_FILL']
@@ -536,13 +542,15 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           // the converged payload instead of re-deriving it.
           if (code === 0 && fingerprint !== null) {
             if (!payloadNeedsTodayFill(output)) {
-              outputMemo.set(args.join('\u0000'), createOutputMemoEntry(startedAt, Date.now(), output, fingerprint, { allowDirtyOnce: true }))
+              outputMemo.set(fillKey, createOutputMemoEntry(startedAt, Date.now(), output, fingerprint))
+              lastGoodPartial.delete(fillKey)
             }
           }
         } catch {
           // Best effort. A failed fill leaves the cache incomplete, which is
           // exactly the state the next cold start knows how to resume from.
         } finally {
+          fillPendingKeys.delete(fillKey)
           stopProgressKeepalive()
         }
       })
@@ -557,6 +565,19 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     const trimmed = line.trim()
     if (!trimmed) return
     const waitingId = peekRequestId(trimmed)
+    try {
+      const maybe = JSON.parse(trimmed)
+      if (isServeRequest(maybe) && allowed(maybe.args)) {
+        const bypassKey = maybe.args.join('\u0000')
+        const lastGood = lastGoodPartial.get(bypassKey)
+        if (canBypassFillWithLastGood({ fillPending: fillPendingKeys.has(bypassKey), lastGood, configFingerprint: observedConfigFingerprint ?? null }) && lastGood) {
+          write({ id: maybe.id, ok: true, output: lastGood.output })
+          return
+        }
+      }
+    } catch {
+      // Malformed lines still go through the queued handler so they get a protocol error instead of disappearing.
+    }
     if (waitingId !== null) awaiting.add(waitingId)
     queue = queue.then(async () => {
       let request: unknown
@@ -646,6 +667,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
             if (oldest) outputMemo.delete(oldest[0])
           }
           write({ id: request.id, ok: true, output })
+          if (payloadNeedsTodayFill(output) && configFingerprint !== null) {
+            lastGoodPartial.set(memoKey, { output, configFingerprint })
+          }
           if (deferredFiles > 0) scheduleBackgroundFill(request.args)
           else if (payloadNeedsTodayFill(output)) {
             scheduleBackgroundFill(request.args)
