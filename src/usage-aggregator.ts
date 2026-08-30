@@ -4,7 +4,7 @@ import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot, withColdFirstPaintFloor } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
-import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
+import { getAllProviders, hasDetectableSessions } from './providers/index.js'
 import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
@@ -872,8 +872,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     }
     for (const p of allProviders) {
       if (providers.some(pc => pc.name === p.name)) continue
-      const sources = await safeDiscoverSessions(p)
-      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0 })
+      if (await hasDetectableSessions(p)) providers.push({ name: p.name, displayName: p.displayName, cost: 0 })
     }
   } else {
     providers.push({ name: pf, displayName: displayNameByName.get(pf) ?? pf, cost: currentData.cost })

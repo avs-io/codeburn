@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { providers, getAllProviders, getProvider, safeDiscoverSessions, discoverAllSessions } from '../src/providers/index.js'
+import { providers, getAllProviders, getProvider, safeDiscoverSessions, discoverAllSessions, hasDetectableSessions } from '../src/providers/index.js'
 import type { Provider } from '../src/providers/types.js'
 
 function fakeProvider(name: string, discover: Provider['discoverSessions']): Provider {
@@ -167,5 +167,95 @@ describe('provider registry', () => {
       const sources = await discoverAllSessions('keep', [ok1, ok2])
       expect(sources.map(s => s.path)).toEqual(['/keep.jsonl'])
     })
+  })
+})
+
+describe('hasDetectableSessions', () => {
+  it('skips discovery when every probe root is missing', async () => {
+    const discover = vi.fn(async () => [{ path: '/sessions/a.jsonl', project: 'p', provider: 'probe-missing' }])
+    const provider: Provider = {
+      ...fakeProvider('probe-missing', discover),
+      async probeRoots() {
+        return [{ path: '/definitely-not-installed-codeburn-probe-root', label: 'home' }]
+      },
+    }
+    await expect(hasDetectableSessions(provider)).resolves.toBe(false)
+    expect(discover).not.toHaveBeenCalled()
+  })
+
+  it('short-circuits Codex on a non-empty sessions dir without listing files', async () => {
+    const { mkdtempSync, mkdirSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'codeburn-codex-year-'))
+    mkdirSync(join(dir, '2026'))
+    const discover = vi.fn(async () => [{ path: '/sessions/a.jsonl', project: 'p', provider: 'codex' }])
+    const provider: Provider = {
+      ...fakeProvider('codex', discover),
+      name: 'codex',
+      async probeRoots() {
+        return [{ path: dir, label: 'sessions' }]
+      },
+    }
+    await expect(hasDetectableSessions(provider)).resolves.toBe(true)
+    expect(discover).not.toHaveBeenCalled()
+  })
+
+  it('does not treat an empty existing Codex dir as a session source', async () => {
+    const { mkdtempSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'codeburn-empty-codex-'))
+    const discover = vi.fn(async () => [{ path: '/sessions/a.jsonl', project: 'p', provider: 'codex' }])
+    const provider: Provider = {
+      ...fakeProvider('codex', discover),
+      name: 'codex',
+      async probeRoots() {
+        return [{ path: dir, label: 'sessions' }]
+      },
+    }
+    await expect(hasDetectableSessions(provider)).resolves.toBe(false)
+    expect(discover).not.toHaveBeenCalled()
+  })
+
+  it('still discovers non-Codex providers after a cheap existing-root check', async () => {
+    const discover = vi.fn(async () => [])
+    const provider: Provider = {
+      ...fakeProvider('copilot', discover),
+      name: 'copilot',
+      async probeRoots() {
+        return [{ path: '/tmp', label: 'store' }]
+      },
+    }
+    await expect(hasDetectableSessions(provider)).resolves.toBe(false)
+    expect(discover).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to discovery when probeRoots is absent', async () => {
+    const present = fakeProvider('no-probe-present', async () => [{ path: '/a.jsonl', project: 'p', provider: 'no-probe-present' }])
+    const absent = fakeProvider('no-probe-absent', async () => [])
+    await expect(hasDetectableSessions(present)).resolves.toBe(true)
+    await expect(hasDetectableSessions(absent)).resolves.toBe(false)
+  })
+
+  it('returns false and warns once when probeRoots throws', async () => {
+    const warn = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    const discover = vi.fn(async () => [{ path: '/a.jsonl', project: 'p', provider: 'boom-probe' }])
+    const provider: Provider = {
+      ...fakeProvider('boom-probe', discover),
+      async probeRoots() {
+        throw new Error('probe blew up')
+      },
+    }
+    try {
+      await expect(hasDetectableSessions(provider)).resolves.toBe(false)
+      expect(discover).not.toHaveBeenCalled()
+      expect(String(warn.mock.calls[0]![0])).toContain('boom-probe')
+      const afterFirst = warn.mock.calls.length
+      await hasDetectableSessions(provider)
+      expect(warn.mock.calls.length).toBe(afterFirst)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
