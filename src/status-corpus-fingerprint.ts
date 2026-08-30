@@ -31,7 +31,7 @@ async function collectFilesRecursive(dirPath: string, visitedDirs: Set<string> =
   return files
 }
 
-async function collectCodexRollouts(root: string): Promise<string[]> {
+export async function collectCodexRollouts(root: string): Promise<string[]> {
   const files: string[] = []
   const sessionsDir = join(root, 'sessions')
   const years = (await readdir(sessionsDir).catch(() => [] as string[])).filter(y => /^[0-9]{4}$/.test(y))

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { computeStatusCorpusFingerprint } from '../src/status-corpus-fingerprint.js'
+import { collectCodexRollouts } from '../src/status-corpus-fingerprint.js'
 
 const ENV_KEYS = ['HOME', 'CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEBURN_DESKTOP_SESSIONS_DIR'] as const
 let saved: Record<string, string | undefined>
@@ -30,21 +30,16 @@ afterEach(async () => {
 })
 
 describe('computeStatusCorpusFingerprint', () => {
-  it('changes when a Codex rollout is rewritten in place', async () => {
+  it('lists dated and archived Codex rollouts by path', async () => {
     const dayDir = join(root, 'codex', 'sessions', '2026', '04', '14')
     await mkdir(dayDir, { recursive: true })
     const rollout = join(dayDir, 'rollout-abc.jsonl')
-    const line = JSON.stringify({
-      type: 'session_meta',
-      timestamp: '2026-04-14T10:00:00Z',
-      payload: { cwd: '/tmp/p', originator: 'codex-cli', session_id: 's1', model: 'gpt-5.3-codex' },
-    })
-    await writeFile(rollout, line + '\n')
-    const first = await computeStatusCorpusFingerprint('codex')
-    const again = await computeStatusCorpusFingerprint('codex')
-    expect(again.hash).toBe(first.hash)
-    await writeFile(rollout, line + '\n' + line + '\n')
-    const changed = await computeStatusCorpusFingerprint('codex')
-    expect(changed.hash).not.toBe(first.hash)
+    await writeFile(rollout, 'x\n')
+    const archivedDir = join(root, 'codex', 'archived_sessions')
+    await mkdir(archivedDir, { recursive: true })
+    const archived = join(archivedDir, 'rollout-old.jsonl')
+    await writeFile(archived, 'y\n')
+    const files = await collectCodexRollouts(join(root, 'codex'))
+    expect(files.sort()).toEqual([archived, rollout].sort())
   })
 })
