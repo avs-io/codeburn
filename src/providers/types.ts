@@ -128,4 +128,8 @@ export type Provider = {
   // "tool not installed" vs "wrong override" is distinguishable). Providers
   // without it fall back to the paths of whatever sessions were discovered.
   probeRoots?(): Promise<ProbeRoot[]>
+  // Cheap "would discoverSessions return at least one source?" check. Optional.
+  // Used only for leftover $0 tabs so a large corpus is not listed just to
+  // keep a tab. Must stay equivalent to discoverSessions().length > 0.
+  hasDetectableSessions?(): Promise<boolean>
 }

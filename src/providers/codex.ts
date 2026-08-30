@@ -596,6 +596,39 @@ async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]>
   return sources
 }
 
+async function newestFirstNames(dir: string, test: (name: string) => boolean): Promise<string[]> {
+  const names = (await readdir(dir).catch(() => [] as string[])).filter(test)
+  names.sort((a, b) => b.localeCompare(a))
+  return names
+}
+
+/// True iff discoverSessionsInDir would return at least one source. Walks
+/// newest year/month/day first and stops at the first valid rollout so a
+/// leftover $0 tab does not list thousands of files.
+export async function codexDirHasDetectableSession(codexDir: string): Promise<boolean> {
+  const sessionsDir = join(codexDir, 'sessions')
+  const years = await newestFirstNames(sessionsDir, name => /^\d{4}$/.test(name))
+  for (const year of years) {
+    const months = await newestFirstNames(join(sessionsDir, year), name => /^\d{2}$/.test(name))
+    for (const month of months) {
+      const days = await newestFirstNames(join(sessionsDir, year, month), name => /^\d{2}$/.test(name))
+      for (const day of days) {
+        const dayDir = join(sessionsDir, year, month, day)
+        const files = await newestFirstNames(dayDir, name => name.startsWith('rollout-') && name.endsWith('.jsonl'))
+        for (const file of files) {
+          if (await discoverSessionFile(join(dayDir, file))) return true
+        }
+      }
+    }
+  }
+  const archivedDir = join(codexDir, 'archived_sessions')
+  const archived = await newestFirstNames(archivedDir, name => name.startsWith('rollout-') && name.endsWith('.jsonl'))
+  for (const file of archived) {
+    if (await discoverSessionFile(join(archivedDir, file))) return true
+  }
+  return false
+}
+
 // The model fields come off an unchecked JSON.parse cast, so a third-party
 // rollout can carry a non-string `model`. It flows straight into calculateCost,
 // which calls `.replace()` on it, so pick the first genuine string and never let
@@ -1385,6 +1418,13 @@ export function createCodexProvider(
       if (duplicateHome) return []
       if (scanBoth) return [...rootsFor(primaryDir), ...rootsFor(dir)]
       return rootsFor(dir)
+    },
+
+    async hasDetectableSessions(): Promise<boolean> {
+      if (duplicateHome) return false
+      if (await codexDirHasDetectableSession(dir)) return true
+      if (scanBoth) return codexDirHasDetectableSession(primaryDir)
+      return false
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

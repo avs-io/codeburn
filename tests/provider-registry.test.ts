@@ -183,38 +183,49 @@ describe('hasDetectableSessions', () => {
     expect(discover).not.toHaveBeenCalled()
   })
 
-  it('short-circuits Codex on a non-empty sessions dir without listing files', async () => {
+  it('does not treat an empty Codex year dir as a session source', async () => {
     const { mkdtempSync, mkdirSync } = await import('node:fs')
     const { tmpdir } = await import('node:os')
     const { join } = await import('node:path')
-    const dir = mkdtempSync(join(tmpdir(), 'codeburn-codex-year-'))
-    mkdirSync(join(dir, '2026'))
-    const discover = vi.fn(async () => [{ path: '/sessions/a.jsonl', project: 'p', provider: 'codex' }])
-    const provider: Provider = {
-      ...fakeProvider('codex', discover),
-      name: 'codex',
-      async probeRoots() {
-        return [{ path: dir, label: 'sessions' }]
-      },
-    }
-    await expect(hasDetectableSessions(provider)).resolves.toBe(true)
+    const { createCodexProvider } = await import('../src/providers/codex.js')
+    const home = mkdtempSync(join(tmpdir(), 'codeburn-empty-year-'))
+    mkdirSync(join(home, 'sessions', '2026'), { recursive: true })
+    const provider = createCodexProvider(home)
+    const discover = vi.spyOn(provider, 'discoverSessions')
+    await expect(hasDetectableSessions(provider)).resolves.toBe(false)
     expect(discover).not.toHaveBeenCalled()
   })
 
-  it('does not treat an empty existing Codex dir as a session source', async () => {
-    const { mkdtempSync } = await import('node:fs')
+  it('ignores a malformed archived Codex rollout name', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs')
     const { tmpdir } = await import('node:os')
     const { join } = await import('node:path')
-    const dir = mkdtempSync(join(tmpdir(), 'codeburn-empty-codex-'))
-    const discover = vi.fn(async () => [{ path: '/sessions/a.jsonl', project: 'p', provider: 'codex' }])
-    const provider: Provider = {
-      ...fakeProvider('codex', discover),
-      name: 'codex',
-      async probeRoots() {
-        return [{ path: dir, label: 'sessions' }]
-      },
-    }
+    const { createCodexProvider } = await import('../src/providers/codex.js')
+    const home = mkdtempSync(join(tmpdir(), 'codeburn-bad-archive-'))
+    mkdirSync(join(home, 'archived_sessions'), { recursive: true })
+    writeFileSync(join(home, 'archived_sessions', 'rollout-not-a-session.jsonl'), '{"type":"not-session-meta"}\n')
+    const provider = createCodexProvider(home)
+    const discover = vi.spyOn(provider, 'discoverSessions')
     await expect(hasDetectableSessions(provider)).resolves.toBe(false)
+    expect(discover).not.toHaveBeenCalled()
+  })
+
+  it('short-circuits Codex after the first valid rollout without listing the corpus', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { createCodexProvider } = await import('../src/providers/codex.js')
+    const home = mkdtempSync(join(tmpdir(), 'codeburn-valid-codex-'))
+    const dayDir = join(home, 'sessions', '2026', '04', '14')
+    mkdirSync(dayDir, { recursive: true })
+    writeFileSync(join(dayDir, 'rollout-abc123.jsonl'), JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: { cwd: '/tmp/proj', originator: 'codex-cli', session_id: 'sess-1', model: 'gpt-5.3-codex' },
+    }) + '\n')
+    const provider = createCodexProvider(home)
+    const discover = vi.spyOn(provider, 'discoverSessions')
+    await expect(hasDetectableSessions(provider)).resolves.toBe(true)
     expect(discover).not.toHaveBeenCalled()
   })
 

@@ -17,7 +17,7 @@
 - **A resident-serve poll of a complete-cache 7D no longer waits on the serialized background fill.** While fill is pending, an identical-argv request is answered from the labelled incomplete first paint. Fill still converges to a complete memo afterward.
 - **A last-good fill bypass now fingerprints config.json on the request path and expires if fill does not converge.** A currency or config change during fill no longer returns the previous payload. A wedged fill cannot pin the incomplete answer forever.
 - **Desktop resident serve no longer stays disabled for the rest of a long session after three child deaths.** After a 5-minute cooldown it retries the resident child instead of one-shoting every period switch until quit.
-- **An all-provider menubar-json query no longer lists every leftover provider session file just to keep a $0 tab.** Missing probe roots skip discovery. Codex with a non-empty sessions/archived dir is treated as installed-but-zero without walking thousands of rollouts. Other leftover providers still discover, so a VS Code storage folder is not a Copilot tab.
+- **An all-provider menubar-json query no longer lists every leftover provider session file just to keep a $0 tab.** Missing probe roots skip discovery. Codex stops at the first valid rollout instead of walking thousands of files. Empty year dirs and malformed archived rollouts stay hidden. Other leftover providers still discover, so a VS Code storage folder is not a Copilot tab.
 
 ## 0.9.23 - 2026-08-29
 

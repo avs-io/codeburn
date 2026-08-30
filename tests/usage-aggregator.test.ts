@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, vi } from 'vitest'
-import { mkdir } from 'fs/promises'
+import { mkdir, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { buildMenubarPayloadForRange } from '../src/usage-aggregator.js'
@@ -34,14 +34,16 @@ describe('buildMenubarPayloadForRange', () => {
 describe('installed-but-zero provider tabs', () => {
   it('does not list Codex session files just to keep a $0 tab', async () => {
     const home = join(tmpdir(), `codeburn-zero-cost-probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
-    const sessions = join(home, 'sessions')
-    await mkdir(sessions, { recursive: true })
-    await mkdir(join(sessions, '2026'))
+    const dayDir = join(home, 'sessions', '2026', '04', '14')
+    await mkdir(dayDir, { recursive: true })
+    await writeFile(join(dayDir, 'rollout-abc123.jsonl'), JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: { cwd: '/tmp/proj', originator: 'codex-cli', session_id: 'sess-1', model: 'gpt-5.3-codex' },
+    }) + '\n')
     const provider = createCodexProvider(home)
     const discover = vi.spyOn(provider, 'discoverSessions')
-    const probe = vi.spyOn(provider, 'probeRoots')
     await expect((await import('../src/providers/index.js')).hasDetectableSessions(provider)).resolves.toBe(true)
-    expect(probe).toHaveBeenCalled()
     expect(discover).not.toHaveBeenCalled()
   })
 })

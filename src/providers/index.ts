@@ -28,7 +28,7 @@ import { rooCode } from './roo-code.js'
 import { zerostack } from './zerostack.js'
 import { grok } from './grok.js'
 import type { Provider, SessionSource } from './types.js'
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 
 let antigravityProvider: Provider | null = null
 let antigravityLoadAttempted = false
@@ -279,39 +279,35 @@ export async function safeDiscoverSessions(provider: Provider): Promise<SessionS
 
 const warnedProbeFailures = new Set<string>()
 
-function codexRootLooksPopulated(path: string): boolean {
-  try {
-    const info = statSync(path)
-    if (info.isFile()) return path.endsWith('.jsonl')
-    if (!info.isDirectory()) return false
-    return readdirSync(path).some(name =>
-      /^\d{4}$/.test(name) || (name.startsWith('rollout-') && name.endsWith('.jsonl')),
-    )
-  } catch {
-    return false
-  }
+function warnProbeFailure(provider: Provider, err: unknown): void {
+  if (warnedProbeFailures.has(provider.name)) return
+  warnedProbeFailures.add(provider.name)
+  const msg = err instanceof Error ? err.message : String(err)
+  process.stderr.write(
+    `codeburn: skipped ${provider.name} session probe after an error: ${msg}\n`
+  )
 }
 
 // Installed-but-zero for the menubar tab list. probeRoots is a cheap negative
-// ("nothing to scan") and, for Codex, a non-empty-dir short-circuit so we do
-// not walk thousands of rollout files just to keep a $0 tab. Existing roots
-// for other providers still fall through to discovery — a VS Code storage
-// folder is not the same as a session source.
+// ("nothing to scan"). Codex implements hasDetectableSessions so a leftover
+// $0 tab does not list thousands of rollouts and stays equivalent to
+// discoverSessions().length > 0. Other leftover providers still discover,
+// so a VS Code storage folder is not a Copilot tab.
 export async function hasDetectableSessions(provider: Provider): Promise<boolean> {
+  if (provider.hasDetectableSessions) {
+    try {
+      return await provider.hasDetectableSessions()
+    } catch (err) {
+      warnProbeFailure(provider, err)
+      return false
+    }
+  }
   if (provider.probeRoots) {
     try {
       const roots = await provider.probeRoots()
-      const existing = roots.filter(root => existsSync(root.path))
-      if (existing.length === 0) return false
-      if (provider.name === 'codex') return existing.some(root => codexRootLooksPopulated(root.path))
+      if (!roots.some(root => existsSync(root.path))) return false
     } catch (err) {
-      if (!warnedProbeFailures.has(provider.name)) {
-        warnedProbeFailures.add(provider.name)
-        const msg = err instanceof Error ? err.message : String(err)
-        process.stderr.write(
-          `codeburn: skipped ${provider.name} session probe after an error: ${msg}\n`
-        )
-      }
+      warnProbeFailure(provider, err)
       return false
     }
   }
