@@ -49,6 +49,7 @@ const DEFAULT_DRAIN_MS = 45_000
 // that a client which then goes quiet still converges promptly.
 // CODEBURN_SERVE_FILL_DELAY_MS overrides it for tests.
 const DEFAULT_FILL_DELAY_MS = 3_000
+const DEFAULT_FILL_MAX_MS = 60_000
 
 type OutputMemoEntry = {
   createdAt: number
@@ -99,6 +100,16 @@ export function canBypassFillWithLastGood(opts: {
     && opts.lastGood != null
     && opts.configFingerprint !== null
     && opts.lastGood.configFingerprint === opts.configFingerprint
+}
+
+/// Last-good fill bypass is only honest while fill is still expected to
+/// converge. A wedged fill must not pin the incomplete payload forever.
+export function fillBypassExpired(opts: {
+  fillStartedAt: number
+  now: number
+  maxMs: number
+}): boolean {
+  return opts.fillStartedAt > 0 && opts.now - opts.fillStartedAt >= opts.maxMs
 }
 
 /// A complete fill/poll memo that failed clean reuse is still useful last-good.
@@ -512,8 +523,10 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   const write = (value: unknown): void => { protocolWrite(JSON.stringify(value) + '\n') }
   write({ ready: true, pid: process.pid })
 
-  // Strict serialization: each request chains on the previous one.
+  // User requests are serialized on queue so drain sees them immediately.
+  // Fill/refresh run on workQueue so a last-good poll does not wait behind fill.
   let queue: Promise<void> = Promise.resolve()
+  let workQueue: Promise<void> = Promise.resolve()
 
   // Progressive cold start (#1110). Ids of requests received but not yet
   // answered, so work that holds the queue can heartbeat them.
@@ -529,6 +542,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   const fillPendingKeys = new Set<string>()
   const lastGoodPartial = new Map<string, { output: string; configFingerprint: string }>()
   const refreshPendingKeys = new Set<string>()
+  let fillStartedAt = 0
+  const fillMaxMs = Number(process.env['CODEBURN_SERVE_FILL_MAX_MS']) || DEFAULT_FILL_MAX_MS
 
   // The other half of the first paint: the same request, unfloored. It is an
   // ordinary parse, so what it writes to the session and daily caches is
@@ -539,9 +554,10 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     if (fillTimer) return
     const fillKey = args.join('\u0000')
     fillPendingKeys.add(fillKey)
+    fillStartedAt = Date.now()
     const delayMs = Number(process.env['CODEBURN_SERVE_FILL_DELAY_MS']) || DEFAULT_FILL_DELAY_MS
     fillTimer = setTimeout(() => {
-      queue = queue.then(async () => {
+      workQueue = workQueue.then(async () => {
         const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
         startProgressKeepalive()
         const startedAt = Date.now()
@@ -581,6 +597,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           // exactly the state the next cold start knows how to resume from.
         } finally {
           fillPendingKeys.delete(fillKey)
+          fillStartedAt = 0
+          fillTimer = undefined
           stopProgressKeepalive()
         }
       })
@@ -594,7 +612,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     const refreshKey = args.join('\u0000')
     if (refreshPendingKeys.has(refreshKey) || fillPendingKeys.has(refreshKey)) return
     refreshPendingKeys.add(refreshKey)
-    queue = queue.then(async () => {
+    workQueue = workQueue.then(async () => {
       const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
       startProgressKeepalive()
       const startedAt = Date.now()
@@ -614,31 +632,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   }
 
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
-  rl.on('line', (line) => {
-    const trimmed = line.trim()
-    if (!trimmed) return
-    const waitingId = peekRequestId(trimmed)
-    try {
-      const maybe = JSON.parse(trimmed)
-      if (isServeRequest(maybe) && allowed(maybe.args)) {
-        const bypassKey = maybe.args.join('\u0000')
-        const lastGood = lastGoodPartial.get(bypassKey)
-        if (canBypassFillWithLastGood({ fillPending: fillPendingKeys.has(bypassKey), lastGood, configFingerprint: observedConfigFingerprint ?? null }) && lastGood) {
-          write({ id: maybe.id, ok: true, output: lastGood.output })
-          return
-        }
-        const memo = outputMemo.get(bypassKey)
-        if (refreshPendingKeys.has(bypassKey) && memo && observedConfigFingerprint != null && memo.configFingerprint === observedConfigFingerprint) {
-          const staleOutput = labelPayloadStale(memo.output)
-          if (staleOutput) {
-            write({ id: maybe.id, ok: true, output: staleOutput })
-            return
-          }
-        }
-      }
-    } catch {
-      // Malformed lines still go through the queued handler so they get a protocol error instead of disappearing.
-    }
+
+  const enqueueRequest = (trimmed: string, waitingId: string | number | null): void => {
     if (waitingId !== null) awaiting.add(waitingId)
     queue = queue.then(async () => {
       let request: unknown
@@ -671,6 +666,23 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       }
 
       const memoKey = request.args.join('\u0000')
+      if (fillBypassExpired({ fillStartedAt, now: Date.now(), maxMs: fillMaxMs })) {
+        fillPendingKeys.delete(memoKey)
+        lastGoodPartial.delete(memoKey)
+      }
+      const lastGood = lastGoodPartial.get(memoKey)
+      if (canBypassFillWithLastGood({ fillPending: fillPendingKeys.has(memoKey), lastGood, configFingerprint }) && lastGood) {
+        write({ id: request.id, ok: true, output: lastGood.output })
+        return
+      }
+      const refreshMemo = outputMemo.get(memoKey)
+      if (refreshPendingKeys.has(memoKey) && refreshMemo && configFingerprint !== null && refreshMemo.configFingerprint === configFingerprint) {
+        const staleOutput = labelPayloadStale(refreshMemo.output)
+        if (staleOutput) {
+          write({ id: request.id, ok: true, output: staleOutput })
+          return
+        }
+      }
       const memoHit = outputMemo.get(memoKey)
       const reuse = memoHit ? rootReuseValidation?.(memoHit.validatedFrom) : undefined
       if (consumeOutputMemo(memoHit, {
@@ -713,6 +725,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       // it lands back-to-back with the parse's own quiet stretches. Wrapping
       // here (rather than at each command's exits) covers every served command
       // at one seam, and runCaptured routes the beats out as progress frames.
+      if (fillPendingKeys.size > 0 || refreshPendingKeys.size > 0) {
+        await workQueue
+      }
       const { startProgressKeepalive, stopProgressKeepalive, withColdFirstPaintFloor } = await import('./parser.js')
       startProgressKeepalive()
       try {
@@ -780,6 +795,13 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     }).finally(() => {
       if (waitingId !== null) awaiting.delete(waitingId)
     })
+  }
+
+  rl.on('line', (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    const waitingId = peekRequestId(trimmed)
+    enqueueRequest(trimmed, waitingId)
   })
 
   // The app owns this process: stdin closing (or failing) means the app is

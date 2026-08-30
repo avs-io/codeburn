@@ -16,6 +16,7 @@
 - **A resident-serve fill of a complete-cache 7D is unfloored only while that fill is running.** CODEBURN_SERVE_FILL still persists so later polls parse today; the mtime floor and snapshot-first stay on for later dirty reparses. Incomplete fill is not memoized, and a dirty fill memo is not reused.
 - **A resident-serve poll of a complete-cache 7D no longer waits on the serialized background fill.** While fill is pending, an identical-argv request is answered from the labelled incomplete first paint. Fill still converges to a complete memo afterward.
 - **A resident-serve poll of a complete-cache 7D no longer waits 450 ms to re-derive after fill when session roots went dirty.** It returns the complete fill payload labelled stale and refreshes behind that answer. Exact reuse still requires clean roots; dirty-once exact reuse is not this.
+- **A last-good fill bypass now fingerprints config.json on the request path and expires if fill does not converge.** A currency or config change during fill no longer returns the previous payload. A wedged fill cannot pin the incomplete answer forever.
 
 ## 0.9.23 - 2026-08-29
 

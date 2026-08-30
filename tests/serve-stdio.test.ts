@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, type ChildProcess } from 'child_process'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo, canBypassFillWithLastGood, canServeStaleLastGood, labelPayloadStale } from '../src/serve.js'
+import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo, canBypassFillWithLastGood, canServeStaleLastGood, labelPayloadStale, fillBypassExpired } from '../src/serve.js'
 
 it('timestamps a completed output memo before parsing begins', () => {
   const parseStartedAt = 100
@@ -25,6 +25,12 @@ it('classifies watcher gaps as unknown without confusing them with dirty roots',
   expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 100, healthy: false })).toBe('dirty')
   expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 100, healthy: true })).toBe('dirty')
   expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 99, healthy: true })).toBe('clean')
+})
+
+it('expires last-good fill bypass after the fill deadline', () => {
+  expect(fillBypassExpired({ fillStartedAt: 100, now: 100 + 59_999, maxMs: 60_000 })).toBe(false)
+  expect(fillBypassExpired({ fillStartedAt: 100, now: 100 + 60_000, maxMs: 60_000 })).toBe(true)
+  expect(fillBypassExpired({ fillStartedAt: 0, now: 1_000_000, maxMs: 60_000 })).toBe(false)
 })
 
 it('serves last-good incomplete only while a fill is pending for that argv', () => {
