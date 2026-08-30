@@ -784,6 +784,41 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  it('does not let a today snapshot force a 7D corpus fingerprint before first paint', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-today-then-week-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const todayArgs = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const today = runCli(todayArgs, home)
+      expect(today.status, `stderr: ${today.stderr}`).toBe(0)
+      expect(findSnapshotFiles(join(home, '.cache', 'codeburn'))).toHaveLength(1)
+
+      const weekArgs = ['status', '--format', 'menubar-json', '--period', 'week', '--provider', 'all', '--no-optimize', '--no-timeline']
+      const firstWeek = runCli(weekArgs, home)
+      expect(firstWeek.status, `stderr: ${firstWeek.stderr}`).toBe(0)
+      const firstWeekPayload = JSON.parse(firstWeek.stdout) as { current: { calls: number } }
+      expect(firstWeekPayload.current.calls).toBe(1)
+      // First 7D is wait-path: do not fingerprint/persist just because a today
+      // snapshot exists. The today snapshot remains the only file.
+      expect(findSnapshotFiles(join(home, '.cache', 'codeburn'))).toHaveLength(1)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('persists a today-only first-paint snapshot even when historical files were deferred', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-today-floor-snap-'))
 

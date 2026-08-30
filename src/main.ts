@@ -1,5 +1,8 @@
 import { isAbsolute } from 'path'
-import { readdir } from 'fs/promises'
+import { access } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
@@ -75,10 +78,11 @@ function collect(val: string, acc: string[]): string[] {
   return acc
 }
 
-async function statusSnapshotFileExists(): Promise<boolean> {
+async function thisQuerySnapshotExists(queryKey: string): Promise<boolean> {
   try {
-    const names = await readdir(getCodeburnCacheDir())
-    return names.some(name => name.startsWith('status-snapshot.') && name.endsWith('.json'))
+    const hash = createHash('sha256').update(queryKey).digest('hex').slice(0, 16)
+    await access(join(getCodeburnCacheDir(), `status-snapshot.${hash}.json`), fsConstants.R_OK)
+    return true
   } catch {
     return false
   }
@@ -1204,17 +1208,21 @@ program
       // identical for both optimize values.
       const useSnapshot = !queryScope.optimize
       // Fingerprinting every source file is a full corpus walk. Skip it when
-      // there is no snapshot to hit AND this query cannot persist one (a
-      // deferred multi-day first-paint). Today-only first-paint may persist,
-      // so it still fingerprints BEFORE the parse: hashing after the payload
-      // can stamp a stale answer under a newer corpus.
+      // THIS query has no snapshot to hit. A leftover today snapshot must not
+      // force a 7D fingerprint. Today-only first-paint may persist, so it
+      // still fingerprints BEFORE the parse: hashing after the payload can
+      // stamp a stale answer under a newer corpus. A first 7D does not hash
+      // on the wait-path: the one-shot process exits at payload print, and
+      // hashing after the payload would only delay that. Later identical 7D
+      // polls persist once a snapshot for this query exists.
       const todayStartForSnapshot = new Date()
       todayStartForSnapshot.setHours(0, 0, 0, 0)
       const todayOnlyQuery = toDateString(periodInfo.range.start) === toDateString(todayStartForSnapshot)
         && toDateString(periodInfo.range.end) === toDateString(todayStartForSnapshot)
       let corpus: Awaited<ReturnType<typeof computeCorpusFingerprint>> | null = null
       let snapshot: unknown = null
-      if (useSnapshot && (todayOnlyQuery || await statusSnapshotFileExists())) {
+      const hasThisQuerySnapshot = useSnapshot && await thisQuerySnapshotExists(queryKey)
+      if (useSnapshot && (todayOnlyQuery || hasThisQuerySnapshot)) {
         corpus = await computeCorpusFingerprint(pf)
         snapshot = await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY)
       }
