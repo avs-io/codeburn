@@ -7,7 +7,8 @@ import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, isSessionHydrationComplete } from './parser.js'
+import { computeStatusCorpusFingerprint } from './status-corpus-fingerprint.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
@@ -1219,11 +1220,11 @@ program
       todayStartForSnapshot.setHours(0, 0, 0, 0)
       const todayOnlyQuery = toDateString(periodInfo.range.start) === toDateString(todayStartForSnapshot)
         && toDateString(periodInfo.range.end) === toDateString(todayStartForSnapshot)
-      let corpus: Awaited<ReturnType<typeof computeCorpusFingerprint>> | null = null
+      let corpus: Awaited<ReturnType<typeof computeStatusCorpusFingerprint>> | null = null
       let snapshot: unknown = null
       const hasThisQuerySnapshot = useSnapshot && await thisQuerySnapshotExists(queryKey)
       if (useSnapshot && (todayOnlyQuery || hasThisQuerySnapshot)) {
-        corpus = await computeCorpusFingerprint(pf)
+        corpus = await computeStatusCorpusFingerprint(pf)
         snapshot = await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY)
       }
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
