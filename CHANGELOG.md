@@ -19,6 +19,7 @@
 - **Desktop resident serve no longer stays disabled for the rest of a long session after three child deaths.** After a 5-minute cooldown it retries the resident child instead of one-shoting every period switch until quit.
 - **An all-provider menubar-json query no longer lists every leftover provider session file just to keep a $0 tab.** Missing probe roots skip discovery. Codex stops at the first valid rollout instead of walking thousands of files. Empty year dirs and malformed archived rollouts stay hidden. Other leftover providers still discover, so a VS Code storage folder is not a Copilot tab.
 - **A 7D / 30D menubar-json query no longer fingerprints the whole corpus just because a today snapshot exists.** Fingerprint-before-parse only runs when this query already has a snapshot, or the query is today-only. A first 7D prints the payload without hashing; hashing after print would only delay the one-shot wait-path.
+- **Desktop starts the progressive resident serve on the first routed query if boot never started one.** A stale serve.pid no longer forces every period switch onto an 11s one-shot for the rest of the session. The three-death cooldown is unchanged.
 
 ## 0.9.23 - 2026-08-29
 

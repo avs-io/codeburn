@@ -920,10 +920,13 @@ export function spawnCli(
   // cache warm-up. CODEBURN_PROGRESS is compatible because startServe sets it
   // on the resident child; any other per-call env needs an isolated one-shot.
   if (SERVE_ROUTED.has(args[0] ?? '') && isServeCompatibleEnv(opts.extraEnv)) {
-    const serve = serveClient
     // Recover lazily from an unexpected child death. start() is synchronous and
     // idempotent, and the client's lifetime death budget prevents an endlessly
     // crashing binary from being respawned on every poll.
+    // A skipped boot start / stale serve.pid used to leave serveClient null,
+    // so every period switch one-shot for the rest of the session.
+    if (!serveClient && !shuttingDown) startServe()
+    const serve = serveClient
     if (serve && !serve.isRunning() && !serve.disabled()) serve.start()
     if (serve?.isRunning()) {
       const flight = serve.request(args, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.onStderr)

@@ -1105,6 +1105,16 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(oneShotsFile)).toBe('oooo')
   })
 
+  it('starts a progressive resident on the first routed query when boot never called startServe', async () => {
+    const files = fakeResidentBin()
+    await expect(spawnCli(['status', '--lazy-boot'], { timeoutMs: 5_000 })).resolves.toMatchObject({ via: 'serve' })
+    expect(readMaybe(files.startsFile)).toBe('s')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+    await expect(spawnCli(['status', '--lazy-boot-2'], { timeoutMs: 5_000 })).resolves.toMatchObject({ via: 'serve' })
+    expect(readMaybe(files.startsFile)).toBe('s')
+    expect(readMaybe(files.heavyFile)).toBe('hh')
+  })
+
   it('retries the resident child after the disable cooldown', async () => {
     const startsFile = join(dir, 'serve-cooldown-starts')
     const oneShotsFile = join(dir, 'serve-cooldown-oneshots')
