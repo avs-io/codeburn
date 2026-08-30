@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, type ChildProcess } from 'child_process'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo, canBypassFillWithLastGood, canServeStaleLastGood, labelPayloadStale, fillBypassExpired } from '../src/serve.js'
+import { classifyRootReuse, createOutputMemoEntry, consumeOutputMemo, canBypassFillWithLastGood, fillBypassExpired } from '../src/serve.js'
 
 it('timestamps a completed output memo before parsing begins', () => {
   const parseStartedAt = 100
@@ -40,18 +40,6 @@ it('serves last-good incomplete only while a fill is pending for that argv', () 
   expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: 'other' })).toBe(false)
   expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: null })).toBe(false)
   expect(canBypassFillWithLastGood({ fillPending: true, lastGood, configFingerprint: 'config' })).toBe(true)
-})
-
-it('labels a dirty complete memo stale instead of serving it as exact', () => {
-  const memo = createOutputMemoEntry(100, 200, JSON.stringify({ generated: 't', current: { calls: 1 } }), 'config')
-  expect(canServeStaleLastGood({ reuse: 'dirty', memo, configFingerprint: 'config', now: 250, capMs: 60_000 })).toBe(true)
-  expect(canServeStaleLastGood({ reuse: 'unknown', memo, configFingerprint: 'config', now: 250, capMs: 60_000 })).toBe(true)
-  expect(canServeStaleLastGood({ reuse: 'clean', memo, configFingerprint: 'config', now: 250, capMs: 60_000 })).toBe(false)
-  expect(consumeOutputMemo(memo, { configFingerprint: 'config', now: 250, capMs: 60_000, reuse: 'dirty' }).hit).toBe(false)
-  const labelled = labelPayloadStale(memo.output)
-  expect(labelled).not.toBeNull()
-  expect(JSON.parse(labelled!).stale).toBe(true)
-  expect(labelPayloadStale('not-json')).toBeNull()
 })
 
 it('refuses dirty and unknown memos, including a fill memo', () => {

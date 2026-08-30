@@ -112,35 +112,6 @@ export function fillBypassExpired(opts: {
   return opts.fillStartedAt > 0 && opts.now - opts.fillStartedAt >= opts.maxMs
 }
 
-/// A complete fill/poll memo that failed clean reuse is still useful last-good.
-/// Mark it stale so the client does not treat it as exact, then refresh behind
-/// the answer. Dirty-once exact reuse is not this: that hid a later write.
-export function canServeStaleLastGood(opts: {
-  reuse: ParseReuseValidation | undefined
-  memo: { configFingerprint: string; createdAt: number } | undefined
-  configFingerprint: string | null
-  now: number
-  capMs: number
-}): boolean {
-  if (!opts.memo || opts.configFingerprint === null) return false
-  if (opts.memo.configFingerprint !== opts.configFingerprint) return false
-  if (opts.now - opts.memo.createdAt >= opts.capMs) return false
-  return opts.reuse === 'dirty' || opts.reuse === 'unknown'
-}
-
-export function labelPayloadStale(output: string): string | null {
-  try {
-    const payload = JSON.parse(output) as { stale?: boolean } | null
-    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-      payload.stale = true
-      return JSON.stringify(payload)
-    }
-  } catch {
-    // Non-JSON command output cannot carry the stale marker.
-  }
-  return null
-}
-
 type ServeOptionKind = 'flag' | 'value'
 
 // This is intentionally a positive, command-specific option schema rather
@@ -541,7 +512,6 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   let fillTimer: ReturnType<typeof setTimeout> | undefined
   const fillPendingKeys = new Set<string>()
   const lastGoodPartial = new Map<string, { output: string; configFingerprint: string }>()
-  const refreshPendingKeys = new Set<string>()
   let fillStartedAt = 0
   const fillMaxMs = Number(process.env['CODEBURN_SERVE_FILL_MAX_MS']) || DEFAULT_FILL_MAX_MS
 
@@ -608,29 +578,6 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     fillTimer.unref?.()
   }
 
-  const scheduleBackgroundRefresh = (args: string[]): void => {
-    const refreshKey = args.join('\u0000')
-    if (refreshPendingKeys.has(refreshKey) || fillPendingKeys.has(refreshKey)) return
-    refreshPendingKeys.add(refreshKey)
-    workQueue = workQueue.then(async () => {
-      const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
-      startProgressKeepalive()
-      const startedAt = Date.now()
-      try {
-        const captured = await runCaptured(buildProgram, args, beat)
-        const fingerprint = await getConfigFingerprint()
-        if (captured.code === 0 && fingerprint !== null && !payloadNeedsTodayFill(captured.output)) {
-          outputMemo.set(refreshKey, createOutputMemoEntry(startedAt, Date.now(), captured.output, fingerprint))
-        }
-      } catch {
-        // Best effort. The next poll still has the labelled last-good.
-      } finally {
-        refreshPendingKeys.delete(refreshKey)
-        stopProgressKeepalive()
-      }
-    })
-  }
-
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
 
   const enqueueRequest = (trimmed: string, waitingId: string | number | null): void => {
@@ -675,14 +622,6 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: true, output: lastGood.output })
         return
       }
-      const refreshMemo = outputMemo.get(memoKey)
-      if (refreshPendingKeys.has(memoKey) && refreshMemo && configFingerprint !== null && refreshMemo.configFingerprint === configFingerprint) {
-        const staleOutput = labelPayloadStale(refreshMemo.output)
-        if (staleOutput) {
-          write({ id: request.id, ok: true, output: staleOutput })
-          return
-        }
-      }
       const memoHit = outputMemo.get(memoKey)
       const reuse = memoHit ? rootReuseValidation?.(memoHit.validatedFrom) : undefined
       if (consumeOutputMemo(memoHit, {
@@ -693,20 +632,6 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       }).hit && memoHit) {
         write({ id: request.id, ok: true, output: memoHit.output })
         return
-      }
-      if (canServeStaleLastGood({
-        reuse,
-        memo: memoHit,
-        configFingerprint,
-        now: Date.now(),
-        capMs: OUTPUT_MEMO_CAP_MS,
-      }) && memoHit) {
-        const staleOutput = labelPayloadStale(memoHit.output)
-        if (staleOutput) {
-          write({ id: request.id, ok: true, output: staleOutput })
-          scheduleBackgroundRefresh(request.args)
-          return
-        }
       }
       // Progressive cold start (#1110): on a cold cache the menubar payload is
       // answered from the files the requested period can actually show, and the
@@ -725,7 +650,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       // it lands back-to-back with the parse's own quiet stretches. Wrapping
       // here (rather than at each command's exits) covers every served command
       // at one seam, and runCaptured routes the beats out as progress frames.
-      if (fillPendingKeys.size > 0 || refreshPendingKeys.size > 0) {
+      if (fillPendingKeys.size > 0) {
         await workQueue
       }
       const { startProgressKeepalive, stopProgressKeepalive, withColdFirstPaintFloor } = await import('./parser.js')
