@@ -1105,6 +1105,49 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(oneShotsFile)).toBe('oooo')
   })
 
+  it('retries the resident child after the disable cooldown', async () => {
+    const startsFile = join(dir, 'serve-cooldown-starts')
+    const oneShotsFile = join(dir, 'serve-cooldown-oneshots')
+    fakeBin(
+      'cooldown-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const starts = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+         if (starts <= 3) {
+           const rl = readline.createInterface({ input: process.stdin });
+           rl.once('line', () => process.exit(1));
+         } else {
+           const rl = readline.createInterface({ input: process.stdin });
+           rl.on('line', line => {
+             const request = JSON.parse(line);
+             process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
+           });
+           setTimeout(() => process.stdout.write(JSON.stringify({ ready: true, pid: process.pid }) + '\\n'), 20);
+         }
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(spawnCli(['status', '--cooldown', String(attempt)], { timeoutMs: 5_000 }))
+        .resolves.toEqual({ via: 'spawn' })
+    }
+    expect(readMaybe(startsFile)).toBe('sss')
+    const realNow = Date.now.bind(Date)
+    const frozen = realNow() + 5 * 60_000
+    Date.now = () => frozen
+    try {
+    await expect(spawnCli(['status', '--cooldown-retry'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'serve' })
+    } finally {
+      Date.now = realNow
+    }
+    expect(readMaybe(startsFile)).toBe('ssss')
+  })
+
   it('does not spawn a one-shot fallback after killAll destroys serve', async () => {
     const requestSeenFile = join(dir, 'request-seen')
     const oneShotsFile = join(dir, 'one-shot-reads')

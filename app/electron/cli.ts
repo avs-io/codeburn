@@ -542,6 +542,7 @@ async function runScheduledCli(
 //  - three child deaths permanently disable serve for this app run.
 const SERVE_ROUTED = new Set(['status', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit'])
 const SERVE_MAX_RESTARTS = 3
+const SERVE_DISABLE_COOLDOWN_MS = 5 * 60_000
 
 type PendingServeRequest = {
   resolve: (v: unknown) => void
@@ -560,6 +561,7 @@ class ServeClient {
   private pending = new Map<number, PendingServeRequest>()
   private nextId = 1
   private deaths = 0
+  private disabledUntil = 0
   private buffer = ''
   private bufferBytes = 0
   private warmed = false
@@ -569,7 +571,13 @@ class ServeClient {
   constructor(private readonly spec: SpawnSpec, private readonly pidFile?: string) {}
 
   isRunning(): boolean { return this.child !== null }
-  disabled(): boolean { return this.deaths >= SERVE_MAX_RESTARTS }
+  disabled(): boolean {
+    if (this.deaths < SERVE_MAX_RESTARTS) return false
+    if (Date.now() < this.disabledUntil) return true
+    this.deaths = 0
+    this.disabledUntil = 0
+    return false
+  }
   isDestroyed(): boolean { return this.destroyed }
 
   start(): void {
@@ -688,7 +696,10 @@ class ServeClient {
     this.buffer = ''
     this.bufferBytes = 0
     this.warmed = false
-    if (countsTowardBudget) this.deaths += 1
+    if (countsTowardBudget) {
+      this.deaths += 1
+      if (this.deaths >= SERVE_MAX_RESTARTS) this.disabledUntil = Date.now() + SERVE_DISABLE_COOLDOWN_MS
+    }
     activeChildren.delete(child as never)
     for (const [, waiter] of this.pending) {
       waiter.clear()
@@ -763,6 +774,7 @@ class ServeClient {
   destroy(): ChildProcess | null {
     this.destroyed = true
     this.deaths = SERVE_MAX_RESTARTS
+    this.disabledUntil = Number.POSITIVE_INFINITY
     const child = this.child
     if (!child) return null
     this.onDeath(child, false)
