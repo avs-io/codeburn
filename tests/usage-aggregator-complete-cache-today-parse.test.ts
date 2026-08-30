@@ -104,6 +104,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   clearSessionCache()
+  delete process.env['CODEBURN_SERVE_HYDRATION']
+  delete process.env['CODEBURN_SERVE_FILL']
   for (const k of ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k]
     else process.env[k] = savedEnv[k]
@@ -214,5 +216,52 @@ describe('buildDurablePeriod complete-cache today-only live parse', () => {
     expect(parseRanges.some(range => new Date(range.start).getTime() === dayStart.getTime())).toBe(true)
     expect(durable.scanRange.start.getTime()).toBe(dayStart.getTime())
     expect(durable.scanRange.end.getTime()).toBe(dayEnd.getTime())
+  })
+
+  it('skips the live today parse on a serve first-paint when the daily cache is complete', async () => {
+    const days = [6, 5, 4, 3, 2, 1].map(n => cachedDay(daysAgoStr(n), 10))
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: getDailyCacheConfigHash(),
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days,
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(ROOT, 'cache', `daily-cache.v${DAILY_CACHE_VERSION}.json`), JSON.stringify(cache), 'utf-8')
+    process.env['CODEBURN_SERVE_HYDRATION'] = '1'
+    delete process.env['CODEBURN_SERVE_FILL']
+    parseRanges.length = 0
+    const durable = await buildDurablePeriod(getDateRange('week'), { provider: 'all' })
+    expect(parseRanges).toEqual([])
+    expect(durable.liveProjects).toEqual([])
+    expect(durable.todayAllDays).toEqual([])
+    expect(durable.data.cost).toBeCloseTo(60, 8)
+    delete process.env['CODEBURN_SERVE_HYDRATION']
+  })
+
+  it('parses today on a serve fill pass even when the daily cache is complete', async () => {
+    const days = [6, 5, 4, 3, 2, 1].map(n => cachedDay(daysAgoStr(n), 10))
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: getDailyCacheConfigHash(),
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days,
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(ROOT, 'cache', `daily-cache.v${DAILY_CACHE_VERSION}.json`), JSON.stringify(cache), 'utf-8')
+    process.env['CODEBURN_SERVE_HYDRATION'] = '1'
+    process.env['CODEBURN_SERVE_FILL'] = '1'
+    parseRanges.length = 0
+    await buildDurablePeriod(getDateRange('week'), { provider: 'all' })
+    const now = new Date()
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    expect(parseRanges.length).toBeGreaterThan(0)
+    for (const range of parseRanges) {
+      expect(new Date(range.start).getTime()).toBeGreaterThanOrEqual(todayStart.getTime())
+    }
   })
 })

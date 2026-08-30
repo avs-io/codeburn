@@ -174,6 +174,15 @@ function readServeOption(args: string[], name: string): string | undefined {
 /// a partial payload. Unset means "answer only with complete data".
 export const SERVE_PROGRESSIVE_ENV = 'CODEBURN_SERVE_PROGRESSIVE'
 
+function payloadNeedsTodayFill(output: string): boolean {
+  try {
+    const payload = JSON.parse(output) as { hydration?: { complete?: boolean } }
+    return payload.hydration?.complete === false
+  } catch {
+    return false
+  }
+}
+
 /// The range start a cold first paint of this request may be floored to, or
 /// null when the request must not be answered partially (#1110).
 ///
@@ -467,15 +476,27 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     const delayMs = Number(process.env['CODEBURN_SERVE_FILL_DELAY_MS']) || DEFAULT_FILL_DELAY_MS
     fillTimer = setTimeout(() => {
       queue = queue.then(async () => {
-        const { isColdCacheOnDisk } = await import('./session-cache.js')
-        // A request that landed in front of the fill may already have done the
-        // full parse (only the menubar payload is ever floored).
-        if (!await isColdCacheOnDisk()) return
         const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
         startProgressKeepalive()
         const startedAt = Date.now()
         try {
-          const { output, code } = await runCaptured(buildProgram, args, beat)
+          const prevFill = process.env['CODEBURN_SERVE_FILL']
+          process.env['CODEBURN_SERVE_FILL'] = '1'
+          let output = ''
+          let code = 1
+          try {
+            const captured = await runCaptured(buildProgram, args, beat)
+            output = captured.output
+            code = captured.code
+          } finally {
+            if (code === 0) {
+              process.env['CODEBURN_SERVE_FILL'] = '1'
+            } else if (prevFill === undefined) {
+              delete process.env['CODEBURN_SERVE_FILL']
+            } else {
+              process.env['CODEBURN_SERVE_FILL'] = prevFill
+            }
+          }
           const fingerprint = await getConfigFingerprint()
           // Memoized so the poll that follows the fill answers instantly with
           // the converged payload instead of re-deriving it.
@@ -579,7 +600,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           // fill converges, so a memo hit would pin the client to the first
           // paint for the whole memo cap.
           if (configFingerprint !== null && deferredFiles === 0) {
+            if (!payloadNeedsTodayFill(output)) {
             outputMemo.set(memoKey, createOutputMemoEntry(parseStartedAt, Date.now(), output, configFingerprint))
+            }
           }
           if (outputMemo.size > 32) {
             const oldest = [...outputMemo.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
@@ -587,6 +610,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           }
           write({ id: request.id, ok: true, output })
           if (deferredFiles > 0) scheduleBackgroundFill(request.args)
+          else if (payloadNeedsTodayFill(output)) {
+            scheduleBackgroundFill(request.args)
+          }
         }
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
       } catch (err) {

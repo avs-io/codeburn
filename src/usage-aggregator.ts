@@ -560,6 +560,13 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const hasProjectFilter = projectInclude.length > 0 || projectExclude.length > 0
   const rangeIncludesToday = rangeStartStr <= todayStr && rangeEndStr >= todayStr
   const historyFromCompleteCache = cache.complete === true && !isTodayOnly && rangeIncludesToday && !hasProjectFilter && !daysSelection
+  // Serve first-paint of a complete-cache 7D/30D can answer the headline from
+  // the 1 MB daily cache without loading the 395 MB session shards. Today is
+  // missing until the fill pass (CODEBURN_SERVE_FILL=1) runs the live parse.
+  // One-shot CLI never sets SERVE_HYDRATION_ENV, so it still parses today.
+  const skipLiveTodayOnServePaint = historyFromCompleteCache
+    && process.env[SERVE_HYDRATION_ENV] === '1'
+    && process.env['CODEBURN_SERVE_FILL'] !== '1'
 
   // Today's live data always comes from an all-provider parse so the union (and
   // any per-provider slice of it) sees every provider's today. `todayAllDays` is
@@ -589,6 +596,10 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
       liveProjects = raw
       scanRange = todayRange
       todayAllDays = aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
+    } else if (skipLiveTodayOnServePaint) {
+      liveProjects = []
+      scanRange = todayRange
+      todayAllDays = []
     } else if (historyFromCompleteCache) {
       const raw = fp(await parseToday('all'))
       liveProjects = raw
@@ -795,6 +806,11 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     cache = durable.cache
     todayAllDays = durable.todayAllDays
   }
+  const skippedLiveToday = process.env[SERVE_HYDRATION_ENV] === '1'
+    && process.env['CODEBURN_SERVE_FILL'] !== '1'
+    && (todayAllDays?.length ?? 0) === 0
+    && cache.complete === true
+    && !(toDateString(periodInfo.range.start) === todayStr && toDateString(periodInfo.range.end) === todayStr)
   claudeConfigs = claudeConfigs ?? await claudeConfigSelector(scanProjects, null)
   const liveCoversRequestedPeriod = scanRange.start.getTime() <= periodInfo.range.start.getTime()
 
@@ -1185,6 +1201,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // complete) or a ~tens-of-ms wait after parse. Headlines do not need it;
   // leave the optimize block empty until the unfloored fill.
   const skipOptimize = opts.optimize === false || hydration?.deferredForFirstPaint === true
+    || skippedLiveToday
   const optimize = skipOptimize ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
   const granularRange = opts.daysSelection?.range ?? scanRange
   const granularHistory = opts.timeline === false ? undefined : buildGranularHistory(scanProjects, granularRange)
@@ -1193,8 +1210,12 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // deliberately sequenced behind it) and reports that through `hydration`
   // instead, so the two are never conflated.
   const partialFirstPaint = hydration?.deferredForFirstPaint === true
+    || skippedLiveToday
   const stale = hydration?.complete === false && !partialFirstPaint ? true : undefined
-  const payload = buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  const hydrationForPayload = skippedLiveToday
+    ? { complete: false, deferredForFirstPaint: true, indexedFiles: 0, pendingFiles: 1 }
+    : hydration
+  const payload = buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydrationForPayload))
   // Plugin socket: add-only sections from loaded plugins (empty socket by
   // default, so the payload is byte-identical without plugins installed).
   const pluginSections = await pluginPayloadSections(await loadPlugins())
