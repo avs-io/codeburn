@@ -92,6 +92,12 @@ impl CodeburnCli {
     }
 
     fn default_program() -> Self {
+        if let Some(persisted) = read_persisted_cli_path() {
+            return CodeburnCli {
+                program: persisted,
+                extra_args: vec![],
+            };
+        }
         CodeburnCli {
             program: locate_cli().unwrap_or_else(default_program_name),
             extra_args: vec![],
@@ -255,6 +261,77 @@ pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 /// probe the standard npm / node install prefixes.
 fn locate_cli() -> Option<String> {
     find_in_search_dirs(&candidate_names())
+}
+
+/// Same filename the mac menubar writes (`codeburn-cli-path.v1` under the
+/// platform Application Support / AppData directory). Locate CLI persists here
+/// so the next resolve — and the desktop app — pick up the chosen binary
+/// without a restart lecture.
+pub fn persisted_cli_path_file() -> PathBuf {
+    if let Ok(path) = env::var("CODEBURN_CLI_PATH_FILE") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("CodeBurn")
+        .join("codeburn-cli-path.v1")
+}
+
+pub fn read_persisted_cli_path() -> Option<String> {
+    read_persisted_cli_path_from(&persisted_cli_path_file())
+}
+
+fn read_persisted_cli_path_from(file: &std::path::Path) -> Option<String> {
+    let value = std::fs::read_to_string(file).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    validate_cli_path(trimmed).ok()
+}
+
+pub fn validate_cli_path(path: &str) -> Result<String> {
+    if !is_safe_arg(path) {
+        bail!("CLI path contains characters the tray will not spawn");
+    }
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() {
+        bail!("CLI path must be absolute");
+    }
+    if !candidate.is_file() {
+        bail!("CLI path is not a file");
+    }
+    Ok(path.to_string())
+}
+
+pub fn write_persisted_cli_path(path: &str) -> Result<String> {
+    write_persisted_cli_path_to(&persisted_cli_path_file(), path)
+}
+
+fn write_persisted_cli_path_to(file: &std::path::Path, path: &str) -> Result<String> {
+    let validated = validate_cli_path(path)?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(file, format!("{validated}\n"))?;
+    Ok(validated)
+}
+
+/// Native picker — the Windows equivalent of the mac menubar NSOpenPanel used
+/// to point at `codeburn`. Cancel returns `Ok(None)` and does not invent a path.
+pub fn pick_cli_path() -> Result<Option<String>> {
+    let picked = rfd::FileDialog::new()
+        .set_title("Locate the codeburn CLI")
+        .add_filter("CodeBurn CLI", &["exe", "cmd", "bat"])
+        .add_filter("All files", &["*"])
+        .pick_file();
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let text = path.to_string_lossy().into_owned();
+    Ok(Some(write_persisted_cli_path(&text)?))
 }
 
 /// Same search for Claude Code's own binary, so "Connect Claude" spawns an absolute path
@@ -597,5 +674,31 @@ mod tests {
         assert!(parse_version("0.9.9").unwrap() >= MIN_CLI_VERSION);
         assert!(parse_version("0.9.20").unwrap() >= MIN_CLI_VERSION);
         assert!(parse_version("0.10.0").unwrap() >= MIN_CLI_VERSION);
+    }
+
+    #[test]
+    fn persist_round_trip_uses_the_mac_filename() {
+        let dir = std::env::temp_dir().join(format!(
+            "codeburn-cli-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("codeburn-cli-path.v1");
+        let planted = dir.join("codeburn");
+        std::fs::write(&planted, b"#!/bin/sh\n").unwrap();
+        let stored = write_persisted_cli_path_to(&file, planted.to_str().unwrap()).unwrap();
+        assert_eq!(stored, planted.to_string_lossy());
+        assert_eq!(read_persisted_cli_path_from(&file).as_deref(), Some(stored.as_str()));
+        assert_eq!(
+            persisted_cli_path_file().file_name().unwrap(),
+            "codeburn-cli-path.v1"
+        );
+        assert!(validate_cli_path("relative/codeburn").is_err());
+        assert!(validate_cli_path("codeburn; rm -rf /").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,6 +22,11 @@ export type MenubarPayload = {
       calls?: number
       hasUsage?: boolean
     }>
+    topProjects?: Array<{
+      name: string
+      cost?: number
+      sessions?: number
+    }>
   }
   optimize: {
     findingCount: number

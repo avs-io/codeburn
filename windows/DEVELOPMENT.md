@@ -1,8 +1,23 @@
 # CodeBurn Menubar (Windows)
 
-Tauri 2.x tray app that surfaces CodeBurn in the Windows notification area. It is the Windows
-mirror of the native macOS menubar in `../mac/`, which stays the authoritative look and feel;
-this project mirrors its layout, colors, and data via the shared `tokens.json`.
+Tauri 2.x tray-resident Glance flyout (`codeburn-menubar.exe`). A stranger on a
+fresh Windows install should read today's list-rate cost from the tray, or see
+**Locate CLI**. It never crashes, never invents a fake `$0`, and never recovers a
+hidden tray icon with a floating pill.
+
+The host is the existing acrylic frameless popover. The flyout is the Glance
+shape: Today, Last 7 days, a slate sparkline, Open CodeBurn / Refresh, and a
+one-time pin hint. Payload is `codeburn status --format menubar-json` (today +
+week) on a 30s poll. Dollars are list API-rate estimates.
+
+Locate CLI writes the same `codeburn-cli-path.v1` file the mac menubar uses
+(`%APPDATA%\CodeBurn\codeburn-cli-path.v1` on Windows), then returns to glance
+without a restart lecture. The default hotkey is `Ctrl+Alt+B` (configurable in
+`%APPDATA%\codeburn\windows-glance.json`); `Win+C` and `Ctrl+Shift+P` are
+rejected so the flyout does not fight those chords.
+
+Orange is FlameMark and primary buttons only. Do not add a Capacity Dock or
+edge-dock peek here.
 
 Linux (ksni / AppIndicator) support is compiled and kept working for dev, but it is
 **experimental and unreleased** - Linux users should use the GNOME extension in `../gnome/`.
@@ -23,6 +38,9 @@ windows/
 │   ├── src/
 │   │   ├── main.rs   binary entry
 │   │   ├── lib.rs    tray, window lifecycle, state wiring
+│   │   ├── glance.rs Glance config (hotkey + one-time pin hint)
+│   │   ├── hotkey.rs Ctrl+Alt+B (configurable; blocks Win+C / Ctrl+Shift+P)
+│   │   ├── desktop.rs Open CodeBurn → desktop Overview
 │   │   ├── cli.rs    argv-validated spawn of the codeburn CLI
 │   │   ├── config.rs ~/.config/codeburn/config.json read/write under a lock
 │   │   ├── plan.rs   Claude OAuth quota (port of mac/.../ClaudeSubscriptionService.swift)
@@ -96,9 +114,9 @@ installed after the tray app was launched is still found. Only absolute director
 considered - empty or relative `PATH` entries are skipped so nothing is ever resolved out of the
 current working directory.
 
-If nothing is found, or `codeburn --version` is older than `MIN_CLI_VERSION`
-(`src-tauri/src/cli.rs`), the popover shows a setup screen with the install command and a
-"Check again" button. That gate is probed once on mount, before the first payload fetch.
+If nothing is found, the flyout shows **CLI not found** and **Locate CLI**. The picker
+writes `codeburn-cli-path.v1` and returns to glance immediately — no restart lecture, no
+fake `$0`. That gate is probed on mount, before the first payload fetch.
 
 `MIN_CLI_VERSION` is **0.9.9**: the first release whose `codeburn status --format menubar-json`
 accepts `--no-optimize`, which the app's quiet background refreshes always pass. Every payload
@@ -107,12 +125,11 @@ also exists at that version.
 
 ## Refresh policy
 
-Mirrors `mac/Sources/CodeBurnMenubar/RefreshCadence.swift`: each CLI fetch is a full Node
-process, so the cadence follows popover visibility.
-
-- popover visible: 60 s tick, full fetch (optimize findings included)
-- popover hidden: 120 s tick, `today`/`all` only, `--no-optimize`
-- on show: immediate refresh when the visible key is older than 60 s
+Glance polls `codeburn status --format menubar-json` for `today` and `week` every 30
+seconds while the CLI is present, and again on `codeburn://shown` / Refresh. Quiet
+fetches pass `--no-optimize`. Last-good numbers stay on screen (dimmed) while a
+refresh is in flight; a failed first read is **Couldn’t read usage.** + Retry, never
+`$0.00`.
 
 ## Plan / quota
 

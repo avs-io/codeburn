@@ -1,7 +1,10 @@
 mod autostart;
 mod cli;
 mod config;
+mod desktop;
 mod fx;
+mod glance;
+mod hotkey;
 mod plan;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
 /// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
@@ -74,6 +77,8 @@ pub fn run() {
                 round_window_corners(&window);
             }
 
+            start_glance_hotkey(app.handle());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -104,6 +109,12 @@ pub fn run() {
             commands::plan_usage,
             commands::launch_at_login,
             commands::set_launch_at_login,
+            commands::pick_cli_path,
+            commands::set_cli_path,
+            commands::glance_config,
+            commands::mark_pin_hint_shown,
+            commands::set_glance_hotkey,
+            commands::open_desktop,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -120,18 +131,14 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         return Ok(());
     };
 
-    let open = MenuItem::with_id(app, "open", "Open CodeBurn", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open_desktop", "Open CodeBurn", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
-    let theme = MenuItem::with_id(app, "toggle_theme", "Toggle Dark/Light", true, None::<&str>)?;
-    let report = MenuItem::with_id(app, "report", "Open Full Report", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &open,
             &refresh,
-            &theme,
-            &report,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -168,21 +175,19 @@ const BLANK_ICON_SIZE: u32 = 16;
 
 #[cfg(not(target_os = "linux"))]
 fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
-    match event.id.as_ref() {
+        match event.id.as_ref() {
         "quit" => app.exit(0),
-        "open" => show_popover(app, None),
+        "open_desktop" => {
+            let _ = crate::desktop::open_desktop();
+            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+                let _ = window.hide();
+                mark_hidden(app);
+            }
+        }
         "refresh" => {
             if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.emit("codeburn://refresh", ());
             }
-        }
-        "toggle_theme" => {
-            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
-                let _ = window.emit("codeburn://toggle-theme", ());
-            }
-        }
-        "report" => {
-            let _ = cli::spawn_in_terminal(app, &["report"]);
         }
         _ => {}
     }
@@ -281,6 +286,21 @@ fn mark_hidden(app: &AppHandle) {
     let _ = app.emit("codeburn://hidden", ());
 }
 
+fn start_glance_hotkey(app: &AppHandle) {
+    let accel = crate::glance::GlanceConfig::load().hotkey;
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("codeburn-glance-hotkey".into())
+        .spawn(move || {
+            if let Err(err) = crate::hotkey::listen(&accel, move || {
+                show_popover(&app, None);
+            }) {
+                eprintln!("codeburn-menubar: glance hotkey not registered: {err}");
+            }
+        })
+        .ok();
+}
+
 fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
     let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
         return;
@@ -316,8 +336,8 @@ fn show_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
 /// popover sits `MARGIN` inside the work area, horizontally centred on the anchor and
 /// clamped to the screen.
 fn position_popover(window: &tauri::WebviewWindow, anchor: Option<(i32, i32)>) {
-    const POPOVER_WIDTH_LOGICAL: f64 = 360.0;
-    const POPOVER_HEIGHT_LOGICAL: f64 = 660.0;
+    const POPOVER_WIDTH_LOGICAL: f64 = 312.0;
+    const POPOVER_HEIGHT_LOGICAL: f64 = 380.0;
     const MARGIN_LOGICAL: f64 = 8.0;
 
     let point = anchor
@@ -516,5 +536,70 @@ mod commands {
     #[tauri::command]
     pub async fn plan_usage(state: State<'_, AppState>) -> Result<crate::plan::PlanUsage, String> {
         state.plan.fetch().await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn pick_cli_path(
+        state: State<'_, AppState>,
+    ) -> Result<Option<crate::cli::CliStatus>, String> {
+        let picked = tokio::task::spawn_blocking(crate::cli::pick_cli_path)
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if picked.is_none() {
+            return Ok(None);
+        }
+        let fresh = crate::cli::CodeburnCli::resolve();
+        let status = fresh.status().await;
+        if status.found {
+            if let Ok(mut guard) = state.cli.lock() {
+                *guard = fresh;
+            }
+        }
+        Ok(Some(status))
+    }
+
+    #[tauri::command]
+    pub async fn set_cli_path(
+        path: String,
+        state: State<'_, AppState>,
+    ) -> Result<crate::cli::CliStatus, String> {
+        crate::cli::write_persisted_cli_path(&path).map_err(|e| e.to_string())?;
+        let fresh = crate::cli::CodeburnCli::resolve();
+        let status = fresh.status().await;
+        if status.found {
+            if let Ok(mut guard) = state.cli.lock() {
+                *guard = fresh;
+            }
+        }
+        Ok(status)
+    }
+
+    #[tauri::command]
+    pub fn glance_config() -> crate::glance::GlanceConfig {
+        crate::glance::GlanceConfig::load()
+    }
+
+    #[tauri::command]
+    pub fn mark_pin_hint_shown() -> Result<crate::glance::GlanceConfig, String> {
+        let mut config = crate::glance::GlanceConfig::load();
+        config.mark_pin_hint_shown().map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+
+    #[tauri::command]
+    pub fn set_glance_hotkey(hotkey: String) -> Result<String, String> {
+        let mut config = crate::glance::GlanceConfig::load();
+        config.set_hotkey(&hotkey).map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub fn open_desktop(app: AppHandle) -> Result<(), String> {
+        crate::desktop::open_desktop().map_err(|e| e.to_string())?;
+        if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+            let _ = window.hide();
+            super::mark_hidden(&app);
+        }
+        Ok(())
     }
 }
