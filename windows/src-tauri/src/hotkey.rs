@@ -45,6 +45,8 @@ fn pump_windows_messages() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
+    // SAFETY: MSG is zeroed before PeekMessageW writes it; we only dispatch
+    // messages this thread owns. Required so Win32 delivers the hotkey.
     unsafe {
         let mut msg = std::mem::zeroed::<MSG>();
         while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {

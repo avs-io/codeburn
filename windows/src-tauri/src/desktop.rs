@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 pub fn open_desktop() -> Result<()> {
     #[cfg(windows)]
     {
-        return open_windows_desktop();
+        open_windows_desktop()
     }
     #[cfg(not(windows))]
     {
