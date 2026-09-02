@@ -1,10 +1,14 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
 
 import { aggregateModels, renderTable, renderMarkdown, renderJson, renderCsv, type ModelReportRow } from '../src/models-report.js'
+import { setModelAliases } from '../src/models.js'
 import type {
   ProjectSummary,
   SessionSummary,
@@ -32,8 +36,11 @@ function makeCall(opts: {
   costUSD: number
   input?: number
   output?: number
+  reasoning?: number
   cacheWrite?: number
   cacheRead?: number
+  savingsUSD?: number
+  savingsBaselineModel?: string
 }): ParsedApiCall {
   return {
     provider: opts.provider,
@@ -42,6 +49,7 @@ function makeCall(opts: {
       ...emptyTokens(),
       inputTokens: opts.input ?? 0,
       outputTokens: opts.output ?? 0,
+      reasoningTokens: opts.reasoning ?? 0,
       cacheCreationInputTokens: opts.cacheWrite ?? 0,
       cacheReadInputTokens: opts.cacheRead ?? 0,
     },
@@ -55,6 +63,8 @@ function makeCall(opts: {
     timestamp: '2026-05-09T00:00:00.000Z',
     bashCommands: [],
     deduplicationKey: `${opts.provider}-${opts.model}-${opts.costUSD}`,
+    savingsUSD: opts.savingsUSD,
+    savingsBaselineModel: opts.savingsBaselineModel,
   }
 }
 
@@ -162,6 +172,32 @@ describe('aggregateModels', () => {
     expect(byKey['codex:gpt-5.5']!.credits).toBeCloseTo(887.5, 6)
     expect(byKey['codex:gpt-5']!.credits).toBeNull()
     expect(byKey['claude:claude-sonnet-4-6']!.credits).toBeNull()
+    expect(byKey['codex:gpt-5.5']!.creditsIncomplete).toBeFalsy()
+  })
+
+  it('partial-sums Codex credits when a merge mixes rated and unrated ids', async () => {
+    setModelAliases({ 'codex-house-sku': 'gpt-5.5' })
+    try {
+      const rows = await aggregateModels([makeProject([
+        makeTurn('feature', [
+          makeCall({ provider: 'codex', model: 'gpt-5.5', input: 0, output: 1_000_000, costUSD: 9 }),
+        ]),
+        makeTurn('feature', [
+          makeCall({ provider: 'codex', model: 'codex-house-sku', input: 0, output: 1_000_000, costUSD: 9 }),
+        ]),
+      ])])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.model).toBe('gpt-5.5')
+      // gpt-5.5 output is 750 credits/M; the aliased house SKU has no rate.
+      expect(rows[0]!.credits).toBeCloseTo(750, 6)
+      expect(rows[0]!.creditsIncomplete).toBe(true)
+      expect(rows[0]!.calls).toBe(2)
+      const parsed = JSON.parse(renderJson(rows))
+      expect(parsed[0].credits).toBeCloseTo(750, 6)
+      expect(parsed[0].creditsIncomplete).toBe(true)
+    } finally {
+      setModelAliases({})
+    }
   })
 
   it('includes credits in the JSON output', async () => {
@@ -183,6 +219,110 @@ describe('aggregateModels', () => {
 
     const rows = await aggregateModels([makeProject([makeTurn('feature', [call])])])
     expect(rows[0]!.cacheReadTokens).toBe(4000) // not 8000
+  })
+
+  it('falls back from a provider local table miss to the global short name', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cursor-agent', model: 'gpt-5.6-sol', costUSD: 2.5 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('GPT-5.6 Sol (est.)')
+    expect(rows[0]!.model).toBe('gpt-5.6-sol')
+  })
+
+  it('resolves Fireworks path-form ids through the global table', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cline', model: 'accounts/fireworks/models/kimi-k2p6', costUSD: 1 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('Kimi K2.6')
+    expect(rows[0]!.model).toBe('accounts/fireworks/models/kimi-k2p6')
+  })
+
+  it('merges two raw ids that resolve to the same alias-resolved canonical id', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('testing', [makeCall({
+        provider: 'cline-cli', model: 'accounts/fireworks/models/glm-5p2',
+        input: 800, output: 67, costUSD: 0.246,
+      })]),
+      makeTurn('conversation', [makeCall({
+        provider: 'cline-cli', model: 'glm-5p2',
+        input: 15, output: 1, costUSD: 0.019,
+      })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.provider).toBe('cline-cli')
+    expect(rows[0]!.modelDisplayName).toBe('GLM-5.2')
+    // First-seen raw id, not the lexicographically-smallest of the merge.
+    expect(rows[0]!.model).toBe('accounts/fireworks/models/glm-5p2')
+    expect(rows[0]!.inputTokens).toBe(815)
+    expect(rows[0]!.outputTokens).toBe(68)
+    expect(rows[0]!.costUSD).toBeCloseTo(0.265, 6)
+    expect(rows[0]!.calls).toBe(2)
+    expect(rows[0]!.topCategory).toBe('testing')
+    expect(rows[0]!.topCategoryShare).toBeCloseTo(0.246 / 0.265, 3)
+  })
+
+  it('does not pick the lexicographically-smallest raw id after a merge', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'codex', model: 'kimi-k3', costUSD: 2 })]),
+      makeTurn('feature', [makeCall({ provider: 'codex', model: 'k3', costUSD: 1 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.model).toBe('kimi-k3')
+    expect(rows[0]!.modelDisplayName).toBe('Kimi K3')
+    expect(rows[0]!.calls).toBe(2)
+  })
+
+  it('does not merge same-provider ids that only share a display name', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'codex', model: 'gpt-5', costUSD: 3 })]),
+      makeTurn('feature', [makeCall({ provider: 'codex', model: 'gpt-5-untracked-xyz', costUSD: 1 })]),
+      makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'glm-5p2', costUSD: 1 })]),
+      makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'GLM-5.2', costUSD: 2 })]),
+    ])])
+    const codex = rows.filter(r => r.provider === 'codex')
+    expect(codex).toHaveLength(2)
+    expect(codex.every(r => r.modelDisplayName === 'GPT-5')).toBe(true)
+    expect(new Set(codex.map(r => r.model))).toEqual(new Set(['gpt-5', 'gpt-5-untracked-xyz']))
+
+    const cline = rows.filter(r => r.provider === 'cline-cli')
+    expect(cline).toHaveLength(2)
+    expect(cline.every(r => r.modelDisplayName === 'GLM-5.2')).toBe(true)
+    expect(new Set(cline.map(r => r.model))).toEqual(new Set(['glm-5p2', 'GLM-5.2']))
+  })
+
+  it('clears a merged savings baseline when three raw ids disagree', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({
+        provider: 'codex', model: 'k3',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'gpt-4o',
+      })]),
+      makeTurn('feature', [makeCall({
+        provider: 'codex', model: 'kimi-k3',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'claude-sonnet-4-6',
+      })]),
+      makeTurn('feature', [makeCall({
+        provider: 'codex', model: 'k3-agent',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'gpt-5',
+      })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.provider).toBe('codex')
+    expect(rows[0]!.modelDisplayName).toBe('Kimi K3')
+    expect(rows[0]!.savingsUSD).toBe(6)
+    expect(rows[0]!.savingsBaselineModel).toBe('')
+    expect(rows[0]!.calls).toBe(3)
+  })
+
+  it('does not merge the same display name across providers', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'glm-5p2', costUSD: 1 })]),
+      makeTurn('feature', [makeCall({ provider: 'hermes', model: 'glm-5p2', costUSD: 2 })]),
+    ])])
+    expect(rows).toHaveLength(2)
+    expect(new Set(rows.map(r => r.provider))).toEqual(new Set(['cline-cli', 'hermes']))
+    expect(rows.every(r => r.modelDisplayName === 'GLM-5.2')).toBe(true)
   })
 
   it('reports the dominant task type with its cost share in default mode', async () => {
@@ -234,12 +374,15 @@ describe('aggregateModels', () => {
     expect(above.find(r => r.provider === 'cursor')).toBeUndefined()
   })
 
+  // Providers that report reasoning as a bucket SEPARATE from output still get
+  // it added in. Codex and claude do not - they bill reasoning inside
+  // output_tokens - and that carve-out is covered in codex-pricing-1075.test.ts.
   it('counts reasoning tokens as output tokens', async () => {
     const project = makeProject([
       makeTurn('feature', [
         {
-          provider: 'codex',
-          model: 'gpt-5',
+          provider: 'gemini',
+          model: 'gemini-2.5-pro',
           usage: { ...emptyTokens(), inputTokens: 100, outputTokens: 50, reasoningTokens: 200 },
           costUSD: 1.0,
           tools: [],
@@ -256,6 +399,25 @@ describe('aggregateModels', () => {
     ])
     const rows = await aggregateModels([project])
     expect(rows[0]!.outputTokens).toBe(250)
+  })
+
+  it('gives copilot supplementary accounting no call weight and no phantom reasoning output', async () => {
+    // One served request recorded twice: the per-turn call carries the full output, the
+    // paired store row carries that output's reasoning subset plus real input/cache tokens.
+    const perTurn = makeCall({ provider: 'copilot', model: 'claude-sonnet-4-5', input: 300, output: 500, cacheRead: 1000, costUSD: 1.0 })
+    const supplementary: ParsedApiCall = {
+      ...makeCall({ provider: 'copilot', model: 'claude-sonnet-4-5', input: 40, output: 0, reasoning: 800, cacheRead: 900, costUSD: 0.5 }),
+      supplementaryAccounting: true,
+    }
+    const rows = await aggregateModels([makeProject([makeTurn('feature', [perTurn, supplementary])])])
+    expect(rows).toHaveLength(1)
+    const row = rows[0]!
+    expect(row.calls).toBe(1)
+    expect(row.outputTokens).toBe(500)
+    // Tokens and cost keep every call, supplementary included.
+    expect(row.inputTokens).toBe(340)
+    expect(row.cacheReadTokens).toBe(1900)
+    expect(row.costUSD).toBeCloseTo(1.5, 6)
   })
 })
 
@@ -713,6 +875,114 @@ describe('renderCsv', () => {
 })
 
 describe('models CLI breakdown flags', () => {
+  vi.setConfig({ testTimeout: 30_000 })
+
+  it('filters the models report to unpriced rows', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-models-unpriced-'))
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'models-unpriced')
+      await mkdir(projectDir, { recursive: true })
+      await writeFile(join(projectDir, 'session.jsonl'), [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:00:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: { role: 'user', content: 'Use one priced and one unpriced model.' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:01:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: {
+            id: 'priced',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4-6',
+            content: [{ type: 'text', text: 'priced' }],
+            usage: { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:02:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: {
+            id: 'unpriced',
+            type: 'message',
+            role: 'assistant',
+            model: 'zz-unpriced-frontier-model',
+            content: [{ type: 'text', text: 'unpriced' }],
+            usage: { input_tokens: 2000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        }),
+      ].join('\n') + '\n')
+
+      const res = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+      )
+
+      expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
+      const rows = JSON.parse(res.stdout) as Array<{ model: string; calls: number }>
+      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-frontier-model'])
+      expect(rows[0]?.calls).toBe(1)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  // Unpriced rows all sort at $0 in aggregateModels, so the old implementation
+  // preserved transcript/Map order instead of findUnpricedModels' token order.
+  it('keeps unpriced rows when --unpriced is combined with --top', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-models-unpriced-top-'))
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'models-unpriced-top')
+      await mkdir(projectDir, { recursive: true })
+      const assistant = (id: string, model: string, timestamp: string, input: number) => JSON.stringify({
+        type: 'assistant',
+        sessionId: 'models-unpriced-top-session',
+        timestamp,
+        cwd: '/tmp/models-unpriced-top',
+        message: {
+          id, type: 'message', role: 'assistant', model,
+          content: [{ type: 'text', text: id }],
+          usage: { input_tokens: input, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        },
+      })
+      await writeFile(join(projectDir, 'session.jsonl'), [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'models-unpriced-top-session',
+          timestamp: '2026-05-09T00:00:00.000Z',
+          cwd: '/tmp/models-unpriced-top',
+          message: { role: 'user', content: 'Three unpriced models arrive small-first.' },
+        }),
+        // Transcript order is deliberately different from token order:
+        // 1.1k, 9.1k, 5.1k total tokens. The two largest must survive --top 2.
+        assistant('small', 'zz-unpriced-small', '2026-05-09T00:01:00.000Z', 1000),
+        assistant('largest', 'zz-unpriced-largest', '2026-05-09T00:02:00.000Z', 9000),
+        assistant('middle', 'zz-unpriced-middle', '2026-05-09T00:03:00.000Z', 5000),
+      ].join('\n') + '\n')
+
+      const res = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--top', '2', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+      )
+
+      expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
+      const rows = JSON.parse(res.stdout) as Array<{ model: string }>
+      expect(rows).toHaveLength(2)
+      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-largest', 'zz-unpriced-middle'])
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('rejects --by-task and --by-agent together with a clear error and exit 1', () => {
     const res = spawnSync(
       process.execPath,

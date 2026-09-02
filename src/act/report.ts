@@ -1,7 +1,8 @@
 import { existsSync } from 'fs'
 import { dirname } from 'node:path'
 import type { DateRange, ProjectSummary, SessionSummary } from '../types.js'
-import type { ActionBaseline, ActionKind, ActionRecord } from './types.js'
+import type { ActionBaseline, ActionKind, ActionRecord, AppliedFix, AppliedVerdict } from './types.js'
+import { REPORT_MIN_AGE_DAYS, VERDICT_WORKED_RATIO } from './types.js'
 import type { FindingPlan } from './plans.js'
 import {
   AVG_TOKENS_PER_READ,
@@ -20,7 +21,8 @@ import {
 } from '../optimize.js'
 import { parseAllSessions } from '../parser.js'
 import { computeYield, type YieldSummary } from '../yield.js'
-import { defaultActionsDir, readRecords } from './journal.js'
+import { defaultActionsDir, readRecords, shortId } from './journal.js'
+import { undoAction } from './undo.js'
 import { renderTable } from '../text-table.js'
 import { formatTokens } from '../format.js'
 import { formatCost } from '../currency.js'
@@ -28,7 +30,6 @@ import { formatCost } from '../currency.js'
 const DAY_MS = 24 * 60 * 60 * 1000
 const WINDOW_CAP_DAYS = 30
 const BASELINE_WINDOW_DAYS = 14
-const REPORT_MIN_AGE_DAYS = 3
 const MIN_POST_WINDOW_SESSIONS = 20
 const VOLUME_SHIFT_FACTOR = 2
 
@@ -39,16 +40,29 @@ const HONEST_FOOTER =
   'Estimates are scaled to the measured window for comparability; the at-apply estimate is kept in --json. '
   + 'MCP and archive realized figures are derived from per-session baselines times session counts, not independently measured. '
   + 'Each fix measures only its own metric; effects are never attributed across signals. '
-  + 'Guard rows are correlation, not attribution. Realized numbers are rounded down.'
+  + 'Guard rows are correlation, not attribution. Realized numbers are rounded down. '
+  + 'Deferral rows exclude servers an MCP remove/scope row already measures.'
 
 const MCP_KINDS = new Set<ActionKind>(['mcp-remove', 'mcp-project-scope'])
+// defer-* re-enable native MCP tool deferral (part 2 of #614): the same
+// prefix schema tokens mcp-remove eliminates, deferral moves out of the
+// upfront prefix. Realized the same way — per-session schema tokens times the
+// post-apply sessions that benefited — but "benefited" flips: instead of a
+// server no longer loading, it is deferral having become active (the session
+// now carries a deferred-tools inventory, the detector's own signal).
+const DEFER_KINDS = new Set<ActionKind>(['defer-enable', 'defer-alwaysload', 'defer-threshold'])
 const ARCHIVE_DEF_TOKENS: Partial<Record<ActionKind, number>> = {
   'archive-skill': TOKENS_PER_SKILL_DEF,
   'archive-agent': TOKENS_PER_AGENT_DEF,
   'archive-command': TOKENS_PER_COMMAND_DEF,
 }
 
-export type RealizedStatus = 'measured' | 'reverted' | 'not-measurable'
+// 'pending' means the applied change has not taken effect in any post-apply
+// session yet (e.g. deferral before a client restart) - distinct from
+// 'reverted', which asserts the user undid it.
+export { REPORT_MIN_AGE_DAYS }
+
+export type RealizedStatus = 'measured' | 'reverted' | 'not-measurable' | 'pending'
 
 export type ActReportRow = {
   id: string
@@ -91,6 +105,8 @@ export type ActReport = {
   // findingId -> earliest apply date of an active applied action; drives the
   // optimize "(previously applied ..., re-flagged)" title suffix.
   appliedByFinding: Record<string, string>
+  // One entry per active applied action, including ones too young to measure.
+  appliedFixes: AppliedFix[]
 }
 
 export type ActReportOptions = {
@@ -178,6 +194,28 @@ function countSessionsLoading(projects: ProjectSummary[], servers: string[]): nu
   return allSessions(projects).filter(s => sessionLoadsAny(s, servers)).length
 }
 
+// Deferral is active in a session exactly when Claude Code emitted a
+// deferred-tools inventory for it — the same signal the mcp-deferral-off
+// detector uses (its absence, alongside MCP overhead, is what flags a gap).
+function sessionHasDeferralActive(s: SessionSummary): boolean {
+  return (s.mcpInventory?.length ?? 0) > 0
+}
+
+// MCP servers observed loading in the window (via inventory or invocation).
+// defer-enable / defer-threshold re-enable deferral for the whole MCP surface
+// rather than a named set, so the affected servers are derived here.
+function observedMcpServers(projects: ProjectSummary[]): string[] {
+  const servers = new Set<string>()
+  for (const s of allSessions(projects)) {
+    for (const fqn of s.mcpInventory ?? []) {
+      const seg = fqn.split('__')[1]
+      if (seg) servers.add(seg)
+    }
+    for (const server of Object.keys(s.mcpBreakdown)) servers.add(server)
+  }
+  return [...servers]
+}
+
 // A kind whose realized effect is a token saving (everything except guard,
 // which is a dollars/yield correlation, and out-of-scope kinds).
 function isTokenKind(kind: ActionKind): boolean {
@@ -224,6 +262,45 @@ function mcpRow(
   }
   const savedSessions = Math.max(0, sessions.length - stillLoading)
   return { ...base, estimatedForWindow, status: 'measured', realizedTokens: Math.floor(perSessionTokens * savedSessions), confidence }
+}
+
+function deferRow(
+  base: ActReportRow, sessions: SessionSummary[],
+  baseline: ActionBaseline, afterStart: Date, now: Date,
+  mcpClaimedServers: ReadonlySet<string>,
+): ActReportRow {
+  // Sum only the servers no MCP row claims (see mcpClaimedServers in
+  // computeActReport), so the same schema tokens are never realized twice.
+  const counted = Object.entries(baseline.metrics).filter(([server]) => !mcpClaimedServers.has(server))
+  const excludedServers = Object.keys(baseline.metrics).length - counted.length
+  const perSessionTokens = counted.reduce((a, [, tokens]) => a + tokens, 0)
+  if (perSessionTokens === 0) {
+    return {
+      ...base,
+      note: excludedServers > 0
+        ? 'not measurable: every server in this baseline is already measured by an MCP remove/scope row'
+        : 'not measurable: empty baseline',
+    }
+  }
+  if (sessions.length === 0) return { ...base, note: 'not measurable: no sessions in the window yet' }
+  const estimatedForWindow = Math.floor(perSessionTokens * sessions.length)
+  // A post-apply session realized the saving only if deferral actually became
+  // active in it. ENABLE_TOOL_SEARCH is read at process start, so sessions
+  // begun before the user restarted still run deferral-off — those aren't
+  // counted, and if none benefited we report it plainly rather than claim a
+  // saving that hasn't taken effect.
+  const deferredSessions = sessions.filter(sessionHasDeferralActive).length
+  const confidence = confidenceFor(sessions.length, baseline, afterStart, now)
+  if (deferredSessions === 0) {
+    return {
+      ...base,
+      estimatedForWindow,
+      status: 'pending',
+      confidence,
+      note: `not yet in effect: deferral is still inactive in ${sessions.length} post-apply session${sessions.length === 1 ? '' : 's'} (takes effect on the next session; the client may not have restarted, or the change was reverted)`,
+    }
+  }
+  return { ...base, estimatedForWindow, status: 'measured', realizedTokens: Math.floor(perSessionTokens * deferredSessions), confidence }
 }
 
 function archiveRow(
@@ -358,7 +435,7 @@ async function modelDefaultRow(
 
 async function computeRow(
   rec: ActionRecord, sessions: SessionSummary[], afterStart: Date, now: Date,
-  opts: ActReportOptions, modelDefaultProjectFound = true,
+  mcpClaimedServers: ReadonlySet<string>, opts: ActReportOptions, modelDefaultProjectFound = true,
 ): Promise<ActReportRow> {
   const estimatedAtApply = rec.baseline?.estimatedTokens ?? 0
   const base: ActReportRow = {
@@ -378,6 +455,7 @@ async function computeRow(
   if (!baseline) return { ...base, note: 'not measurable: no baseline captured at apply time' }
 
   if (MCP_KINDS.has(rec.kind)) return mcpRow(base, rec, sessions, baseline, afterStart, now)
+  if (DEFER_KINDS.has(rec.kind)) return deferRow(base, sessions, baseline, afterStart, now, mcpClaimedServers)
   if (rec.kind in ARCHIVE_DEF_TOKENS) return archiveRow(base, rec, sessions, baseline, afterStart, now)
   if (rec.kind === 'claude-md-rule') return readEditRow(base, sessions, baseline, afterStart, now)
   if (rec.kind === 'shell-config') return { ...base, note: 'not measurable: bash result token sizes are not retained in the summary' }
@@ -395,6 +473,63 @@ async function computeRow(
 // counted, so a corrupt journal can never crash `act report` or optimize.
 function isSaneRecord(r: ActionRecord): boolean {
   return typeof r.at === 'string' && typeof r.status === 'string' && !Number.isNaN(new Date(r.at).getTime())
+}
+
+// Turn the measured rows plus the still-young entries into one verdict per
+// active applied action. No second reconciliation: everything measurable comes
+// straight off the row `act report` already computed.
+function buildAppliedFixes(active: ActionRecord[], rows: ActReportRow[], now: Date): AppliedFix[] {
+  const byId = new Map(rows.map(r => [r.id, r]))
+  return active.map(rec => {
+    const row = byId.get(rec.id)
+    const base = {
+      id: rec.id,
+      kind: rec.kind,
+      findingId: rec.findingId ?? null,
+      appliedAt: rec.at,
+      ageDays: ageDays(rec.at, now),
+      undoCommand: `codeburn act undo ${shortId(rec.id)}`,
+    }
+    // No row means too young to measure; a row that is not a measured token
+    // row (not-measurable, not yet in effect, reverted by the user, or a
+    // correlation-only kind) has no reduction to judge either.
+    if (!row) return { ...base, verdict: 'pending' as const, estimatedTokens: rec.baseline?.estimatedTokens ?? 0, realizedTokens: 0, note: '' }
+    if (row.status !== 'measured' || !isTokenKind(row.kind)) {
+      return { ...base, verdict: 'pending' as const, estimatedTokens: row.estimatedForWindow, realizedTokens: 0, note: row.note }
+    }
+    const estimatedTokens = row.estimatedForWindow
+    const realizedTokens = row.realizedTokens
+    const verdict: AppliedVerdict = realizedTokens <= 0
+      ? 'no-effect'
+      : estimatedTokens <= 0 || realizedTokens >= estimatedTokens * VERDICT_WORKED_RATIO ? 'worked' : 'partial'
+    return { ...base, verdict, estimatedTokens, realizedTokens, note: row.note }
+  })
+}
+
+// --auto-revert: undo the fixes that measured no reduction at all. CLAUDE.md
+// rules are never undone unattended, matching the --yes guardrail - the file
+// belongs to whatever project the user happened to be in.
+export async function autoRevertNoEffect(
+  fixes: AppliedFix[], opts: { actionsDir?: string } = {},
+): Promise<{ lines: string[]; revertedIds: Set<string> }> {
+  const lines: string[] = []
+  const revertedIds = new Set<string>()
+  for (const fix of fixes) {
+    if (fix.verdict !== 'no-effect') continue
+    const label = fix.findingId ?? fix.kind
+    if (fix.kind === 'claude-md-rule') {
+      lines.push(`Not auto-reverted: ${label} edits a CLAUDE.md. Revert: ${fix.undoCommand}`)
+      continue
+    }
+    try {
+      const record = await undoAction({ id: fix.id }, { actionsDir: opts.actionsDir })
+      revertedIds.add(fix.id)
+      lines.push(`Reverted ${shortId(record.id)}: ${record.description}`)
+    } catch (err) {
+      lines.push(`Could not revert ${label}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { lines, revertedIds }
 }
 
 export async function computeActReport(opts: ActReportOptions = {}): Promise<ActReport> {
@@ -424,6 +559,7 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
     observedDays: 0,
     malformedRecords,
     appliedByFinding,
+    appliedFixes: buildAppliedFixes(active, [], now),
   }
 
   const eligible = active.filter(r => ageDays(r.at, now) > REPORT_MIN_AGE_DAYS)
@@ -434,6 +570,20 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
   const projects = await loadProjects({ start: windowStart, end: now })
   const costRate = computeInputCostRate(projects)
 
+  // Servers a same-journal MCP row (mcp-remove / mcp-project-scope) already
+  // measures. Deferral baselines for defer-enable / defer-threshold span the
+  // whole observed MCP surface, so without this exclusion a defer row and an
+  // MCP row would both claim the same server's schema tokens over the same
+  // post-apply sessions, inflating totalRealizedTokens. Conservative by
+  // design: the defer row drops the server for its whole window even though
+  // pre-removal sessions were legitimately its own - under-claiming keeps the
+  // footer's "each fix measures only its own metric" literally true.
+  const mcpClaimedServers = new Set<string>()
+  for (const r of active) {
+    if (!MCP_KINDS.has(r.kind) || !r.baseline) continue
+    for (const server of Object.keys(r.baseline.metrics)) mcpClaimedServers.add(server)
+  }
+
   const rows: ActReportRow[] = []
   for (const rec of eligible) {
     const afterStart = new Date(Math.max(new Date(rec.at).getTime(), windowStart.getTime()))
@@ -441,7 +591,7 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
       ? modelDefaultSessionsInWindow(rec, projects, afterStart, now)
       : undefined
     const sessions = modelDefaultWindow?.sessions ?? sessionsInWindow(projects, afterStart, now)
-    rows.push(await computeRow(rec, sessions, afterStart, now, opts, modelDefaultWindow?.projectFound))
+    rows.push(await computeRow(rec, sessions, afterStart, now, mcpClaimedServers, opts, modelDefaultWindow?.projectFound))
   }
 
   const measuredRows = rows.filter(r => r.status === 'measured' && isTokenKind(r.kind))
@@ -463,6 +613,7 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
     observedDays,
     malformedRecords,
     appliedByFinding,
+    appliedFixes: buildAppliedFixes(active, rows, now),
   }
 }
 
@@ -483,6 +634,7 @@ export function buildOptimizeAppliedHeader(report: ActReport): string | null {
 
 function realizedCell(r: ActReportRow): string {
   if (r.status === 'reverted') return 'reverted'
+  if (r.status === 'pending') return 'not yet in effect'
   if (r.status === 'not-measurable') return 'not measurable'
   if (r.correlation) return `abandoned ${r.correlation.abandonedPctThen}% -> ${r.correlation.abandonedPctNow}% (corr.)`
   if (r.kind === 'model-default') return 'correlation'
@@ -563,6 +715,7 @@ export function buildActReportJson(report: ActReport): unknown {
       activeActions: report.activeCount,
       observedDays: report.observedDays,
     },
+    appliedFixes: report.appliedFixes,
     footer: HONEST_FOOTER,
   }
 }
@@ -578,25 +731,60 @@ type CaptureCtx = {
   now: Date
 }
 
-function mcpServersFromApply(finding: WasteFinding): string[] {
+function mcpServersFromApply(finding: WasteFinding, affectedMcpServers?: string[]): string[] {
+  if (affectedMcpServers) return affectedMcpServers
   if (finding.apply?.kind === 'mcp-remove') return finding.apply.servers
   if (finding.apply?.kind === 'mcp-project-scope') return finding.apply.servers.map(s => s.server)
   return []
 }
 
 function needsConfigBaseline(kind: ActionKind): boolean {
-  return MCP_KINDS.has(kind) || kind in ARCHIVE_DEF_TOKENS || kind === 'claude-md-rule' || kind === 'shell-config'
+  return MCP_KINDS.has(kind) || DEFER_KINDS.has(kind) || kind in ARCHIVE_DEF_TOKENS || kind === 'claude-md-rule' || kind === 'shell-config'
 }
 
-export function captureBaseline(finding: WasteFinding, kind: ActionKind, ctx: CaptureCtx): ActionBaseline | undefined {
+// Servers whose upfront schema deferral removes from the prefix. defer-alwaysload
+// names them; defer-enable / defer-threshold re-enable deferral across the whole
+// observed MCP surface.
+function deferServers(finding: WasteFinding, ctx: CaptureCtx): string[] {
+  if (finding.apply?.kind === 'defer-alwaysload') return finding.apply.servers.map(s => s.server)
+  return observedMcpServers(ctx.projects)
+}
+
+export function captureBaseline(
+  finding: WasteFinding,
+  kind: ActionKind,
+  ctx: CaptureCtx,
+  affectedMcpServers?: string[],
+): ActionBaseline | undefined {
   const common = {
     windowDays: ctx.windowDays,
     capturedAt: ctx.now.toISOString(),
-    estimatedTokens: Math.max(0, Math.round(finding.tokensSaved)),
+    estimatedTokens: Math.max(0, Math.round(finding.applyTokensSaved ?? finding.tokensSaved)),
   }
 
   if (MCP_KINDS.has(kind)) {
-    const servers = mcpServersFromApply(finding)
+    const servers = mcpServersFromApply(finding, affectedMcpServers)
+    if (servers.length === 0) return undefined
+    const covByServer = new Map(ctx.coverage.map(c => [c.server, c]))
+    const metrics: Record<string, number> = {}
+    for (const server of servers) {
+      const cov = covByServer.get(server)
+      // Removal realizes only the unused schema that the low-coverage
+      // detector estimated. If coverage is unavailable, omit the numeric
+      // claim instead of inventing a five-tool baseline.
+      const tools = finding.id === 'mcp-low-coverage'
+        ? cov?.unusedTools.length ?? 0
+        : cov && cov.toolsAvailable > 0 ? cov.toolsAvailable : TOOLS_PER_MCP_SERVER
+      metrics[server] = tools * TOKENS_PER_MCP_TOOL
+    }
+    const estimatedTokens = finding.applyTokensSavedByServer
+      ? Math.round(servers.reduce((sum, server) => sum + (finding.applyTokensSavedByServer?.[server] ?? 0), 0))
+      : common.estimatedTokens
+    return { ...common, estimatedTokens, sessions: countSessionsLoading(ctx.projects, servers), metrics }
+  }
+
+  if (DEFER_KINDS.has(kind)) {
+    const servers = deferServers(finding, ctx)
     if (servers.length === 0) return undefined
     const covByServer = new Map(ctx.coverage.map(c => [c.server, c]))
     const metrics: Record<string, number> = {}
@@ -641,7 +829,8 @@ export async function captureBaselinesForPlans(
   const projects = await loadProjects({ start, end: now })
   const ctx: CaptureCtx = { projects, coverage: aggregateMcpCoverage(projects), windowDays: BASELINE_WINDOW_DAYS, now }
   for (const fp of applicable) {
-    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx)
+    if (fp.plan!.mcpSavingsUncertain) continue
+    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx, fp.plan!.affectedMcpServers)
     if (baseline) fp.plan!.baseline = baseline
   }
 }

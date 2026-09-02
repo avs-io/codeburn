@@ -1,17 +1,38 @@
 import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
-import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, buildMenubarPayload } from './menubar-json.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete } from './parser.js'
-import { findUnpricedModels, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName } from './models.js'
+import { isBehavioralCall } from './behavioral-weight.js'
+import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
+import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
-import { claude, getClaudeConfigDirs, getDesktopSessionsDir } from './providers/claude.js'
+import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
+import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
-import { aggregateProjectsIntoDays, buildPeriodDataFromDays } from './day-aggregator.js'
+import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKeyInTz } from './day-aggregator.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { aggregateModels } from './models-report.js'
+import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, computePricingCoverage } from './workflow-insights.js'
+import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
-import { getDaysInRange, ensureCacheHydrated, loadDailyCache, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache } from './daily-cache.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens } from './session-output.js'
+import { getDaysInRange, ensureCacheHydrated, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
 import { buildGranularHistory } from './granular-history.js'
+
+// Row caps for the by-PR / by-branch payload aggregations, ranked by cost.
+const TOP_BRANCHES = 15
+type SubagentRow = NonNullable<BreakdownArrays['subagents']>[number]
+
+export function providerSliceHasUsage(slice: ProviderDaySlice): boolean {
+  return slice.cost > 0
+    || slice.savingsUSD > 0
+    || slice.calls > 0
+    || (slice.sessions ?? 0) > 0
+    || (slice.inputTokens ?? 0) > 0
+    || (slice.outputTokens ?? 0) > 0
+    || (slice.cacheReadTokens ?? 0) > 0
+    || (slice.cacheWriteTokens ?? 0) > 0
+}
+
 
 export function buildPeriodData(label: string, projects: ProjectSummary[]): PeriodData {
   const sessions = projects.flatMap(p => p.sessions)
@@ -21,7 +42,7 @@ export function buildPeriodData(label: string, projects: ProjectSummary[]): Peri
 
   for (const sess of sessions) {
     inputTokens += sess.totalInputTokens
-    outputTokens += sess.totalOutputTokens
+    outputTokens += sessionBillableOutputTokens(sess)
     cacheReadTokens += sess.totalCacheReadTokens
     cacheWriteTokens += sess.totalCacheWriteTokens
     for (const [cat, d] of Object.entries(sess.categoryBreakdown)) {
@@ -42,6 +63,13 @@ export function buildPeriodData(label: string, projects: ProjectSummary[]): Peri
     }
   }
 
+  const unpricedModels = findUnpricedModels(Object.entries(modelTotals)
+    .map(([model, d]) => ({ model, calls: d.calls, cost: d.cost, tokens: d.tokens })))
+  const costBearingCalls = Object.entries(modelTotals)
+    .reduce((s, [model, d]) => s + (model === '<synthetic>' || isExpectedFreeModel(model) ? 0 : d.calls), 0)
+  const unpricedCalls = unpricedModels.reduce((s, m) => s + m.calls, 0)
+  const corrections = scanUserCorrections(projects)
+
   return {
     label,
     cost: projects.reduce((s, p) => s + p.totalCostUSD, 0),
@@ -56,16 +84,22 @@ export function buildPeriodData(label: string, projects: ProjectSummary[]): Peri
     models: Object.entries(modelTotals)
       .sort(([, a], [, b]) => b.cost - a.cost)
       .map(([name, d]) => ({ name, calls: d.calls, cost: d.cost, savingsUSD: d.savingsUSD, estimatedCostUSD: d.estimatedCostUSD })),
-    unpricedModels: findUnpricedModels(Object.entries(modelTotals)
-      .map(([model, d]) => ({ model, calls: d.calls, cost: d.cost, tokens: d.tokens }))),
+    unpricedModels,
+    workflow: {
+      corrections: corrections.corrections,
+      correctionRate: corrections.correctionRate,
+      medianTimeToFirstEditMs: medianTimeToFirstEditMs(projects),
+    },
+    topReworkedFiles: aggregateFileChurn(projects),
+    pricingCoverage: computePricingCoverage(costBearingCalls, unpricedCalls),
   }
 }
 
 export function getDailyCacheConfigHash(): string {
   const savingsHash = getLocalModelSavingsConfigHash()
   const overridesHash = getPriceOverridesConfigHash()
-  if (!overridesHash) return savingsHash
-  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}`
+  const flatRateHash = getFlatRateModelsConfigHash()
+  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}\u0002flatRateModels=${flatRateHash}`
 }
 
 async function hydrateCache(): Promise<DailyCache> {
@@ -77,6 +111,10 @@ async function hydrateCache(): Promise<DailyCache> {
       // Never finalize the daily history off a partial (interrupted) session
       // hydration — that is what froze empty older days into the chart.
       isSessionHydrationComplete,
+      // On a tz-change re-derive the same parse is re-aggregated under the old
+      // tzKey so carried slices can be reduced by the turns that re-bucketed
+      // across local midnight (issue #770).
+      (projects, tz) => aggregateProjectsIntoDays(projects, (iso) => dateKeyInTz(iso, tz)),
     )
   } catch (err) {
     // Previously swallowed silently, which turned any backfill failure into an
@@ -88,6 +126,42 @@ async function hydrateCache(): Promise<DailyCache> {
       `${err instanceof Error ? err.message : String(err)}\n`
     )
     return emptyCache()
+  }
+}
+
+/**
+ * Finish the existing durable day cache from an already-normalized lifetime
+ * session index. The parser callback is only a range projection of `projects`:
+ * no source discovery, transcript read, or session-cache parse is repeated.
+ */
+export async function hydrateDailyCacheFromNormalizedProjects(projects: ProjectSummary[], complete = true): Promise<DailyCache> {
+  return ensureCacheHydrated(
+    (range) => Promise.resolve(filterProjectsByDateRange(projects, range)),
+    aggregateProjectsIntoDays,
+    getDailyCacheConfigHash(),
+    () => complete,
+    (rangeProjects, tz) => aggregateProjectsIntoDays(rangeProjects, (iso) => dateKeyInTz(iso, tz)),
+  )
+}
+
+/// The `hydration` block is emitted ONLY inside the resident serve child, which
+/// sets this marker on itself at startup. That is the whole one-shot safety
+/// rule in one place: a one-shot CLI process never sets it, so `--format
+/// menubar-json` from a spawn (including the desktop app's spawn fallback, the
+/// Swift menubar, and `codeburn web`) is byte-identical to before and can never
+/// carry a partial-data label — it has no second poll to converge with.
+export const SERVE_HYDRATION_ENV = 'CODEBURN_SERVE_HYDRATION'
+
+function hydrationStateFor(hydration: ReturnType<typeof sessionHydrationSnapshot> | undefined): HydrationState | undefined {
+  if (process.env[SERVE_HYDRATION_ENV] !== '1' || !hydration) return undefined
+  // Emitted only while incomplete: absence means complete (the rule one-shot
+  // consumers already live by), and a warm serve payload stays byte-identical
+  // to the spawned one-shot — the upgrade-path gate asserts exactly that.
+  if (hydration.complete) return undefined
+  return {
+    complete: hydration.complete,
+    indexedFiles: hydration.indexedFiles,
+    totalFiles: hydration.indexedFiles + hydration.pendingFiles,
   }
 }
 
@@ -131,7 +205,11 @@ async function claudeConfigSelector(projects: ProjectSummary[], selectedId?: str
   // idle config or Claude Desktop is still selectable). Only worth it when a
   // second source is possible: more than one config dir, or a Claude Desktop
   // sessions dir exists. A plain single-config user skips it entirely.
-  const desktopExists = await stat(getDesktopSessionsDir()).then(s => s.isDirectory()).catch(() => false)
+  const desktopExists = (
+    await Promise.all(
+      getDesktopSessionsDirs().map(dir => stat(dir).then(s => s.isDirectory()).catch(() => false)),
+    )
+  ).some(Boolean)
   if ((await getClaudeConfigDirs()).length > 1 || desktopExists) {
     for (const source of await claude.discoverSessions()) {
       if ((source.sourceKind !== 'claude-config' && source.sourceKind !== 'claude-desktop') || !source.sourceId || !source.sourceLabel || !source.sourcePath) continue
@@ -167,6 +245,423 @@ function dailyEntriesToHistory(days: ReturnType<typeof aggregateProjectsIntoDays
       topModels,
     }
   })
+}
+
+/// Collapse a day to a single provider's slice, promoting the slice's totals to
+/// the day-level fields buildPeriodDataFromDays reads. A day with no slice for
+/// the provider becomes a zero day (so the date is still present but contributes
+/// nothing). The `carried` flag is inherited so a per-provider total can still
+/// account for expired-source days.
+function sliceDayToProvider(day: DailyEntry, provider: string): DailyEntry {
+  const s = Object.hasOwn(day.providers, provider) ? day.providers[provider] : undefined
+  if (!s) {
+    return {
+      date: day.date, cost: 0, savingsUSD: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      editTurns: 0, oneShotTurns: 0, models: {}, categories: {}, providers: {},
+      ...(day.carried ? { carried: true as const } : {}),
+    }
+  }
+  return {
+    date: day.date,
+    cost: s.cost,
+    savingsUSD: s.savingsUSD ?? 0,
+    calls: s.calls,
+    sessions: s.sessions ?? 0,
+    inputTokens: s.inputTokens ?? 0,
+    outputTokens: s.outputTokens ?? 0,
+    cacheReadTokens: s.cacheReadTokens ?? 0,
+    cacheWriteTokens: s.cacheWriteTokens ?? 0,
+    editTurns: s.editTurns ?? 0,
+    oneShotTurns: s.oneShotTurns ?? 0,
+    models: s.models ?? {},
+    categories: s.categories ?? {},
+    providers: { [provider]: s },
+    ...(s.projects ? { projects: s.projects } : {}),
+    ...(day.carried ? { carried: true as const } : {}),
+  }
+}
+
+/// Does a cached day's project entry pass the active name filters? Mirrors
+/// parser.filterProjectsByName exactly — case-insensitive substring match
+/// against the project name OR its filesystem path, include first then exclude —
+/// so a filter selects the same projects whether it is resolved against a fresh
+/// parse or against the day cache. Patterns arrive pre-lowercased. `path` is
+/// absent on entries whose sessions were gone before it could be recorded; the
+/// name is then all there is to match on, as it is for the display layers.
+function dayProjectMatches(name: string, path: string | undefined, include: string[], exclude: string[]): boolean {
+  const n = name.toLowerCase()
+  const p = (path ?? '').toLowerCase()
+  const hit = (pattern: string): boolean => n.includes(pattern) || (p !== '' && p.includes(pattern))
+  if (include.length > 0 && !include.some(hit)) return false
+  if (exclude.length > 0 && exclude.some(hit)) return false
+  return true
+}
+
+/// Sum the per-project day stats that pass the filters. `defineProperty` so a
+/// project directory named "__proto__" stays an own key instead of mutating the
+/// prototype link (same reason day-aggregator does it when writing them).
+function sumMatchingProjects(
+  projects: Record<string, ProjectDayStats>,
+  include: string[],
+  exclude: string[],
+): { cost: number; calls: number; savingsUSD: number; sessions: number; projects: Record<string, ProjectDayStats>; matched: number } {
+  const out = { cost: 0, calls: 0, savingsUSD: 0, sessions: 0, projects: {} as Record<string, ProjectDayStats>, matched: 0 }
+  for (const [name, p] of Object.entries(projects)) {
+    if (!dayProjectMatches(name, p.path, include, exclude)) continue
+    out.cost += p.cost
+    out.calls += p.calls
+    out.savingsUSD += p.savingsUSD ?? 0
+    out.sessions += p.sessions ?? 0
+    out.matched += 1
+    Object.defineProperty(out.projects, name, { value: p, enumerable: true, writable: true, configurable: true })
+  }
+  return out
+}
+
+/// Collapse a day to the slice matching the active --project/--exclude filters,
+/// the project-level counterpart of sliceDayToProvider. Without this a
+/// project-filtered headline counted every historical day WHOLE — excluded
+/// projects included — while every detail panel (By Project / By Activity / By
+/// Model, all built from the name-filtered live parse) left them out, so the two
+/// could not be reconciled.
+///
+/// `DailyEntry.projects` (cache v15+) carries cost/calls/savingsUSD/sessions per
+/// project, so those four are recomputed EXACTLY. The day's tokens, models and
+/// categories have no per-project split to slice, so they are dropped here
+/// rather than reported as if they belonged to the surviving projects;
+/// buildDurablePeriod refills them from the project-filtered live parse, which
+/// is exact for every session that still exists.
+///
+/// A day recorded before v15 has no `projects` at all and nothing can
+/// reconstruct one once the sources are gone. Such a day cannot be attributed to
+/// any project, so it contributes nothing to a project-filtered total and its
+/// cost is surfaced as `unattributedCostUSD` instead of being silently folded in
+/// (understating with a stated figure beats overstating with excluded spend).
+function sliceDayToProject(day: DailyEntry, include: string[], exclude: string[]): DailyEntry {
+  const zeroDay = (): DailyEntry => ({
+    date: day.date, cost: 0, savingsUSD: 0, calls: 0, sessions: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    editTurns: 0, oneShotTurns: 0, models: {}, categories: {}, providers: {},
+    ...(day.carried ? { carried: true as const } : {}),
+  })
+  if (!day.projects) return zeroDay()
+  const totals = sumMatchingProjects(day.projects, include, exclude)
+  if (totals.matched === 0) return zeroDay()
+
+  // Provider slices carry their own per-project split, so `--provider X` on top
+  // of a project filter stays consistent with the day-level slice. A slice
+  // adopted from a pre-v15 cache has no split and is dropped for the same
+  // reason the day-level one is.
+  const providers: Record<string, ProviderDaySlice> = {}
+  for (const [name, slice] of Object.entries(day.providers)) {
+    if (!slice.projects) continue
+    const sliced = sumMatchingProjects(slice.projects, include, exclude)
+    if (sliced.matched === 0) continue
+    Object.defineProperty(providers, name, {
+      value: { cost: sliced.cost, calls: sliced.calls, savingsUSD: sliced.savingsUSD, sessions: sliced.sessions, projects: sliced.projects },
+      enumerable: true, writable: true, configurable: true,
+    })
+  }
+
+  return {
+    date: day.date,
+    cost: totals.cost,
+    savingsUSD: totals.savingsUSD,
+    calls: totals.calls,
+    sessions: totals.sessions,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    editTurns: 0, oneShotTurns: 0, models: {}, categories: {},
+    providers,
+    projects: totals.projects,
+    ...(day.carried ? { carried: true as const } : {}),
+  }
+}
+
+/// The durable day set behind a period's headline: historical days from the
+/// carry-forward cache (up to yesterday, INCLUDING days whose session files have
+/// expired) unioned with today parsed live, then narrowed to the requested range
+/// and (when given) the heatmap day selection. Identical construction to the
+/// menubar's all-provider headline — this IS that construction, extracted.
+///
+/// `sliceHistorical` narrows the cache-sourced days only. Today's days come from
+/// a parse the caller already name-filtered, so re-slicing them would be a no-op
+/// at best and could only lose data the filter meant to keep.
+function unionDaysForPeriod(
+  cache: DailyCache,
+  todayAllDays: DailyEntry[],
+  periodInfo: PeriodInfo,
+  daysSelection: Set<string> | null,
+  sliceHistorical?: (day: DailyEntry) => DailyEntry,
+): DailyEntry[] {
+  const now = new Date()
+  const yesterdayStr = toDateString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  const historicalRangeEndStr = rangeEndStr < yesterdayStr ? rangeEndStr : yesterdayStr
+  const cacheDays = rangeStartStr <= historicalRangeEndStr
+    ? getDaysInRange(cache, rangeStartStr, historicalRangeEndStr)
+    : []
+  // Apply the day selection BEFORE slicing so a day the heatmap filtered out
+  // never reaches the slicer (which tallies what it could not attribute).
+  const selectedCacheDays = daysSelection ? cacheDays.filter(d => daysSelection.has(d.date)) : cacheDays
+  const historicalDays = sliceHistorical ? selectedCacheDays.map(d => sliceHistorical(d)) : selectedCacheDays
+  const todayInRange = todayAllDays.filter(d => d.date >= rangeStartStr && d.date <= rangeEndStr)
+  const unfiltered = [...historicalDays, ...todayInRange].sort((a, b) => a.date.localeCompare(b.date))
+  return daysSelection ? unfiltered.filter(d => daysSelection.has(d.date)) : unfiltered
+}
+
+export type IndexedDurableOverview = {
+  cost: number
+  savingsUSD: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  carriedCostUSD: number
+}
+
+/**
+ * Project a dashboard headline from one normalized lifetime index. Existing
+ * durable cache days remain authoritative (so expired transcripts do not
+ * disappear); normalized days fill only dates the durable cache does not yet
+ * contain, which is the cold first-index case. Today always comes from the
+ * live normalized index. No parser is called here.
+ */
+export function buildDurableOverviewFromNormalizedIndex(
+  periodInfo: PeriodInfo,
+  normalizedProjects: ProjectSummary[],
+  cache: DailyCache,
+  opts: AggregateOpts = {},
+): IndexedDurableOverview {
+  const pf = opts.provider ?? 'all'
+  const include = (opts.project ?? []).map(value => value.toLowerCase())
+  const exclude = (opts.exclude ?? []).map(value => value.toLowerCase())
+  const hasProjectFilter = include.length > 0 || exclude.length > 0
+  const filteredProjects = filterProjectsByName(normalizedProjects, opts.project ?? [], opts.exclude ?? [])
+  const scanProjects = filterProjectsByDateRange(filteredProjects, periodInfo.range)
+  const now = new Date()
+  const todayStr = toDateString(now)
+  const normalizedDays = aggregateProjectsIntoDays(filteredProjects)
+  const todayDays = normalizedDays
+    .filter(day => day.date === todayStr)
+  const historicalSlice = hasProjectFilter
+    ? (day: DailyEntry): DailyEntry => sliceDayToProject(day, include, exclude)
+    : undefined
+  const cachedAllDays = unionDaysForPeriod(cache, todayDays, periodInfo, null, historicalSlice)
+  const cachedDates = new Set(cache.days.map(day => day.date))
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  // A provider-scoped index deliberately does not rewrite the shared all-
+  // provider durable cache. When that cache has no row for a surviving
+  // historical source, fill the missing date from this same normalized index;
+  // existing durable rows stay authoritative so expired history is preserved.
+  const canFillMissingDates = cache.complete !== true || cache.days.length === 0
+  const normalizedHistoricalDays = canFillMissingDates
+    ? normalizedDays.filter(day =>
+        day.date !== todayStr
+        && day.date >= rangeStartStr
+        && day.date <= rangeEndStr
+        && !cachedDates.has(day.date)
+      )
+    : []
+  const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
+  const normalizedByDate = new Map(normalizedDays.map(day => [day.date, day]))
+  const days = pf === 'all' ? allDays : allDays.map(day => {
+    if (Object.hasOwn(day.providers, pf)) return sliceDayToProvider(day, pf)
+    const normalized = normalizedByDate.get(day.date)
+    // The shared cache can be complete for a date while lacking this selected
+    // provider's slice (for example, Claude was cached before Codex appeared).
+    // Fill only that absent slice from the provider-scoped normalized index.
+    // An existing slice remains authoritative, retaining carried/expired money
+    // and preventing the surviving source from being counted twice.
+    return normalized && Object.hasOwn(normalized.providers, pf)
+      ? sliceDayToProvider(normalized, pf)
+      : sliceDayToProvider(day, pf)
+  })
+  const data = buildPeriodDataFromDays(days, periodInfo.label)
+
+  // Fields whose durable day rows cannot project under a project filter come
+  // from the same normalized period slice that feeds the visible detail panels.
+  const scan = buildPeriodData(periodInfo.label, scanProjects)
+  data.sessions = Math.max(data.sessions, scan.sessions)
+  if (hasProjectFilter) {
+    data.inputTokens = scan.inputTokens
+    data.outputTokens = scan.outputTokens
+    data.cacheReadTokens = scan.cacheReadTokens
+    data.cacheWriteTokens = scan.cacheWriteTokens
+  }
+
+  return {
+    cost: data.cost,
+    savingsUSD: data.savingsUSD,
+    calls: data.calls,
+    sessions: data.sessions,
+    inputTokens: data.inputTokens,
+    outputTokens: data.outputTokens,
+    cacheReadTokens: data.cacheReadTokens,
+    cacheWriteTokens: data.cacheWriteTokens,
+    carriedCostUSD: days.reduce((sum, day) => sum + (day.carried ? day.cost : 0), 0),
+  }
+}
+
+/// The single durable-totals builder every CLI/TUI surface and the menubar share.
+/// Headline totals (cost/calls/sessions/tokens/models/categories/savings) come
+/// from the carry-forward daily cache unioned with today's live parse and sliced
+/// to the requested provider, so a period that includes days whose session files
+/// have expired still counts them — the invariant the menubar already relies on.
+/// Detail-only fields that day entries can't carry (estimatedCost, unpriced
+/// models, workflow intelligence, per-session drill-down) are enriched from a
+/// fresh parse of the surviving sessions.
+export type DurablePeriod = {
+  /// Durable headline totals for the period.
+  data: PeriodData
+  /// The exact provider-sliced, day-filtered day set behind `data`. Daily rows
+  /// rendered by report/overview come from here so they reconcile to `data`.
+  days: DailyEntry[]
+  /// Sum of `cost` on `carried` days included in the period (footnote source).
+  carriedCostUSD: number
+  /// Cost the active --project/--exclude filter had to set aside: cached days
+  /// recorded before per-project day stats existed (v15) carry no project split,
+  /// so they cannot be attributed to the filtered projects. Always 0 when no
+  /// project filter is active. Reported so a filtered total that is short of the
+  /// unfiltered one says so instead of just looking wrong.
+  unattributedCostUSD: number
+  /// Fresh per-period parse (provider + name filtered) for detail views that
+  /// still need surviving session files.
+  liveProjects: ProjectSummary[]
+  /// Hydrated all-provider cache (reused by the menubar's provider list + daily
+  /// history sections).
+  cache: DailyCache
+  /// Today-only slice, all providers, name-filtered (memo seed for the menubar).
+  todayAllDays: DailyEntry[]
+  /// The scan range the live parse covered (today-only when the period is today).
+  scanRange: DateRange
+}
+
+export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: AggregateOpts = {}): Promise<DurablePeriod> {
+  const pf = opts.provider ?? 'all'
+  const daysSelection = opts.daysSelection ?? null
+  const fp = (p: ProjectSummary[]) => filterProjectsByName(p, opts.project ?? [], opts.exclude ?? [])
+
+  const now = new Date()
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const todayRange: DateRange = { start: todayStart, end: now }
+  const todayStr = toDateString(todayStart)
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  const isTodayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
+
+  const cache = await hydrateCache()
+
+  // Today's live data always comes from an all-provider parse so the union (and
+  // any per-provider slice of it) sees every provider's today. `todayAllDays` is
+  // the today bucket only — the union filters the historical remainder out of the
+  // cache.
+  let liveProjects: ProjectSummary[]
+  let todayAllDays: DailyEntry[]
+  let scanRange: DateRange
+  if (pf === 'all') {
+    if (isTodayOnly) {
+      const raw = fp(await parseAllSessions(todayRange, 'all'))
+      liveProjects = raw
+      scanRange = todayRange
+      todayAllDays = aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
+    } else {
+      const raw = fp(await parseAllSessions(periodInfo.range, 'all'))
+      liveProjects = daysSelection ? filterProjectsByDays(raw, daysSelection.days) : raw
+      scanRange = periodInfo.range
+      // A period that reaches today contains today's turns already, so derive the
+      // today slice from the same parse instead of scanning today again. Slice it
+      // to today first (filterProjectsByDays re-anchors a midnight-straddling
+      // turn to its surviving today calls), so today's category / turn count
+      // lands on today rather than staying anchored on the turn's yesterday
+      // start. Otherwise the post-midnight half vanishes from By Activity and the
+      // JSON daily turn count while the per-call cost/calls still bucket to today.
+      todayAllDays = rangeEndStr >= todayStr
+        ? aggregateProjectsIntoDays(filterProjectsByDays(raw, new Set([todayStr]))).filter(d => d.date === todayStr)
+        : aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
+    }
+  } else {
+    // Provider-filtered: today's all-provider parse feeds the union (sliced
+    // below); the provider-scoped parse feeds the detail/enrichment fields.
+    todayAllDays = aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
+    const rawProv = fp(await parseAllSessions(isTodayOnly ? todayRange : periodInfo.range, pf))
+    liveProjects = daysSelection && !isTodayOnly ? filterProjectsByDays(rawProv, daysSelection.days) : rawProv
+    scanRange = isTodayOnly ? todayRange : periodInfo.range
+  }
+
+  // Name filters must reach the cache-sourced days too. Today's parse is already
+  // name-filtered above (`fp`), but the historical remainder comes straight out
+  // of the day cache, so without this slice a --project/--exclude headline
+  // counted every expired-source day whole while the detail panels did not.
+  const projectInclude = (opts.project ?? []).map(s => s.toLowerCase())
+  const projectExclude = (opts.exclude ?? []).map(s => s.toLowerCase())
+  const hasProjectFilter = projectInclude.length > 0 || projectExclude.length > 0
+  // What a filtered total cannot claim, and therefore has to leave out: a cached
+  // day with no project split at all, or — with a provider filter also active,
+  // since the headline then reads that provider's slice — a slice carried from a
+  // cache generation that predates per-project splits. Both are stated back to
+  // the caller (footnoted by the overview) instead of vanishing from the total.
+  const unattributableCost = (day: DailyEntry): number => {
+    if (pf === 'all') return day.projects ? 0 : day.cost
+    const slice = Object.hasOwn(day.providers, pf) ? day.providers[pf] : undefined
+    if (!slice) return 0
+    return !day.projects || !slice.projects ? slice.cost : 0
+  }
+  let unattributedCostUSD = 0
+  const sliceHistorical = hasProjectFilter
+    ? (day: DailyEntry): DailyEntry => {
+        unattributedCostUSD += unattributableCost(day)
+        return sliceDayToProject(day, projectInclude, projectExclude)
+      }
+    : undefined
+
+  const allDays = unionDaysForPeriod(cache, todayAllDays, periodInfo, daysSelection?.days ?? null, sliceHistorical)
+  const days = pf === 'all' ? allDays : allDays.map(d => sliceDayToProvider(d, pf))
+  const data = buildPeriodDataFromDays(days, periodInfo.label)
+
+  // Enrich the cache-authoritative headline with fields DailyEntry cannot carry.
+  // These are all derivable only from surviving sessions (estimated-cost markers,
+  // unpriced-model detection, per-turn workflow intelligence), so they describe
+  // the live population, a subset of the carried headline.
+  const scanData = buildPeriodData(periodInfo.label, liveProjects)
+  data.estimatedCostUSD = scanData.estimatedCostUSD
+  data.unpricedModels = scanData.unpricedModels
+  data.workflow = scanData.workflow
+  data.topReworkedFiles = scanData.topReworkedFiles
+  data.pricingCoverage = scanData.pricingCoverage
+  // Cache buckets a session on its START day, the scan on any ACTIVE day; both
+  // are lower bounds of distinct sessions, so max is the tightest safe bound.
+  data.sessions = Math.max(data.sessions, scanData.sessions)
+  // Tokens/models/categories have no per-project split in the day cache, so
+  // sliceDayToProject drops them (see there). Under a project filter they come
+  // from the live parse instead: exact for the filtered projects, bounded by
+  // source retention like every other scan-derived field above, and consistent
+  // with the By Model / By Activity panels that read the same parse. Cost, calls,
+  // sessions and savings stay durable — sliced out of the cache, expired days
+  // included.
+  if (hasProjectFilter) {
+    data.inputTokens = scanData.inputTokens
+    data.outputTokens = scanData.outputTokens
+    data.cacheReadTokens = scanData.cacheReadTokens
+    data.cacheWriteTokens = scanData.cacheWriteTokens
+    data.models = scanData.models
+    data.categories = scanData.categories
+  }
+  const estimatedByModel = new Map(
+    scanData.models.filter(m => m.estimatedCostUSD != null).map(m => [m.name, m.estimatedCostUSD!]),
+  )
+  if (estimatedByModel.size > 0) {
+    data.models = data.models.map(m =>
+      estimatedByModel.has(m.name) ? { ...m, estimatedCostUSD: estimatedByModel.get(m.name) } : m,
+    )
+  }
+
+  const carriedCostUSD = days.reduce((s, d) => s + (d.carried ? d.cost : 0), 0)
+  return { data, days, carriedCostUSD, unattributedCostUSD, liveProjects, cache, todayAllDays, scanRange }
 }
 
 /**
@@ -212,17 +707,27 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   let scanProjects!: ProjectSummary[]
   let scanRange!: DateRange
   let cache: DailyCache = emptyCache()
-  let todayProviderData: PeriodData | null = null
+  /// The exact day set behind the all-provider headline (cache-backed
+  /// historical days + today's live days, day-filtered). Non-null only on the
+  /// unscoped all-provider path; it is the authority the projects view merges
+  /// from, so carried days count even after their session files are gone.
+  let cacheDaysForPeriod: DailyEntry[] | null = null
   let claudeConfigs: ClaudeConfigSelector | undefined
   const requestedClaudeConfigSourceId = opts.claudeConfigSourceId?.trim() || null
   const isClaudeConfigScoped = requestedClaudeConfigSourceId !== null
 
+  // Captured synchronously right after whichever branch's primary parse resolves —
+  // the ONLY safe read point for the module-level hydration global. Re-reading the
+  // global later would race against this function's own history-block re-parse and
+  // against concurrent requests (web-dashboard SWR, parallel MCP calls).
+  let hydration: ReturnType<typeof sessionHydrationSnapshot> | undefined
   let effectivelyScoped = false
   if (isClaudeConfigScoped) {
     // A config source scopes Claude usage only, so scan just Claude (main.ts
     // rejects a contradictory non-Claude --provider). This also avoids parsing
     // every other provider's corpus on each scoped refresh.
     const rawProjects = fp(await parseAllSessions(periodInfo.range, 'claude'))
+    hydration = sessionHydrationSnapshot()
     const fullProjects = daysSelection ? filterProjectsByDays(rawProjects, daysSelection.days) : rawProjects
     claudeConfigs = await claudeConfigSelector(fullProjects, requestedClaudeConfigSourceId)
     const selectedSourceId = claudeConfigs?.selectedId ?? null
@@ -238,63 +743,30 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     // still renders.
   }
   if (!effectivelyScoped) {
-    if (isAllProviders) {
-      cache = await hydrateCache()
-      const isTodayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
-      // Single all-provider scan for the requested window. Previously the overview
-      // parsed every provider TWICE — once over todayRange and once over the full
-      // period — even though the period scan already contains today's turns. Scan
-      // once here and derive the "today" slice from it below: aggregateProjects-
-      // IntoDays buckets by each turn's own timestamp, so a period scan's today
-      // slice is identical to a dedicated today scan's. A purely historical window
-      // (ends before today) never reaches today, so its separate today scan — the
-      // one the always-on daily-history strip needs — is left to run.
-      let rawScan: ProjectSummary[]
-      if (isTodayOnly) {
-        rawScan = fp(await parseAllSessions(todayRange, 'all'))
-        scanProjects = rawScan
-        scanRange = todayRange
-      } else {
-        rawScan = fp(await parseAllSessions(periodInfo.range, 'all'))
-        scanProjects = daysSelection ? filterProjectsByDays(rawScan, daysSelection.days) : rawScan
-        scanRange = periodInfo.range
-      }
-      // Seed the today memo from the un-daysSelection rawScan so the always-on
-      // daily-history strip still shows today even when the heatmap day filter
-      // excludes it (matching the old dedicated today scan, which ignored it).
-      if (rangeEndStr >= todayStr) {
-        todayAllDays = aggregateProjectsIntoDays(rawScan).filter(d => d.date === todayStr)
-      }
-      const todayDays = await getTodayAllDays()
-      const historicalDays = rangeStartStr <= historicalRangeEndStr
-        ? getDaysInRange(cache, rangeStartStr, historicalRangeEndStr)
-        : []
-      const todayInRange = todayDays.filter(d => d.date >= rangeStartStr && d.date <= rangeEndStr)
-      const unfilteredDays = [...historicalDays, ...todayInRange].sort((a, b) => a.date.localeCompare(b.date))
-      const allDays = daysSelection ? unfilteredDays.filter(d => daysSelection.days.has(d.date)) : unfilteredDays
-      currentData = buildPeriodDataFromDays(allDays, periodInfo.label)
-    } else {
-      cache = await loadDailyCache()
-      const rawProviderProjects = fp(await parseAllSessions(periodInfo.range, pf))
-      const fullProjects = daysSelection ? filterProjectsByDays(rawProviderProjects, daysSelection.days) : rawProviderProjects
-      todayProviderData = buildPeriodData(periodInfo.label, fullProjects)
-      currentData = todayProviderData
-      scanProjects = fullProjects
-      scanRange = periodInfo.range
-    }
-  }
-  if (isAllProviders) {
-    // Load-bearing overwrite: the daily-cache path above never carries
-    // estimatedCostUSD (DailyEntry has no such field), so this fresh-parse
-    // rebuild is what keeps the estimated marker alive on cached periods.
-    // Removing it as redundant silently drops the flag.
-    currentData = buildPeriodData(periodInfo.label, scanProjects)
+    // Every non-scoped headline — all-provider AND provider-filtered — is built
+    // by the one shared durable-totals builder. It unions the carry-forward
+    // cache with today's live parse (slicing to the provider when filtered), so
+    // days whose session files have expired still count. The provider list and
+    // daily-history sections below reuse its cache + today slice.
+    const durable = await buildDurablePeriod(periodInfo, {
+      provider: pf,
+      project: opts.project,
+      exclude: opts.exclude,
+      daysSelection,
+    })
+    hydration = sessionHydrationSnapshot()
+    currentData = durable.data
+    scanProjects = durable.liveProjects
+    scanRange = durable.scanRange
+    cacheDaysForPeriod = durable.days
+    cache = durable.cache
+    todayAllDays = durable.todayAllDays
   }
   claudeConfigs = claudeConfigs ?? await claudeConfigSelector(scanProjects, null)
 
-  // Codex credits for the period. Reuses the models aggregation (folds reasoning
-  // into output, keeps non-cached input + cached-read separate) so the figure
-  // matches the official credit rates.
+  // Codex credits for the period. Reuses the models aggregation (billable output
+  // already includes reasoning for codex, keeps non-cached input + cached-read
+  // separate) so the figure matches the official credit rates.
   const modelRows = await aggregateModels(scanProjects)
   currentData.codexCredits = modelRows.reduce(
     (sum, r) => sum + (r.provider === 'codex' && r.credits != null ? r.credits : 0),
@@ -302,46 +774,76 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   )
 
   // PROVIDERS
-  // For .all: enumerate every provider with cost across the period (from cache) + installed-but-zero.
-  // For specific: just this single provider with its scoped cost.
+  // For .all: enumerate every provider with usage across the period (from cache) + installed-but-idle.
+  // `hasUsage` preserves token-only and subscription-backed activity while
+  // distinguishing a provider merely discovered on disk.
+  // For specific: just this single provider with its scoped totals.
   const allProviders = await getAllProviders()
   const displayNameByName = new Map(allProviders.map(p => [p.name, p.displayName]))
   const providers: ProviderCost[] = []
   if (isClaudeConfigScoped) {
-    const providerTotals: Record<string, number> = {}
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of aggregateProjectsIntoDays(scanProjects)) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     if (providers.length === 0 && claudeConfigs?.selectedId) {
-      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0 })
+      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0, calls: 0, hasUsage: false })
     }
   } else if (isAllProviders) {
-    const unfilteredProviderDays = [
-      ...(rangeStartStr <= historicalRangeEndStr ? getDaysInRange(cache, rangeStartStr, historicalRangeEndStr) : []),
-      ...(await getTodayAllDays()).filter(d => d.date >= rangeStartStr && d.date <= rangeEndStr),
-    ]
-    const allDaysForProviders = daysSelection ? unfilteredProviderDays.filter(d => daysSelection.days.has(d.date)) : unfilteredProviderDays
-    const providerTotals: Record<string, number> = {}
+    // Reuse the day set the headline was built from instead of rebuilding one
+    // straight out of the cache. The rebuilt version unioned unfiltered historical
+    // days with an already-filtered today, so per-provider costs counted every
+    // carried day whole while today honoured --project/--exclude, and the provider
+    // list could not be reconciled with the By Project panel (#865).
+    //
+    // durable.days is that same union, already narrowed by range, day selection and
+    // the project filter, which is what the comment above the buildDurablePeriod
+    // call already promised this section would use. Non-null here: this branch
+    // implies !isClaudeConfigScoped, which forces the !effectivelyScoped path that
+    // assigns it.
+    const allDaysForProviders = cacheDaysForPeriod ?? []
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of allDaysForProviders) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     for (const p of allProviders) {
       if (providers.some(pc => pc.name === p.name)) continue
       const sources = await safeDiscoverSessions(p)
-      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0 })
+      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0, calls: 0, hasUsage: false })
     }
   } else {
-    providers.push({ name: pf, displayName: displayNameByName.get(pf) ?? pf, cost: currentData.cost })
+    providers.push({
+      name: pf,
+      displayName: displayNameByName.get(pf) ?? pf,
+      cost: currentData.cost,
+      calls: currentData.calls,
+      hasUsage: currentData.cost > 0
+        || currentData.savingsUSD > 0
+        || currentData.calls > 0
+        || currentData.sessions > 0
+        || currentData.inputTokens > 0
+        || currentData.outputTokens > 0
+        || currentData.cacheReadTokens > 0
+        || currentData.cacheWriteTokens > 0,
+    })
   }
 
   // DAILY HISTORY (last 365 days)
@@ -402,33 +904,71 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   }
 
   const home = homedir()
-  const friendlyProject = (p: ProjectSummary) => {
-    const resolved = p.projectPath || p.project
-    if (resolved === home || resolved === home + '/') return 'Home'
-    return resolved.split('/').filter(Boolean).pop() || p.project
+  const friendlyFromPath = (path: string | undefined, fallback: string): string => {
+    if (!path) return fallback
+    if (path === home || path === home + '/') return 'Home'
+    return path.split('/').filter(Boolean).pop() || fallback
   }
+  const friendlyProject = (p: ProjectSummary) => friendlyFromPath(p.projectPath || p.project, p.project)
+  const sessionDetailsOf = (p: ProjectSummary) => [...p.sessions]
+    .sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+    .slice(0, 10)
+    .map(s => ({
+      cost: s.totalCostUSD,
+      savingsUSD: s.totalSavingsUSD,
+      calls: s.apiCalls,
+      inputTokens: s.totalInputTokens,
+      outputTokens: sessionBillableOutputTokens(s),
+      date: s.firstTimestamp?.split('T')[0] ?? '',
+      models: Object.entries(s.modelBreakdown)
+        .map(([name, m]) => ({ name, cost: m.costUSD, savingsUSD: m.savingsUSD }))
+        .sort((a, b) => b.cost - a.cost)
+        .slice(0, 3),
+    }))
 
-  currentData.projects = scanProjects.map(p => ({
-    name: friendlyProject(p),
-    cost: p.totalCostUSD,
-    savingsUSD: p.totalSavingsUSD,
-    sessions: p.sessions.length,
-    sessionDetails: [...p.sessions]
-      .sort((a, b) => b.totalCostUSD - a.totalCostUSD)
-      .slice(0, 10)
-      .map(s => ({
-        cost: s.totalCostUSD,
-        savingsUSD: s.totalSavingsUSD,
-        calls: s.apiCalls,
-        inputTokens: s.totalInputTokens,
-        outputTokens: s.totalOutputTokens,
-        date: s.firstTimestamp?.split('T')[0] ?? '',
-        models: Object.entries(s.modelBreakdown)
-          .map(([name, m]) => ({ name, cost: m.costUSD, savingsUSD: m.savingsUSD }))
-          .sort((a, b) => b.cost - a.cost)
-          .slice(0, 3),
-      })),
-  }))
+  if (cacheDaysForPeriod !== null) {
+    // Project totals come from the SAME day set as the headline, so carried
+    // days count here too. The surviving-session parse contributes only what
+    // day entries cannot: the per-session drill-down and a fresher project
+    // path. Days recorded before the projects rollup existed have totals but
+    // no project split, so this list can sum to less than the headline — an
+    // honest gap, not a bug.
+    type CachedProjectTotal = { cost: number; savingsUSD: number; sessions: number; path?: string }
+    const cachedTotals = new Map<string, CachedProjectTotal>()
+    for (const d of cacheDaysForPeriod) {
+      for (const [name, p] of Object.entries(d.projects ?? {})) {
+        const acc = cachedTotals.get(name) ?? { cost: 0, savingsUSD: 0, sessions: 0 }
+        acc.cost += p.cost
+        acc.savingsUSD += p.savingsUSD
+        acc.sessions += p.sessions
+        if (!acc.path && p.path) acc.path = p.path
+        cachedTotals.set(name, acc)
+      }
+    }
+    const liveByName = new Map(scanProjects.map(p => [p.project, p]))
+    const names = new Set([...cachedTotals.keys(), ...liveByName.keys()])
+    currentData.projects = [...names].map(name => {
+      const cached = cachedTotals.get(name)
+      const live = liveByName.get(name)
+      return {
+        name: live ? friendlyProject(live) : friendlyFromPath(cached?.path, name),
+        cost: cached?.cost ?? live!.totalCostUSD,
+        savingsUSD: cached?.savingsUSD ?? live!.totalSavingsUSD,
+        // max for the same reason as the headline: start-day bucketing vs
+        // active-day counting, both lower bounds of distinct sessions.
+        sessions: Math.max(cached?.sessions ?? 0, live?.sessions.length ?? 0),
+        ...(live ? { sessionDetails: sessionDetailsOf(live) } : {}),
+      }
+    }).sort((a, b) => b.cost - a.cost)
+  } else {
+    currentData.projects = scanProjects.map(p => ({
+      name: friendlyProject(p),
+      cost: p.totalCostUSD,
+      savingsUSD: p.totalSavingsUSD,
+      sessions: p.sessions.length,
+      sessionDetails: sessionDetailsOf(p),
+    }))
+  }
 
   const effMap = aggregateModelEfficiency(scanProjects)
   currentData.modelEfficiency = [...effMap.entries()].map(([name, eff]) => ({
@@ -462,6 +1002,34 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       date: s.firstTimestamp?.split('T')[0] ?? '',
     }))
   ).sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD)).slice(0, 5)
+
+  // PULL REQUESTS + BRANCHES (all-provider path only). Both are session-layer
+  // aggregations over the surviving-session parse, so carried history cannot
+  // contribute — expected and fine. PR links and per-turn git branches are
+  // captured natively by Claude or correlated from any provider's saved session
+  // through explicit references, exact launcher prompts, or unambiguous cwds.
+  // Set only when non-empty so the payload omits them (and the app renders its
+  // quiet empty state) whenever there is nothing to show. Excluded on the
+  // Claude-config-scoped path (which replaces scanProjects with one config's
+  // sessions) so this stays the genuine unscoped all-provider aggregation.
+  if (isAllProviders && !effectivelyScoped) {
+    // One pass yields both rows and totals, so they never disagree.
+    const { rows: prRows, totals: prTotals } = buildPrAttribution(scanProjects)
+    if (prRows.length > 0) {
+      currentData.pullRequests = {
+        // PRs are user-auditable spend records, so never collapse the tail into
+        // an opaque "Other" bucket. The desktop list scrolls with the page.
+        rows: prRows,
+        distinctCost: prTotals.cost,
+        distinctSessions: prTotals.sessions,
+        attributedCost: prTotals.attributedCost,
+        unattributedCost: prTotals.unattributedCost,
+        ...(prTotals.subagentSessions > 0 ? { subagentSessions: prTotals.subagentSessions } : {}),
+      }
+    }
+    const branchRows = aggregateByBranch(scanProjects)
+    if (branchRows.length > 0) currentData.byBranch = branchRows.slice(0, TOP_BRANCHES)
+  }
 
   // Routing waste: find cheapest reliable model (≥90% 1-shot, ≥5 edits),
   // then compute how much each pricier model overpaid.
@@ -498,6 +1066,17 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     const toolMap: Record<string, number> = {}
     const skillMap: Record<string, { turns: number; cost: number }> = {}
     const subagentMap: Record<string, { calls: number; cost: number }> = {}
+    const ompSubagentMap = new Map<string, {
+      agentName: string
+      model: string
+      startedAt: string
+      calls: number
+      cost: number
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+    }>()
     const mcpMap: Record<string, number> = {}
     // Local-model savings rollup: avoided spend (cost forced to $0, baseline
     // recorded) grouped by model and provider. Mirrors the per-call savingsUSD
@@ -510,22 +1089,52 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       for (const [t, d] of Object.entries(s.toolBreakdown)) { if (!t.startsWith('lang:')) toolMap[t] = (toolMap[t] ?? 0) + d.calls }
       for (const [sk, d] of Object.entries(s.skillBreakdown)) { const e = skillMap[sk] ?? { turns: 0, cost: 0 }; e.turns += d.turns; e.cost += d.costUSD; skillMap[sk] = e }
       for (const [sa, d] of Object.entries(s.subagentBreakdown)) { const e = subagentMap[sa] ?? { calls: 0, cost: 0 }; e.calls += d.calls; e.cost += d.costUSD; subagentMap[sa] = e }
+      if (s.agentName && s.turns.some(turn => turn.assistantCalls.some(call => call.provider === 'omp'))) {
+        const calls = s.turns.flatMap(turn => turn.assistantCalls)
+        const models = Array.from(new Set(calls.map(call => call.model))).sort()
+        const model = models.join(', ') || 'unknown'
+        const startedAt = s.agentStartedAt ?? s.firstTimestamp
+        const key = `${s.agentName}\u0000${model}\u0000${startedAt}`
+        const entry = ompSubagentMap.get(key) ?? {
+          agentName: s.agentName,
+          model,
+          startedAt,
+          calls: 0,
+          cost: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        }
+        entry.calls += s.apiCalls
+        entry.cost += s.totalCostUSD
+        entry.inputTokens += s.totalInputTokens
+        entry.outputTokens += s.totalOutputTokens
+        entry.cacheReadTokens += s.totalCacheReadTokens
+        entry.cacheWriteTokens += s.totalCacheWriteTokens
+        ompSubagentMap.set(key, entry)
+      }
       for (const [m, d] of Object.entries(s.mcpBreakdown)) { mcpMap[m] = (mcpMap[m] ?? 0) + d.calls }
       for (const turn of s.turns) for (const call of turn.assistantCalls) {
         if (!call.savingsUSD || call.savingsUSD <= 0) continue
+        // Saved DOLLARS/tokens keep every call, but the `calls` figures are
+        // request counts: a supplementary accounting call (copilot rollup /
+        // paired store row) can carry configured model-savings too and must
+        // not count as a request.
+        const callWeight = isBehavioralCall(call) ? 1 : 0
         totalSavings += call.savingsUSD
-        totalSavingsCalls += 1
+        totalSavingsCalls += callWeight
         const modelKey = getShortModelName(call.model)
         const acc = savingsByModel.get(modelKey) ?? { calls: 0, actualUSD: 0, savingsUSD: 0, baselineModel: call.savingsBaselineModel ?? '', inputTokens: 0, outputTokens: 0 }
-        acc.calls += 1
+        acc.calls += callWeight
         acc.actualUSD += call.costUSD
         acc.savingsUSD += call.savingsUSD
         acc.baselineModel = acc.baselineModel || (call.savingsBaselineModel ?? '')
         acc.inputTokens += call.usage.inputTokens
-        acc.outputTokens += call.usage.outputTokens
+        acc.outputTokens += callBillableOutputTokens(call)
         savingsByModel.set(modelKey, acc)
         const provAcc = savingsByProvider.get(call.provider) ?? { calls: 0, savingsUSD: 0 }
-        provAcc.calls += 1
+        provAcc.calls += callWeight
         provAcc.savingsUSD += call.savingsUSD
         savingsByProvider.set(call.provider, provAcc)
       }
@@ -536,17 +1145,36 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       byModel: Array.from(savingsByModel.entries()).sort(([, a], [, b]) => b.savingsUSD - a.savingsUSD).slice(0, 5).map(([name, d]) => ({ name, ...d })),
       byProvider: Array.from(savingsByProvider.entries()).sort(([, a], [, b]) => b.savingsUSD - a.savingsUSD).slice(0, 5).map(([name, d]) => ({ name, ...d })),
     }
+    const subagents: SubagentRow[] = [
+      ...Object.entries(subagentMap).map(([name, d]) => ({ name, ...d })),
+      ...Array.from(ompSubagentMap.values()).map(entry => ({
+        name: entry.agentName,
+        ...entry,
+        totalTokens: entry.inputTokens + entry.outputTokens + entry.cacheReadTokens + entry.cacheWriteTokens,
+      })),
+    ]
     return {
       tools: Object.entries(toolMap).sort(([, a], [, b]) => b - a).slice(0, 10).map(([name, calls]) => ({ name, calls })),
       skills: Object.entries(skillMap).sort(([, a], [, b]) => b.cost - a.cost).slice(0, 10).map(([name, d]) => ({ name, ...d })),
-      subagents: Object.entries(subagentMap).sort(([, a], [, b]) => b.cost - a.cost).slice(0, 10).map(([name, d]) => ({ name, ...d })),
+      subagents: subagents.sort((a, b) => b.cost - a.cost || (b.totalTokens ?? 0) - (a.totalTokens ?? 0)),
       mcpServers: Object.entries(mcpMap).sort(([, a], [, b]) => b - a).slice(0, 10).map(([name, calls]) => ({ name, calls })),
       localModelSavings,
     }
   })()
 
-  const optimize = opts.optimize === false ? null : await scanAndDetect(scanProjects, scanRange)
+  const optimize = opts.optimize === false ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
   const granularRange = opts.daysSelection?.range ?? scanRange
   const granularHistory = opts.timeline === false ? undefined : buildGranularHistory(scanProjects, granularRange)
-  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory)
+  // `stale` keeps its original meaning: a read-only serve that could not see
+  // real files. A first paint is incomplete for a different reason (files
+  // deliberately sequenced behind it) and reports that through `hydration`
+  // instead, so the two are never conflated.
+  const partialFirstPaint = hydration?.deferredForFirstPaint === true
+  const stale = hydration?.complete === false && !partialFirstPaint ? true : undefined
+  const payload = buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  // Plugin socket: add-only sections from loaded plugins (empty socket by
+  // default, so the payload is byte-identical without plugins installed).
+  const pluginSections = await pluginPayloadSections(await loadPlugins())
+  if (Object.keys(pluginSections).length > 0) payload.plugins = pluginSections
+  return payload
 }

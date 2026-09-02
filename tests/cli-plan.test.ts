@@ -147,4 +147,80 @@ describe('codeburn plan command', () => {
       await rm(home, { recursive: true, force: true })
     }
   }, CLI_PLAN_TIMEOUT_MS)
+
+  it('sets copilot-pro as 1500 credits / $15 equivalent', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-plan-'))
+
+    try {
+      const result = runCli(['plan', 'set', 'copilot-pro'], home)
+      expect(result.status).toBe(0)
+
+      const configPath = join(home, '.config', 'codeburn', 'config.json')
+      const config = JSON.parse(await readFile(configPath, 'utf-8')) as {
+        plans?: { copilot?: { id?: string; monthlyCredits?: number; monthlyUsd?: number; provider?: string; resetDay?: number } }
+      }
+      expect(config.plans?.copilot).toMatchObject({
+        id: 'copilot-pro',
+        monthlyCredits: 1500,
+        monthlyUsd: 15,
+        provider: 'copilot',
+        resetDay: 1,
+      })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  }, CLI_PLAN_TIMEOUT_MS)
+
+  it('writes custom copilot credits and rejects mixed units', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-plan-'))
+
+    try {
+      const ok = runCli(['plan', 'set', 'custom', '--credits', '20000', '--provider', 'copilot'], home)
+      expect(ok.status).toBe(0)
+      const configPath = join(home, '.config', 'codeburn', 'config.json')
+      const config = JSON.parse(await readFile(configPath, 'utf-8')) as {
+        plans?: { copilot?: { monthlyCredits?: number; monthlyUsd?: number; provider?: string } }
+      }
+      expect(config.plans?.copilot).toMatchObject({
+        monthlyCredits: 20000,
+        monthlyUsd: 200,
+        provider: 'copilot',
+      })
+
+      const mixed = runCli(['plan', 'set', 'custom', '--monthly-usd', '200', '--provider', 'copilot'], home)
+      expect(mixed.status).not.toBe(0)
+      expect(mixed.stderr).toContain('units mixed')
+
+      const wrongProvider = runCli(['plan', 'set', 'custom', '--credits', '20000', '--provider', 'claude'], home)
+      expect(wrongProvider.status).not.toBe(0)
+      expect(wrongProvider.stderr).toContain('--credits is only valid with --provider copilot')
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  }, CLI_PLAN_TIMEOUT_MS)
+
+  // #1199: the JSON plan block must say how complete the credit total is, not
+  // just carry a bare creditsIncomplete boolean.
+  it('emits the credit completeness fields in status JSON', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-plan-'))
+
+    try {
+      expect(runCli(['plan', 'set', 'copilot-pro'], home).status).toBe(0)
+      const status = runCli(['status', '--provider', 'copilot', '--format', 'json', '--period', 'month', '--no-optimize', '--no-timeline'], home)
+      expect(status.status).toBe(0)
+      const copilot = (JSON.parse(status.stdout) as {
+        plans?: { copilot?: Record<string, unknown> }
+      }).plans?.copilot
+      expect(copilot).toMatchObject({
+        spentCredits: 0,
+        estimatedCredits: 0,
+        creditRatedCalls: 0,
+        creditUnratedCalls: 0,
+        creditsIncomplete: false,
+        creditsNote: 'No Copilot requests in this period.',
+      })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  }, CLI_PLAN_TIMEOUT_MS * 3)
 })

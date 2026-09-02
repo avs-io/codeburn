@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import Observation
+import ServiceManagement
 
 private let refreshIntervalSeconds: UInt64 = 30
 private let forceRefreshWatchdogSeconds: TimeInterval = 90
@@ -44,16 +45,22 @@ struct CodeBurnApp: App {
         Settings {
             SettingsView()
                 .environment(delegate.store)
+                .environment(delegate.updateChecker)
         }
     }
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var statusItemPlacementRecoveryTask: Task<Void, Never>?
     private var popover: NSPopover!
+    private var capacityDockController: CapacityDockController?
     private var rightClickMonitor: Any?
     private var lastContextMenuPresentedAt: Date = .distantPast
+    /// Held only while the right-click menu is open. Cleared in menuDidClose so
+    /// left-click goes back to the popover action instead of re-showing the menu.
+    private var contextMenu: NSMenu?
     fileprivate let store = AppStore()
     let updateChecker = UpdateChecker()
     /// True while the displays are asleep. Refresh ticks skip spawning
@@ -78,8 +85,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var claudeQuotaRefreshTask: Task<Bool, Never>?
     private var codexQuotaRefreshTask: Task<Bool, Never>?
     private var refreshLoopHeartbeatAt: Date = .distantPast
+    private var providerSettingsObserver: NSObjectProtocol?
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Synchronously, before the actor hop: the app can exit before a
+        // detached Task is ever scheduled, and a serve child that outlives us
+        // is the orphan in #1117. shutdown() still runs for the tidy case.
+        ServeChildRegistry.shared.reapAll()
+        Task { await ServeConnection.shared.shutdown() }
+        stopStatusItemPlacementRecovery()
+        capacityDockController?.stop()
+        capacityDockController = nil
+        if let providerSettingsObserver {
+            NotificationCenter.default.removeObserver(providerSettingsObserver)
+            self.providerSettingsObserver = nil
+        }
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)
             rightClickMonitor = nil
@@ -87,9 +107,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // Set accessory policy before the app's focus chain forms. On macOS Tahoe
-        // (26.x), setting it after didFinishLaunching causes ghost status items
-        // because the policy gets baked into the initial focus chain.
+        // Belt-and-suspenders for dev runs only: packaged builds ship
+        // LSUIElement=true (package-app.sh / build-local.sh), so LaunchServices
+        // starts the process at .accessory before main() runs and this call is
+        // a measured no-op there (returns false, no state change — #868
+        // analysis). What actually matters is that the policy NEVER
+        // transitions while a live NSStatusItem exists: the .regular →
+        // .accessory dance from #147 is what plausibly caused the ghost item
+        // that 85b5728 fixed. Keep the policy pinned; see the activate() call
+        // in applicationDidFinishLaunching for the other half of the story.
         NSApp.setActivationPolicy(.accessory)
     }
 
@@ -117,8 +143,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // interaction (popover open, wake) refreshes immediately.
 
         restorePersistedCurrency()
+        // Start the resident CLI early without an artificial query. The first
+        // real status refresh becomes its only cold warm-up. See ServeConnection.
+        Task { await ServeConnection.shared.ensureStarted() }
+        // #868 experiment: restore only the activation half of the #147 fix.
+        // Packaged builds ship LSUIElement=true, so the policy is .accessory
+        // before main() runs and never transitions (the transition is what
+        // plausibly caused the ghost item). Accessory apps can still activate,
+        // which registers the app with the window server before the status
+        // item is created - the effect #147 actually needed for #146.
+        NSApp.activate(ignoringOtherApps: true)
         setupStatusItem()
         setupPopover()
+        capacityDockController = CapacityDockController(store: store)
+        capacityDockController?.start()
         observeStore()
         startRefreshLoop()
         startNapBackstop()
@@ -126,7 +164,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         removeLegacyRefreshAgent()
         registerLoginItemIfNeeded()
         observeSubscriptionDisconnect()
+        observeCapacityDockProviderSettingsRequests()
         Task { await updateChecker.checkIfNeeded() }
+    }
+
+    private func observeCapacityDockProviderSettingsRequests() {
+        providerSettingsObserver = NotificationCenter.default.addObserver(
+            forName: .capacityDockOpenProviderSettings,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let providerID = notification.object as? String else { return }
+            Task { @MainActor [weak self] in
+                self?.store.settingsTab = providerID
+                self?.openSettings()
+            }
+        }
     }
 
     private func setupWakeObservers() {
@@ -140,6 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.stopStatusItemPlacementRecovery()
                 self?.prepareRefreshPipelineForSleep()
             }
         }
@@ -156,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "wake")
+                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -167,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             Task { @MainActor in
                 self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "screen wake")
+                self?.startStatusItemPlacementRecovery()
             }
         }
 
@@ -180,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.displayAsleep = true
+                self?.stopStatusItemPlacementRecovery()
             }
         }
     }
@@ -261,32 +318,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let key = "codeburn.loginItemRegistered"
         guard !UserDefaults.standard.bool(forKey: key) else { return }
 
-        let appPath = Bundle.main.bundlePath
-        let script = "tell application \"System Events\" to make login item at end with properties {path:\(appleScriptStringLiteral(appPath)), hidden:false}"
-
-        let process = Process()
-        process.launchPath = "/usr/bin/osascript"
-        process.arguments = ["-e", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
+        // Registers in-process. The old path told System Events to make the login
+        // item, which made macOS ask for Automation access on first launch (#1026).
+        // No AppleScript fallback: a failure here must not bring that prompt back.
         do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 {
-                UserDefaults.standard.set(true, forKey: key)
+            if SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
             }
+            UserDefaults.standard.set(true, forKey: key)
         } catch {
-            NSLog("CodeBurn: Login item registration failed: \(error)")
+            NSLog("CodeBurn: login item registration failed: \(error.localizedDescription)")
         }
-    }
-
-    private func appleScriptStringLiteral(_ value: String) -> String {
-        var escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
-        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
-        escaped = escaped.replacingOccurrences(of: "\r", with: "")
-        escaped = escaped.replacingOccurrences(of: "\n", with: "")
-        return "\"\(escaped)\""
     }
 
     private var lastRefreshTime: Date = .distantPast
@@ -464,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // is refreshed by refreshPayloadForPopoverOpen the moment it opens,
         // so a closed-popover tick never pays for it (#647).
         if !(popover?.isShown ?? false) {
-            async let menubar = store.refreshQuietly(
+            async let menubar = store.refreshMenubarBadge(
                 period: menubarPeriod,
                 force: force,
                 qualityOfService: qualityOfService
@@ -486,7 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             qualityOfService: qualityOfService
         )
         async let menubar = needsMenubarPayload
-            ? store.refreshQuietly(period: menubarPeriod, force: force, qualityOfService: qualityOfService)
+            ? store.refreshMenubarBadge(period: menubarPeriod, force: force, qualityOfService: qualityOfService)
             : true
         async let today = needsTodayPayload
             ? store.refreshQuietly(period: .today, force: force, qualityOfService: qualityOfService)
@@ -519,6 +561,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     fileprivate var lastSubscriptionRefreshAt: Date?
     fileprivate var lastCodexRefreshAt: Date?
+    fileprivate var lastKimiRefreshAt: Date?
+    fileprivate var lastGeminiRefreshAt: Date?
+    fileprivate var lastCopilotRefreshAt: Date?
+    fileprivate var lastAntigravityRefreshAt: Date?
+    fileprivate var lastCapacityDockProviderRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -526,11 +573,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func refreshLiveQuotaProgressIfDue(
         force: Bool = false,
         forceClaude: Bool = false,
-        forceCodex: Bool = false
+        forceCodex: Bool = false,
+        forceCapacityDockProviders: Bool = false
     ) async -> Bool {
         let cadence = SubscriptionRefreshCadence.current
         let autoRefreshAllowed = cadence != .manual
-        if !force && !forceClaude && !forceCodex && !autoRefreshAllowed { return false }
+        if !force && !forceClaude && !forceCodex && !forceCapacityDockProviders
+            && !autoRefreshAllowed { return false }
 
         let now = Date()
         let threshold = TimeInterval(cadence.rawValue)
@@ -542,7 +591,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let shouldRefreshCodex = force || forceCodex || (
             autoRefreshAllowed && now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast) >= threshold
         )
-        guard shouldRefreshClaude || shouldRefreshCodex else { return false }
+        let shouldRefreshCapacityDockProviders = force || forceCapacityDockProviders || (
+            autoRefreshAllowed
+                && now.timeIntervalSince(lastCapacityDockProviderRefreshAt ?? .distantPast) >= threshold
+        )
+        guard shouldRefreshClaude || shouldRefreshCodex || shouldRefreshCapacityDockProviders else {
+            return false
+        }
 
         if shouldRefreshClaude {
             // The cadence anchor represents the start of an attempt, even if
@@ -571,6 +626,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         case (false, false):
             break
+        }
+        if shouldRefreshCapacityDockProviders {
+            // Generic adapters have their own attempt anchor. They must not be
+            // polled on every payload tick merely because Codex is disconnected
+            // or a Codex refresh failed.
+            lastCapacityDockProviderRefreshAt = now
+            await store.refreshSelectedCapacityDockProviders()
         }
         return true
     }
@@ -614,8 +676,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let task = codexQuotaRefreshTask {
             return await task.value
         }
-        let task = Task { [store] in
-            await store.refreshCodexReportingSuccess()
+        // Kimi Code, Gemini, Copilot, and Antigravity ride the same tick,
+        // each with its own cadence anchor: when Codex is not connected its
+        // refresh returns false
+        // immediately, so lastCodexRefreshAt never advances — anchoring them
+        // on it would poll the quota endpoints on every payload tick instead
+        // of the configured quota cadence. Anchor on attempt (not success)
+        // so a failing endpoint also respects the cadence.
+        let kimiDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastKimiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if kimiDue { lastKimiRefreshAt = Date() }
+        let geminiDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastGeminiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if geminiDue { lastGeminiRefreshAt = Date() }
+        let copilotDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastCopilotRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if copilotDue { lastCopilotRefreshAt = Date() }
+        let antigravityDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastAntigravityRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if antigravityDue { lastAntigravityRefreshAt = Date() }
+        let task = Task { [store, kimiDue, geminiDue, copilotDue, antigravityDue] in
+            async let codex = store.refreshCodexReportingSuccess()
+            if kimiDue {
+                _ = await store.refreshKimiReportingSuccess()
+            }
+            if geminiDue {
+                _ = await store.refreshGeminiReportingSuccess()
+            }
+            if copilotDue {
+                _ = await store.refreshCopilotReportingSuccess()
+            }
+            if antigravityDue {
+                _ = await store.refreshAntigravityReportingSuccess()
+            }
+            return await codex
         }
         codexQuotaRefreshTask = task
         let result = await task.value
@@ -629,15 +735,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let now = Date()
         let claudeElapsed = now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast)
         let codexElapsed = now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast)
+        let capacityDockElapsed = now.timeIntervalSince(lastCapacityDockProviderRefreshAt ?? .distantPast)
         let refreshClaude = claudeElapsed >= interactiveQuotaRefreshFloorSeconds
         let refreshCodex = codexElapsed >= interactiveQuotaRefreshFloorSeconds
-        guard refreshClaude || refreshCodex else { return }
+        let refreshCapacityDockProviders = capacityDockElapsed >= interactiveQuotaRefreshFloorSeconds
+        guard refreshClaude || refreshCodex || refreshCapacityDockProviders else { return }
 
         Task { [weak self] in
             guard let self else { return }
             _ = await self.refreshLiveQuotaProgressIfDue(
                 forceClaude: refreshClaude,
-                forceCodex: refreshCodex
+                forceCodex: refreshCodex,
+                forceCapacityDockProviders: refreshCapacityDockProviders
             )
         }
     }
@@ -826,13 +935,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Reset the cadence anchor so the next loop tick re-evaluates from "now"
     /// rather than measuring against a timestamp from the previous connection.
-    /// Triggered on disconnect of any provider — the cost of clearing both
-    /// anchors is one extra refresh tick on the unaffected provider, far less
+    /// Triggered on disconnect of any provider — the cost of clearing all
+    /// anchors is one extra refresh tick on the unaffected providers, far less
     /// disruptive than waiting a full cadence after a reconnect.
     @MainActor
     func resetSubscriptionCadenceAnchor() {
         lastSubscriptionRefreshAt = nil
         lastCodexRefreshAt = nil
+        lastKimiRefreshAt = nil
+        lastGeminiRefreshAt = nil
+        lastCopilotRefreshAt = nil
+        lastAntigravityRefreshAt = nil
+        lastCapacityDockProviderRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -849,6 +963,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             _ = self.store.payload
             _ = self.store.menubarPeriod
             _ = self.store.menubarPayload
+            // Combined-scope badge total: re-render the badge when the cross-device
+            // aggregate for the menubar period lands (or a peer goes reachable).
+            _ = self.store.menubarBadgeCombined
             // Track currency so the menubar title catches up immediately on
             // currency switch instead of waiting for the next 30s payload tick.
             _ = self.store.currency
@@ -861,23 +978,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // relying on payload/menubarPayload happening to touch the same cache.
             _ = self.store.isOverDailyBudget
             // Track the live-quota state too so the flame icon re-tints on
-            // every subscription / codex usage update, not just every 30s.
+            // every connected provider's usage update, not just every 30s.
             _ = self.store.subscription
             _ = self.store.subscriptionLoadState
             _ = self.store.codexUsage
             _ = self.store.codexLoadState
+            _ = self.store.kimiUsage
+            _ = self.store.kimiLoadState
+            _ = self.store.geminiUsage
+            _ = self.store.geminiLoadState
+            _ = self.store.copilotUsage
+            _ = self.store.copilotLoadState
+            _ = self.store.antigravityUsage
+            _ = self.store.antigravityLoadState
+            _ = self.store.capacityDockProviderSummaries
+            _ = self.store.capacityDockProviderErrors
+            _ = self.store.capacityDockProvidersLoading
+            _ = self.store.capacityDockProviderTransientFailures
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.pendingRefreshWork?.cancel()
                 let work = DispatchWorkItem { [weak self] in
                     self?.refreshStatusButton()
+                    self?.seedCapacityDockFromConnectedProviders()
+                    self?.capacityDockController?.refreshQuotaPresentation()
                     self?.observeStore()
                 }
                 self.pendingRefreshWork = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
             }
         }
+    }
+
+    /// Fresh-install default: mirror the connected subscriptions (capped) into
+    /// the dock until the user first edits the set. Cheap — reads cached quota
+    /// state — and no-ops once seeded or once the user takes over.
+    private func seedCapacityDockFromConnectedProviders() {
+        let connected = CapacityDockPreferences.supportedProviders
+            .filter { store.capacityDockProviderIsConnected($0) }
+        CapacityDockPreferences.autoSeedFromConnected(connected)
     }
 
     // MARK: - Status Item
@@ -887,17 +1027,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
-        guard let button = statusItem.button else { return }
+        let item = NSStatusBar.system.statusItem(withLength: statusItemWidth)
+        item.autosaveName = StatusItemPlacementPolicy.autosaveName
+        // `autosaveName` makes AppKit restore status-item state across launches.
+        // CodeBurn has no user-facing hide toggle, so explicitly restore the
+        // supported visible state in case Tahoe persisted a hidden/parked item.
+        item.isVisible = true
+        statusItem = item
+        guard let button = statusItem.button else {
+            startStatusItemPlacementRecovery()
+            return
+        }
 
-        // Set a simple SF Symbol image immediately to ensure the status item renders.
+        // Set the bundled flame image immediately to ensure the status item renders.
         // On macOS Tahoe, status items may fail to appear if only an attributed title
         // is set during initial setup.
-        let flameConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = true
-        button.image = flame
+        button.image = Self.menubarFlameImage(tint: nil)
         button.imagePosition = .imageLeading
 
         button.target = self
@@ -909,22 +1054,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         // macOS 27 no longer routes any right-mouse event to the status-item
-        // button's target/action. A global monitor still observes right-mouse-down;
+        // button's target/action. A global monitor still observes right-mouse-up;
         // we hit-test it against our own status-item window and present the menu
-        // ourselves. Harmless and stable on 15/26 too (the debounce in
-        // showContextMenu prevents a double-present if the legacy path also fires).
-        rightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.rightMouseDown]) { [weak self] _ in
+        // ourselves.
+        //
+        // Must be mouse-*up*, not mouse-down: presenting on down starts menu
+        // tracking while the button is still held, so the matching rightMouseUp
+        // is treated as an outside click and the menu flashes then dismisses.
+        // Presenting on up (after the click completes) keeps it open. Harmless
+        // on 15/26 too (the debounce in showContextMenu prevents a double-present
+        // if the legacy path also fires).
+        rightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: StatusItemContextMenuPolicy.presentEventMask) { [weak self] _ in
             guard let self,
                   let button = self.statusItem.button,
                   let window = button.window,
                   window.frame.contains(NSEvent.mouseLocation) else { return }
+            // Defer one turn so menu presentation is not nested inside the
+            // monitor callback. Safe on mouse-*up* (the click is already
+            // complete); on mouse-down a deferred present was killed by the
+            // matching up event and the menu only flashed.
             DispatchQueue.main.async { self.showContextMenu(from: button) }
         }
 
         // Defer the full attributed title setup to ensure initial render completes
         DispatchQueue.main.async { [weak self] in
             self?.refreshStatusButton()
+            self?.startStatusItemPlacementRecovery()
         }
+    }
+
+    /// Tahoe can park an accessory app's status item at the screen's top-right
+    /// corner when the auto-hidden menu bar is hidden during launch (#1148).
+    /// Wait for the user's pointer to reveal the bar, then perform up to three
+    /// supported visibility pulses. Never remove/recreate the item: repeated
+    /// creation churn is implicated in poisoning the bundle-id state this
+    /// recovery protects.
+    private func startStatusItemPlacementRecovery() {
+        stopStatusItemPlacementRecovery()
+
+        statusItemPlacementRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(120))
+            var recovery = StatusItemPlacementRecoveryCoordinator()
+
+            while !Task.isCancelled && clock.now < deadline {
+                let placement = self.statusItemPlacementState
+                let revealed = placement.screen.map { screen in
+                    StatusItemPlacementPolicy.isMenuBarRevealed(
+                        pointer: NSEvent.mouseLocation,
+                        screenFrame: screen.frame,
+                        screenVisibleFrame: screen.visibleFrame
+                    )
+                } ?? false
+                switch recovery.action(
+                    for: placement.geometry,
+                    isMenuBarRevealed: revealed,
+                    revealHasSettled: false
+                ) {
+                case .stopHealthy:
+                    return
+                case .poll, .waitForReveal:
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                case .stopExhausted:
+                    NSLog("CodeBurn: status item remains parked after bounded retries")
+                    return
+                case .settleBeforePulse:
+                    // Let the auto-hide animation finish before asking AppKit
+                    // to place the existing item again.
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard !Task.isCancelled else { return }
+                    let settledPlacement = self.statusItemPlacementState
+                    let settledReveal = settledPlacement.screen.map { screen in
+                        StatusItemPlacementPolicy.isMenuBarRevealed(
+                            pointer: NSEvent.mouseLocation,
+                            screenFrame: screen.frame,
+                            screenVisibleFrame: screen.visibleFrame
+                        )
+                    } ?? false
+                    switch recovery.action(
+                        for: settledPlacement.geometry,
+                        isMenuBarRevealed: settledReveal,
+                        revealHasSettled: true
+                    ) {
+                    case .stopHealthy:
+                        return
+                    case .poll, .waitForReveal, .settleBeforePulse:
+                        continue
+                    case .stopExhausted:
+                        NSLog("CodeBurn: status item remains parked after bounded retries")
+                        return
+                    case .pulse(let attempt):
+                        NSLog("CodeBurn: retrying parked status-item placement after menu bar reveal (\(attempt)/\(recovery.maximumPulseCount))")
+                        await StatusItemVisibilityPulse.run { self.statusItem.isVisible = $0 }
+                        guard !Task.isCancelled else { return }
+                        try? await Task.sleep(for: .milliseconds(250))
+                        continue
+                    }
+                case .pulse:
+                    // A pulse is only emitted after the settle phase above.
+                    assertionFailure("status item pulse emitted before reveal settled")
+                    return
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            switch self.statusItemPlacementState {
+            case .healthy:
+                return
+            case .unrealized:
+                NSLog("CodeBurn: status item did not realize before placement recovery timed out")
+            case .parked:
+                NSLog("CodeBurn: status item stayed parked without a menu-bar reveal")
+            }
+        }
+    }
+
+    private func stopStatusItemPlacementRecovery() {
+        statusItemPlacementRecoveryTask?.cancel()
+        statusItemPlacementRecoveryTask = nil
+    }
+
+    private enum StatusItemPlacementState {
+        case unrealized
+        case healthy
+        case parked(NSScreen)
+
+        var geometry: StatusItemPlacementRecoveryGeometry {
+            switch self {
+            case .unrealized: return .unrealized
+            case .healthy: return .healthy
+            case .parked: return .parked
+            }
+        }
+
+        var screen: NSScreen? {
+            if case .parked(let screen) = self { return screen }
+            return nil
+        }
+    }
+
+    private var statusItemPlacementState: StatusItemPlacementState {
+        guard let window = statusItem?.button?.window else { return .unrealized }
+        let frame = window.frame
+        guard !frame.isEmpty else { return .unrealized }
+        guard let screen = window.screen
+                ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) })
+                ?? NSScreen.main else { return .unrealized }
+        let parked = StatusItemPlacementPolicy.isParked(
+            itemFrame: frame,
+            screenFrame: screen.frame,
+            statusBarThickness: NSStatusBar.system.thickness
+        )
+        return parked ? .parked(screen) : .healthy
     }
 
     /// Composes the menubar title as a single attributed string with the flame as an inline
@@ -941,6 +1224,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// Loads the bundled binary-flame PNG (Resources/ProviderIcons/flame.png) at the
+    /// menubar text point size. With no tint it stays a template image so the system
+    /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
+    /// the budget/quota warning states.
+    private static func menubarFlameImage(tint: NSColor?) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+        guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
+            .withSymbolConfiguration(config) else { return nil }
+        guard let tint else {
+            symbol.isTemplate = true
+            return symbol
+        }
+        let recolored = NSImage(size: symbol.size, flipped: false) { rect in
+            symbol.draw(in: rect)
+            tint.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        recolored.isTemplate = false
+        return recolored
+    }
+
     private func refreshStatusButton() {
         guard let button = statusItem.button else { return }
         // Skip while the popover is anchored to this button. Rewriting the
@@ -955,8 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.image = nil
         button.imagePosition = .noImage
 
-        let font = NSFont.monospacedDigitSystemFont(ofSize: menubarTitleFontSize, weight: .medium)
-        let baseConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: menubarTitleFontSize, weight: .regular)
         // Tint the flame based on the worst-affected connected provider's quota.
         // Normal (<70%) keeps the template (auto white-on-dark / black-on-light);
         // warning/critical/danger override with a fixed palette color so the
@@ -966,15 +1270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if tint == nil, store.isOverDailyBudget {
             tint = NSColor.systemYellow
         }
-        let flameConfig: NSImage.SymbolConfiguration
-        if let tint {
-            flameConfig = baseConfig.applying(.init(paletteColors: [tint]))
-        } else {
-            flameConfig = baseConfig
-        }
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = (tint == nil)
+        let flame = Self.menubarFlameImage(tint: tint)
 
         let attachment = NSTextAttachment()
         attachment.image = flame
@@ -992,23 +1288,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         if store.displayMetric != .iconOnly {
             let suffix = menubarPeriod.menubarSuffix(compact: compact)
+            // Under combined scope the badge shows the cross-device aggregate, so
+            // it matches the popover hero instead of trailing it with the local
+            // figure. Falls back to local when no combined payload is available
+            // (local scope, cold cache, or an unreachable peer). Credits have no
+            // combined total, so that metric always reflects the local device.
+            let badgeCombined = store.menubarBadgeCombined
+            let cost: Double? = badgeCombined?.cost ?? menubarPayload?.current.cost
+            let outputTokens: Int? = badgeCombined?.outputTokens ?? menubarPayload?.current.outputTokens
+            let inputTokens: Int? = badgeCombined?.inputTokens ?? menubarPayload?.current.inputTokens
             let valueText: String
-            if store.displayMetric == .tokens, let p = menubarPayload?.current {
-                let out = formatTokensMenubar(Double(p.outputTokens))
-                let inp = formatTokensMenubar(Double(p.inputTokens))
-                valueText = compact ? "↑\(out)↓\(inp)\(suffix)" : " ↑\(out) ↓\(inp)\(suffix)"
-            } else if store.displayMetric == .totalTokens, let p = menubarPayload?.current {
-                let total = formatTokensMenubar(Double(p.inputTokens + p.outputTokens))
+            if store.displayMetric == .tokens, let out = outputTokens, let inp = inputTokens {
+                let outText = formatTokensMenubar(Double(out))
+                let inpText = formatTokensMenubar(Double(inp))
+                valueText = compact ? "↑\(outText)↓\(inpText)\(suffix)" : " ↑\(outText) ↓\(inpText)\(suffix)"
+            } else if store.displayMetric == .totalTokens, let out = outputTokens, let inp = inputTokens {
+                let total = formatTokensMenubar(Double(inp + out))
                 valueText = compact ? "\(total)\(suffix)" : " \(total)\(suffix)"
             } else if store.displayMetric == .credits, let p = menubarPayload?.current {
                 let credits = formatTokensMenubar((p.codexCredits ?? 0).rounded())
                 valueText = compact ? "\(credits)cr\(suffix)" : " \(credits) credits\(suffix)"
             } else {
                 let fallback = compact ? "$-" : "$—"
-                let formatted = menubarPayload?.current.cost
                 valueText = compact
-                    ? (formatted?.asCompactCurrencyWhole() ?? fallback) + suffix
-                    : " " + (formatted?.asCompactCurrency() ?? fallback) + suffix
+                    ? (cost?.asCompactCurrencyWhole() ?? fallback) + suffix
+                    : " " + (cost?.asCompactCurrency() ?? fallback) + suffix
             }
 
             var textAttrs: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: -1.0]
@@ -1016,10 +1320,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 textAttrs[.foregroundColor] = NSColor.secondaryLabelColor
             }
             composed.append(NSAttributedString(string: valueText, attributes: textAttrs))
+
+            // Combined scope, but a paired device didn't report this cycle: append
+            // a dimmed "reachable/total" so the reduced total reads as "peer
+            // unreachable" rather than a glitch (mirrors the popover's device list).
+            if let shortfall = store.menubarBadgeDeviceShortfall {
+                let marker = " · \(shortfall.reachable)/\(shortfall.total)"
+                let markerAttrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .baselineOffset: -1.0,
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+                composed.append(NSAttributedString(string: marker, attributes: markerAttrs))
+            }
         }
 
         button.attributedTitle = composed
-        button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
+        if let shortfall = store.menubarBadgeDeviceShortfall {
+            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel) · \(shortfall.reachable) of \(shortfall.total) devices reporting"
+        } else {
+            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
+        }
 
         persistBadgeStatusFile()
     }
@@ -1106,6 +1427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // closes. The popover's window takes keyboard focus on its own
             // via makeKeyAndOrderFront, which is enough for keystrokes to
             // reach the SwiftUI content.
+            store.menuPopoverVisible = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
                 // Pin the popover's window above the status-bar layer but tag
@@ -1126,9 +1448,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func showContextMenu(from button: NSStatusBarButton) {
         // Debounce: on macOS <= 26 both the legacy action path and the global
         // monitor can fire for a single right-click. Present at most once per click.
-        let now = Date()
-        guard now.timeIntervalSince(lastContextMenuPresentedAt) > 0.3 else { return }
-        lastContextMenuPresentedAt = now
+        // Policy lives in StatusItemContextMenuPolicy so the gate is unit-tested (#802).
+        guard StatusItemContextMenuPolicy.acceptPresent(
+            now: Date(),
+            lastPresentedAt: &lastContextMenuPresentedAt
+        ) else { return }
+
+        // Don't let an open popover steal the click / sit under the menu.
+        if popover?.isShown == true {
+            popover.performClose(nil)
+        }
 
         let menu = NSMenu()
 
@@ -1143,6 +1472,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settingsItem.target = self
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
         menu.addItem(settingsItem)
+
+        let dockSettingsItem = NSMenuItem(title: "Capacity Dock Settings…", action: #selector(openCapacityDockSettings), keyEquivalent: "")
+        dockSettingsItem.target = self
+        dockSettingsItem.image = NSImage(systemSymbolName: "rectangle.trailinghalf.inset.filled.arrow.trailing", accessibilityDescription: "Capacity Dock")
+        menu.addItem(dockSettingsItem)
 
         let refreshNow = NSMenuItem(title: "Refresh Now", action: #selector(refreshNowAction), keyEquivalent: "")
         refreshNow.target = self
@@ -1160,12 +1494,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
 
-        // Present directly. The previous `statusItem.menu = menu; button.performClick`
-        // trick relies on the click -> action path that macOS 27 changed; popUp is
-        // version-stable. Open a few px below the status item so the menu clears the
-        // menu bar: anchoring flush clips the top edge and makes macOS engage menu
-        // scrolling (a scroll chevron appears and the first row slides up on hover).
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 6), in: button)
+        // Present via the status item's own menu slot. AppKit positions and tracks
+        // that menu correctly under the status item (no scroll chevron / first-row
+        // jump). Manual NSMenu.popUp(at:in:) is what caused the jump: the menu was
+        // tracked against a point while the cursor still sat on the status item
+        // above it, so the first mouse move engaged scroll mode.
+        //
+        // #472 dropped this pattern because assigning `statusItem.menu` from the
+        // right-mouse *action* never ran on macOS 27 (right-clicks no longer reach
+        // the button action). We still open from our global rightMouseUp monitor
+        // (or the legacy action on ≤26); once we set `statusItem.menu` ourselves,
+        // performClick is just "open the attached menu" and works on 27 too.
+        //
+        // menuDidClose clears `statusItem.menu` so the next left-click hits our
+        // action (popover) instead of re-opening this menu.
+        menu.delegate = self
+        contextMenu = menu
+        statusItem.menu = menu
+        button.performClick(nil)
+    }
+
+    // MARK: - NSMenuDelegate
+
+    // AppKit invokes menu callbacks on the main thread. Clear the status-item
+    // menu slot so the next left-click hits our action (popover) again.
+    nonisolated func menuDidClose(_ menu: NSMenu) {
+        // Hop explicitly — don't assumeIsolated across the NSMenuDelegate boundary
+        // under Swift 6 strict concurrency (NSMenu isn't Sendable).
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Always clear: we only ever attach our own context menu to the item.
+            self.statusItem.menu = nil
+            self.contextMenu = nil
+        }
     }
 
     /// One-line "today" summary for the context menu's usage row.
@@ -1182,6 +1543,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         openSettings()
     }
 
+    @objc private func openCapacityDockSettings() {
+        // The Capacity Dock controls live in the General pane; jump straight there.
+        store.settingsTab = "general"
+        openSettings()
+    }
+
     @objc private func openSettings() {
         // Accessory-policy apps (no Dock icon, no main menu) don't get the
         // SwiftUI Settings scene wired into the responder chain reliably, so
@@ -1194,7 +1561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         let hosting = NSHostingController(
-            rootView: SettingsView().environment(store)
+            rootView: SettingsView().environment(store).environment(updateChecker)
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
@@ -1210,6 +1577,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settingsWindowController = controller
         NSApp.activate(ignoringOtherApps: true)
         controller.showWindow(nil)
+        // SwiftUI resizes the window past the initial contentRect after first
+        // layout, which drifts the earlier center(). Re-center once that settles.
+        DispatchQueue.main.async { [weak window] in window?.center() }
     }
 
     @objc private func refreshNowAction() {
@@ -1271,6 +1641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        store.menuPopoverVisible = false
         // Catch up on any menubar title updates that were skipped while the
         // popover was anchored.
         refreshStatusButton()

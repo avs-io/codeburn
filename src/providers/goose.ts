@@ -5,7 +5,7 @@ import { calculateCost, getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
 import type { ToolCall } from '../types.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 type SessionRow = {
   id: string
@@ -219,6 +219,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           deduplicationKey: dedupKey,
           userMessage,
           sessionId,
+          ...(session.working_dir
+            ? {
+                projectPath: session.working_dir,
+                workingDirectory: session.working_dir,
+              }
+            : {}),
         }
       } finally {
         db.close()
@@ -273,6 +279,10 @@ export function createGooseProvider(): Provider {
 
     toolDisplayName(rawTool: string): string {
       return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: getDbPath(), label: 'db' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

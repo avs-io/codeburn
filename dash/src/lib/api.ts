@@ -1,4 +1,4 @@
-export type Period = 'today' | 'week' | '30days' | 'month' | 'all'
+export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
 
 export type ModelDay = {
   name: string
@@ -56,6 +56,14 @@ export type Current = {
   skills: Array<{ name: string; turns: number; cost: number }>
   mcpServers: Array<{ name: string; calls: number }>
   modelEfficiency: Array<{ name: string; costPerEdit: number; oneShotRate: number }>
+  // Workflow-intelligence rollup for the period. Optional: an older peer's
+  // payload predates the block, and the Workflow panel hides when it is absent.
+  workflow?: { corrections: number; correctionRate: number | null; medianTimeToFirstEditMs: number | null }
+  // Files most reworked by edit-family calls (top 8), basenames only.
+  topReworkedFiles?: Array<{ path: string; sessions: number; edits: number }>
+  // Share (0-1) of cost-bearing calls that resolved a price. null when not
+  // computable; "unknown" must never render as 100% coverage.
+  pricingCoverage?: number | null
   localModelSavings: { totalUSD: number }
   retryTax: { totalUSD: number; retries: number }
   routingWaste: { totalSavingsUSD: number }
@@ -63,6 +71,10 @@ export type Current = {
 
 export type Payload = {
   generated: string
+  // Only a producer that its clients poll (the resident serve child) ever sends
+  // this, and only it may answer partially. `complete: false` means the totals
+  // cover the files indexed so far. Absence must be read as complete.
+  hydration?: { complete: boolean; indexedFiles: number; totalFiles: number }
   current: Current
   history: { daily: DailyEntry[]; timeline?: GranularHistory }
 }
@@ -117,6 +129,7 @@ function normalizePayload(p?: Payload): Payload | undefined {
   } : undefined
   return {
     generated: p.generated,
+    ...(p.hydration ? { hydration: p.hydration } : {}),
     current: {
       label: c.label ?? '',
       cost: c.cost ?? 0,
@@ -138,6 +151,19 @@ function normalizePayload(p?: Payload): Payload | undefined {
       skills: c.skills ?? [],
       mcpServers: c.mcpServers ?? [],
       modelEfficiency: c.modelEfficiency ?? [],
+      workflow: c.workflow
+        ? {
+            corrections: c.workflow.corrections ?? 0,
+            correctionRate: c.workflow.correctionRate ?? null,
+            medianTimeToFirstEditMs: c.workflow.medianTimeToFirstEditMs ?? null,
+          }
+        : undefined,
+      topReworkedFiles: (c.topReworkedFiles ?? []).map((f) => ({
+        path: f.path,
+        sessions: f.sessions ?? 0,
+        edits: f.edits ?? 0,
+      })),
+      pricingCoverage: c.pricingCoverage ?? null,
       localModelSavings: c.localModelSavings ?? { totalUSD: 0 },
       retryTax: c.retryTax ?? { totalUSD: 0, retries: 0 },
       routingWaste: c.routingWaste ?? { totalSavingsUSD: 0 },
@@ -171,12 +197,16 @@ export async function fetchDevices(period: Period, provider: string): Promise<{ 
   return { devices: (data.devices ?? []).map((d) => ({ ...d, payload: normalizePayload(d.payload) })) }
 }
 
+// Keys map 1:1 to the CLI's --period values (src/cli-date.ts). Period windows
+// are computed server-side by the CLI; the dashboard only forwards the key, so
+// these can never drift from the CLI's totals.
 export const PERIODS: Array<{ key: Period; label: string }> = [
   { key: 'today', label: 'Today' },
   { key: 'week', label: '7 days' },
   { key: '30days', label: '30 days' },
   { key: 'month', label: 'Month' },
-  { key: 'all', label: 'All' },
+  { key: 'all', label: '6 months' },
+  { key: 'lifetime', label: 'Lifetime' },
 ]
 
 export type DiscoveredDevice = {

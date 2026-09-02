@@ -17,14 +17,23 @@ let package = Package(
         .executableTarget(
             name: "CodeBurnMenubar",
             path: "Sources/CodeBurnMenubar",
+            resources: [
+                .process("Resources/ProviderIcons")
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency")
+            ],
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
             ]
         ),
         .testTarget(
             name: "CodeBurnMenubarTests",
             dependencies: ["CodeBurnMenubar"],
-            path: "Tests/CodeBurnMenubarTests"
+            path: "Tests/CodeBurnMenubarTests",
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
         )
     ]
 )

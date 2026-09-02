@@ -3,7 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+// These specs spawn the real CLI (tsx compile + full parse) per test, which
+// blows the 5s default under full parallel suite load while passing cleanly
+// in isolation — the exact flake class #948 documented and CI has hit
+// (cli-emitters timed out on a green PR). Same file-level remedy as
+// cli-status-menubar.test.ts: a 30s ceiling for spawn-heavy suites only.
+vi.setConfig({ testTimeout: 30_000 })
 
 function runCli(args: string[], home: string) {
   return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
@@ -230,6 +237,53 @@ describe('codeburn report --format json daily[] one-shot fields (issue #279)', (
 
       expect(result.status).toBe(1)
       expect(result.stderr).toContain('--day cannot be combined with --from or --to')
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('includes older sessions under --period lifetime but not under --period all', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-json-lifetime-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'app')
+      await mkdir(projectDir, { recursive: true })
+
+      await writeFile(
+        join(projectDir, 'history.jsonl'),
+        [
+          userLine('old', '2025-10-01T09:00:00Z'),
+          assistantEditLine('old', '2025-10-01T09:01:00Z', 'm-old'),
+          userLine('recent', '2026-06-01T09:00:00Z'),
+          assistantEditLine('recent', '2026-06-01T09:01:00Z', 'm-recent'),
+        ].join('\n'),
+      )
+
+      const allResult = runCli([
+        '--format', 'json',
+        '--period', 'all',
+        '--provider', 'claude',
+      ], home)
+      expect(allResult.status).toBe(0)
+      const allReport = JSON.parse(allResult.stdout) as {
+        daily: Array<{ date: string; calls: number }>
+        projects: Array<{ calls: number }>
+      }
+      expect(allReport.daily.map(d => d.date)).toEqual(['2026-06-01'])
+      expect(allReport.projects[0]?.calls).toBe(1)
+
+      const lifetimeResult = runCli([
+        '--format', 'json',
+        '--period', 'lifetime',
+        '--provider', 'claude',
+      ], home)
+      expect(lifetimeResult.status).toBe(0)
+      const lifetimeReport = JSON.parse(lifetimeResult.stdout) as {
+        daily: Array<{ date: string; calls: number }>
+        projects: Array<{ calls: number }>
+      }
+      expect(lifetimeReport.daily.map(d => d.date)).toEqual(['2025-10-01', '2026-06-01'])
+      expect(lifetimeReport.projects[0]?.calls).toBe(2)
     } finally {
       await rm(home, { recursive: true, force: true })
     }

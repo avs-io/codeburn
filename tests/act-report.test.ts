@@ -5,12 +5,18 @@ import { join } from 'node:path'
 
 import { journalPath } from '../src/act/journal.js'
 import {
+  autoRevertNoEffect,
   buildActReportJson,
   buildOptimizeAppliedHeader,
+  captureBaseline,
+  captureBaselinesForPlans,
   computeActReport,
   renderActReport,
 } from '../src/act/report.js'
+import { formatAppliedFix, REPORT_MIN_AGE_DAYS } from '../src/act/types.js'
 import type { ActionRecord } from '../src/act/types.js'
+import type { FindingPlan } from '../src/act/plans.js'
+import type { WasteFinding } from '../src/optimize.js'
 import type { ClassifiedTurn, ProjectSummary } from '../src/types.js'
 
 type Session = ProjectSummary['sessions'][number]
@@ -582,5 +588,474 @@ describe('json + render shape', () => {
     expect(out).toMatch(/40\.0K/)
     expect(out).toMatch(/measures only its own metric/)
     expect(out).toMatch(/scaled to the measured window/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// defer-* realized deltas (part 2 of #614)
+// ---------------------------------------------------------------------------
+
+function deferRecord(over: Partial<ActionRecord> = {}): ActionRecord {
+  const at = daysAgo(10)
+  return {
+    id: 'd1',
+    at,
+    kind: 'defer-enable',
+    findingId: 'mcp-deferral-off',
+    description: 'Remove the ENABLE_TOOL_SEARCH=false override from settings.json',
+    changes: [],
+    status: 'applied',
+    // 2 servers x 2000 tokens/session = 4000 prefix tokens/session.
+    baseline: { windowDays: 14, capturedAt: at, estimatedTokens: 40_000, sessions: 5, metrics: { everything: 2000, 'fs-tools': 2000 } },
+    ...over,
+  }
+}
+
+// NOTE: an mcpInventory on a post-apply session means the OPPOSITE for defer-*
+// vs mcp-remove. For mcp-remove it is "the server loaded again" (reverted);
+// for defer-* it is "deferral became active" (saved). Same fixture, inverse
+// meaning — exactly the design.
+const DEFERRED = { mcpInventory: ['mcp__everything__get-sum'] }
+
+describe('defer realized delta', () => {
+  it('measures savings across post-apply sessions where deferral became active', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), DEFERRED))]) })
+
+    const row = report.rows[0]!
+    expect(row.status).toBe('measured')
+    expect(row.realizedTokens).toBe(20_000) // 4000/session * 5 deferred sessions
+    expect(row.estimatedForWindow).toBe(20_000)
+    expect(report.totalRealizedTokens).toBe(20_000)
+  })
+
+  it('reports "not yet in effect" with zero savings when no post-apply session shows deferral', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    // sessions with MCP activity but NO inventory = deferral still off
+    const off = sessionsAt(4, daysAgo(5), { mcpBreakdown: { everything: { calls: 2, savingsUSD: 0, costUSD: 0 } } })
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(off)]) })
+
+    const row = report.rows[0]!
+    expect(row.status).toBe('pending')
+    expect(row.realizedTokens ?? 0).toBe(0)
+    expect(row.note).toMatch(/not yet in effect/)
+    expect(report.totalRealizedTokens).toBe(0)
+  })
+
+  it('counts only the sessions where deferral actually became active (partial)', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    const active = sessionsAt(3, daysAgo(5), DEFERRED)
+    const stillOff = sessionsAt(2, daysAgo(4))
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf([...active, ...stillOff])]) })
+
+    const row = report.rows[0]!
+    expect(row.status).toBe('measured')
+    expect(row.realizedTokens).toBe(12_000) // 4000 * 3 active (2 still-off excluded)
+    expect(row.estimatedForWindow).toBe(20_000) // 4000 * all 5 window sessions
+  })
+
+  it('is not measurable when no post-apply sessions exist yet', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf([])]) })
+    expect(report.rows[0]!.note).toMatch(/no sessions in the window yet/)
+  })
+
+  it('is not measurable with an empty baseline (zero prefix tokens)', async () => {
+    const rec = deferRecord({ baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 0, sessions: 5, metrics: { everything: 0 } } })
+    const actionsDir = await writeJournal([rec])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), DEFERRED))]) })
+    expect(report.rows[0]!.note).toMatch(/empty baseline/)
+  })
+
+  it('falls back to the no-baseline note for records applied before baselines existed', async () => {
+    const rec = deferRecord({ baseline: undefined })
+    const actionsDir = await writeJournal([rec])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), DEFERRED))]) })
+    expect(report.rows[0]!.note).toMatch(/no baseline captured at apply time/)
+  })
+
+  it('measures defer-alwaysload against its named servers', async () => {
+    const rec = deferRecord({
+      kind: 'defer-alwaysload',
+      findingId: 'mcp-alwaysload-hygiene',
+      description: 'Unpin an alwaysLoad MCP server',
+      baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 30_000, sessions: 6, metrics: { 'heavy-server': 5000 } },
+    })
+    const actionsDir = await writeJournal([rec])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(6, daysAgo(5), DEFERRED))]) })
+    const row = report.rows[0]!
+    expect(row.status).toBe('measured')
+    expect(row.realizedTokens).toBe(30_000) // 5000 * 6
+  })
+
+  it('measures defer-threshold like the other defer kinds', async () => {
+    const rec = deferRecord({ kind: 'defer-threshold', findingId: 'mcp-defer-threshold', description: 'Tighten the auto threshold' })
+    const actionsDir = await writeJournal([rec])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), DEFERRED))]) })
+    expect(report.rows[0]!.status).toBe('measured')
+    expect(report.rows[0]!.realizedTokens).toBe(20_000)
+  })
+
+  it('excludes servers an mcp-remove row already claims, so the two rows never double count', async () => {
+    const actionsDir = await writeJournal([
+      mcpRecord({ baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 10_000, sessions: 5, metrics: { everything: 2000 } } }),
+      deferRecord(),
+    ])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), { mcpInventory: ['mcp__fs-tools__ls'] }))]) })
+
+    const mcpRow = report.rows.find(r => r.kind === 'mcp-remove')!
+    const deferRow = report.rows.find(r => r.kind === 'defer-enable')!
+    expect(mcpRow.status).toBe('measured')
+    expect(mcpRow.realizedTokens).toBe(10_000) // 2000 x 5 saved sessions
+    expect(deferRow.status).toBe('measured')
+    expect(deferRow.realizedTokens).toBe(10_000) // 'fs-tools' only; 'everything' is claimed by the mcp row
+    expect(report.totalRealizedTokens).toBe(20_000) // disjoint sum; without dedup it would be 30_000
+  })
+
+  it('is not measurable when every deferred server is already claimed by an MCP row', async () => {
+    const actionsDir = await writeJournal([
+      mcpRecord({ baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 20_000, sessions: 5, metrics: { everything: 2000, 'fs-tools': 2000 } } }),
+      deferRecord(),
+    ])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5)))]) })
+
+    const deferRow = report.rows.find(r => r.kind === 'defer-enable')!
+    expect(deferRow.status).toBe('not-measurable')
+    expect(deferRow.realizedTokens ?? 0).toBe(0)
+    expect(deferRow.note).toMatch(/already measured by an MCP remove\/scope row/)
+  })
+
+  it('surfaces the pending status to --json consumers instead of asserting a revert', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    const off = sessionsAt(4, daysAgo(5), { mcpBreakdown: { everything: { calls: 2, savingsUSD: 0, costUSD: 0 } } })
+    const json = buildActReportJson(await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(off)]) })) as { actions: Array<{ status: string; realizedTokens: number | null; note: string }> }
+    expect(json.actions[0]!.status).toBe('pending')
+    expect(json.actions[0]!.realizedTokens).toBeNull()
+    expect(json.actions[0]!.note).toMatch(/not yet in effect/)
+  })
+})
+
+describe('defer baseline capture', () => {
+  const finding = (apply: WasteFinding['apply']): WasteFinding => ({
+    id: 'mcp-deferral-off',
+    title: 't', explanation: 'e', impact: 'medium', tokensSaved: 40_000,
+    fix: { type: 'command', label: 'l', text: 'x' },
+    apply,
+  })
+  const ctx = (projects: ProjectSummary[]) => ({ projects, coverage: [], windowDays: 14, now: NOW })
+
+  it('derives servers from observed MCP usage for defer-enable', () => {
+    const projects = [projectOf(sessionsAt(3, daysAgo(5), { mcpBreakdown: { everything: { calls: 2, savingsUSD: 0, costUSD: 0 }, 'fs-tools': { calls: 1, savingsUSD: 0, costUSD: 0 } } }))]
+    const b = captureBaseline(finding({ kind: 'defer-enable', cause: 'env-false', settingPath: '/x', settingScope: 'project settings', value: 'false' }), 'defer-enable', ctx(projects))
+    expect(b).toBeDefined()
+    // no coverage -> 5 tools x 400 fallback per server
+    expect(b!.metrics.everything).toBe(2000)
+    expect(b!.metrics['fs-tools']).toBe(2000)
+  })
+
+  it('uses the named servers for defer-alwaysload', () => {
+    const projects = [projectOf(sessionsAt(2, daysAgo(5)))]
+    const b = captureBaseline(finding({ kind: 'defer-alwaysload', servers: [{ server: 'pinned', paths: ['/a/.mcp.json'] }] }), 'defer-alwaysload', ctx(projects))
+    expect(b).toBeDefined()
+    expect(Object.keys(b!.metrics)).toEqual(['pinned'])
+  })
+
+  it('returns undefined when there is no observed MCP surface to defer', () => {
+    const projects = [projectOf(sessionsAt(3, daysAgo(5)))] // no mcpBreakdown, no inventory
+    const b = captureBaseline(finding({ kind: 'defer-enable', cause: 'env-false', settingPath: '/x', settingScope: 'project settings', value: 'false' }), 'defer-enable', ctx(projects))
+    expect(b).toBeUndefined()
+  })
+})
+
+describe('partial-action baseline capture', () => {
+  it('persists the savings attributable to the local mutation, not the full mixed finding', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 40_000,
+      applyTokensSaved: 20_000,
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: Array.from({ length: 20 }, (_, i) => `mcp__filesystem__t${i}`),
+    })
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessions)],
+      coverage: [{
+        server: 'filesystem',
+        toolsAvailable: 20,
+        toolsInvoked: 3,
+        unusedTools: Array.from({ length: 17 }, (_, i) => `mcp__filesystem__unused${i}`),
+        invocations: 0,
+        loadedSessions: 2,
+        coverageRatio: 3 / 20,
+      }],
+      windowDays: 14,
+      now: NOW,
+    })
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 20_000,
+      sessions: 2,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(finding.tokensSaved).toBe(40_000)
+  })
+
+  it('prices and measures only servers owned by the concrete mutation plan', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 30_000,
+      applyTokensSaved: 30_000,
+      applyTokensSavedByServer: { filesystem: 10_000, managed: 20_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: [
+        ...Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        ...Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+      ],
+    })
+    const coverage = [
+      {
+        server: 'filesystem', toolsAvailable: 20, toolsInvoked: 3,
+        unusedTools: Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        invocations: 3, loadedSessions: 2, coverageRatio: 3 / 20,
+      },
+      {
+        server: 'managed', toolsAvailable: 20, toolsInvoked: 8,
+        unusedTools: Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+        invocations: 8, loadedSessions: 2, coverageRatio: 8 / 20,
+      },
+    ]
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessions)], coverage, windowDays: 14, now: NOW,
+    }, ['filesystem'])
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      sessions: 2,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(baseline!.metrics).not.toHaveProperty('managed')
+  })
+
+  it('does not invent a low-coverage schema baseline when coverage is unavailable', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '1 MCP server with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 10_000,
+      applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessionsAt(2, daysAgo(1)))],
+      coverage: [],
+      windowDays: 14,
+      now: NOW,
+    }, ['filesystem'])
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      metrics: { filesystem: 0 },
+    })
+  })
+
+  it('stamps a narrowed plan with only its concrete server baseline', async () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage', title: '2 MCP servers', explanation: '', impact: 'medium',
+      tokensSaved: 30_000, applyTokensSaved: 30_000,
+      applyTokensSavedByServer: { filesystem: 10_000, managed: 20_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+    const plan: FindingPlan = {
+      finding,
+      notes: [],
+      plan: {
+        kind: 'mcp-remove', description: 'Remove filesystem', changes: [],
+        affectedMcpServers: ['filesystem'],
+      },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: [
+        ...Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        ...Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+      ],
+    })
+
+    await captureBaselinesForPlans([plan], {
+      now: NOW,
+      loadProjects: async () => [projectOf(sessions)],
+    })
+
+    expect(plan.plan?.baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(plan.plan?.baseline?.metrics).not.toHaveProperty('managed')
+  })
+
+  it('does not stamp a numeric baseline onto an uncertain partial mutation', async () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage', title: '1 MCP server', explanation: '', impact: 'medium',
+      tokensSaved: 10_000, applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const plan: FindingPlan = {
+      finding,
+      notes: ['could not parse .mcp.json'],
+      plan: {
+        kind: 'mcp-remove', description: 'Remove filesystem', changes: [],
+        affectedMcpServers: ['filesystem'], mcpSavingsUncertain: true,
+      },
+    }
+
+    await captureBaselinesForPlans([plan], {
+      now: NOW,
+      loadProjects: async () => [projectOf(sessionsAt(2, daysAgo(1)))],
+    })
+
+    expect(plan.plan?.baseline).toBeUndefined()
+  })
+})
+
+describe('applied-fix verdicts', () => {
+  const fixOf = async (records: ActionRecord[], projects: ProjectSummary[]) => {
+    const actionsDir = await writeJournal(records)
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load(projects) })
+    return { report, fixes: report.appliedFixes, actionsDir }
+  }
+
+  it('calls a fix that realized its whole window estimate "worked"', async () => {
+    const { fixes } = await fixOf([mcpRecord()], [projectOf(sessionsAt(20, daysAgo(5)))])
+    expect(fixes).toHaveLength(1)
+    expect(fixes[0]!.verdict).toBe('worked')
+    expect(fixes[0]!.estimatedTokens).toBe(40_000)
+    expect(fixes[0]!.realizedTokens).toBe(40_000)
+    expect(fixes[0]!.undoCommand).toBe('codeburn act undo a1')
+  })
+
+  it('holds the worked/partial boundary at the 70% ratio', async () => {
+    const rec = mcpRecord({ kind: 'mcp-project-scope' })
+    // 14 of 20 sessions saved = exactly 70% of the window estimate.
+    const at70 = await fixOf(
+      [rec],
+      [projectOf([...sessionsAt(14, daysAgo(5)), ...sessionsAt(6, daysAgo(4), { mcpInventory: ['mcp__brave-search__search'] })])],
+    )
+    expect(at70.fixes[0]!.verdict).toBe('worked')
+
+    const below = await fixOf(
+      [rec],
+      [projectOf([...sessionsAt(13, daysAgo(5)), ...sessionsAt(7, daysAgo(4), { mcpInventory: ['mcp__brave-search__search'] })])],
+    )
+    expect(below.fixes[0]!.verdict).toBe('partial')
+    expect(formatAppliedFix(below.fixes[0]!)).toContain('-35% vs estimate')
+  })
+
+  it('calls a fix that realized nothing "no-effect" and offers the undo', async () => {
+    const rec = mcpRecord({ kind: 'mcp-project-scope' })
+    const stillLoading = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const { fixes } = await fixOf([rec], [projectOf(stillLoading)])
+    expect(fixes[0]!.verdict).toBe('no-effect')
+    expect(fixes[0]!.realizedTokens).toBe(0)
+    expect(formatAppliedFix(fixes[0]!)).toContain('did not help. Revert: codeburn act undo a1')
+  })
+
+  it('treats an estimate of zero as worked only when something was realized', async () => {
+    const zeroEstimate = { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 0, sessions: 0, metrics: {} }
+    const { fixes } = await fixOf(
+      [mcpRecord({ baseline: { ...zeroEstimate, metrics: { 'brave-search': 2000 } } })],
+      [projectOf(sessionsAt(20, daysAgo(5)))],
+    )
+    expect(fixes[0]!.estimatedTokens).toBe(40_000)
+    expect(fixes[0]!.verdict).toBe('worked')
+  })
+
+  it('leaves entries younger than the measurement window pending', async () => {
+    const { fixes } = await fixOf([mcpRecord({ at: daysAgo(1) })], [projectOf(sessionsAt(20, daysAgo(1)))])
+    expect(fixes[0]!.verdict).toBe('pending')
+    expect(formatAppliedFix(fixes[0]!)).toBe(`unused-mcp (1d ago): measuring, check back after ${REPORT_MIN_AGE_DAYS} days`)
+  })
+
+  it('keeps a user-reverted entry out of the verdicts and carries its note', async () => {
+    const back = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const { fixes } = await fixOf([mcpRecord()], [projectOf(back)])
+    expect(fixes[0]!.verdict).toBe('pending')
+    expect(fixes[0]!.note).toMatch(/reverted by user/)
+  })
+
+  it('drops undone journal entries entirely', async () => {
+    const rec = mcpRecord()
+    const { fixes } = await fixOf(
+      [rec, { ...rec, status: 'undone', undoneAt: daysAgo(2) }],
+      [projectOf(sessionsAt(20, daysAgo(5)))],
+    )
+    expect(fixes).toHaveLength(0)
+  })
+
+  it('never judges a correlation-only kind, so --auto-revert can never touch it', async () => {
+    const { fixes } = await fixOf([modelDefaultRecord()], [modelProject('app', '/tmp/app', 'candidate-model', 20, 19)])
+    expect(fixes[0]!.verdict).toBe('pending')
+  })
+})
+
+describe('autoRevertNoEffect', () => {
+  const noEffect = (over: Partial<ActionRecord> = {}) => ({
+    ...mcpRecord({ kind: 'mcp-project-scope', ...over }),
+  })
+
+  it('undoes the no-effect entries and leaves the rest alone', async () => {
+    const worked = noEffect({ id: 'keep1', findingId: 'kept' })
+    const actionsDir = await writeJournal([noEffect(), worked])
+    const stillLoading = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(stillLoading)]) })
+    // Both are no-effect here; pin that only the ones we hand over get undone.
+    const target = report.appliedFixes.filter(f => f.id === 'a1')
+    const { lines, revertedIds } = await autoRevertNoEffect(target, { actionsDir })
+
+    expect([...revertedIds]).toEqual(['a1'])
+    expect(lines).toEqual(['Reverted a1: Remove an MCP server from config'])
+    const after = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(stillLoading)]) })
+    expect(after.appliedFixes.map(f => f.id)).toEqual(['keep1'])
+  })
+
+  it('never auto-reverts a CLAUDE.md rule, it prints the undo command instead', async () => {
+    const rec = mcpRecord({
+      id: 'cm1',
+      kind: 'claude-md-rule',
+      findingId: 'read-edit-ratio',
+      baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 10_000, sessions: 20, metrics: { reads: 10, edits: 10 } },
+    })
+    const actionsDir = await writeJournal([rec])
+    const sessions = sessionsAt(20, daysAgo(5), { toolBreakdown: { Edit: { calls: 10, tokens: 0 }, Read: { calls: 10, tokens: 0 } } as never })
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessions)]) })
+
+    expect(report.appliedFixes[0]!.verdict).toBe('no-effect')
+    const { lines, revertedIds } = await autoRevertNoEffect(report.appliedFixes, { actionsDir })
+    expect(revertedIds.size).toBe(0)
+    expect(lines).toEqual(['Not auto-reverted: read-edit-ratio edits a CLAUDE.md. Revert: codeburn act undo cm1'])
+  })
+
+  it('ignores partial and pending entries', async () => {
+    const actionsDir = await writeJournal([mcpRecord({ at: daysAgo(1) })])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(20, daysAgo(1)))]) })
+    const { lines, revertedIds } = await autoRevertNoEffect(report.appliedFixes, { actionsDir })
+    expect(lines).toEqual([])
+    expect(revertedIds.size).toBe(0)
   })
 })

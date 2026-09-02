@@ -10,17 +10,21 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { StaleBanner } from '../components/StaleBanner'
 import { motionEnabled, useBarGrowIn } from '../lib/motion'
 import { type Polled, usePolled } from '../hooks/usePolled'
-import { formatCompact, formatUsd } from '../lib/format'
+import { formatCompact, formatUsd, formatUsdWithCurrency } from '../lib/format'
 import { codeburn } from '../lib/ipc'
-import { contiguousDailyWindow, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
+import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type {
   ActReportJson,
+  CombinedUsage,
   DailyHistoryEntry,
   DateRange,
   MenubarPayload,
   Period,
+  Scope,
   YieldJsonReport,
 } from '../lib/types'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 
 export { localDateKey } from '../lib/period'
 
@@ -124,6 +128,88 @@ function CostPerOutcome({ outcome }: { outcome: Polled<YieldJsonReport> }) {
       <div className="ov-panel-body">
         {body}
         <p className="ov-widget-caption">Git-correlated. Reverted/abandoned = spend that didn't ship.</p>
+      </div>
+    </div>
+  )
+}
+
+// Coaching-note thresholds, mirrored from the CLI so the card and the CLI never
+// disagree (src/workflow-insights.ts buildCoachingNotes).
+const WORKFLOW_CORRECTION_RATE = 0.15
+const WORKFLOW_CORRECTION_COUNT = 3
+const WORKFLOW_CHURN_SESSIONS = 3
+const WORKFLOW_TTFE_SLOW_MS = 5 * 60 * 1000
+
+/** Median time to first edit: `<60s → Ns`, else `Nm` (src/workflow-insights.ts formatDurationShort). */
+function formatWorkflowDuration(ms: number): string {
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`
+  return `${Math.round(ms / 1000)}s`
+}
+
+type WorkflowRollup = NonNullable<MenubarPayload['current']['workflow']>
+type ReworkedFile = { path: string; sessions: number; edits: number }
+
+/**
+ * One coaching line derived with the CLI's thresholds and dry copy voice
+ * (src/workflow-insights.ts buildCoachingNotes): corrections, then file churn,
+ * then time-to-first-edit; the first that fires. Null when none clears its bar.
+ */
+function workflowCoachingNote(workflow: WorkflowRollup, topReworked?: ReworkedFile): string | null {
+  const { correctionRate, corrections, medianTimeToFirstEditMs } = workflow
+  if (correctionRate !== null && correctionRate >= WORKFLOW_CORRECTION_RATE && corrections >= WORKFLOW_CORRECTION_COUNT) {
+    return `You corrected the assistant on ${Math.round(correctionRate * 100)}% of prompts (${corrections} times). State the requirements in the first message to cut the back and forth.`
+  }
+  if (topReworked && topReworked.sessions >= WORKFLOW_CHURN_SESSIONS) {
+    return `${topReworked.path} was reworked across ${topReworked.sessions} sessions (${topReworked.edits} edits). A focused pass on it may cost less than the repeated churn.`
+  }
+  if (medianTimeToFirstEditMs !== null && medianTimeToFirstEditMs >= WORKFLOW_TTFE_SLOW_MS) {
+    return `Median time to first edit is ${formatWorkflowDuration(medianTimeToFirstEditMs)}. Point the assistant at the target file to cut the exploration before it starts editing.`
+  }
+  return null
+}
+
+function WorkflowCard({ current }: { current: MenubarPayload['current'] }) {
+  const workflow = current.workflow
+  const topReworked = current.topReworkedFiles?.[0]
+  // Hide when there is no real signal: never show a card of zeros.
+  const hasSignal = !!workflow && (
+    workflow.correctionRate !== null ||
+    workflow.medianTimeToFirstEditMs !== null ||
+    workflow.corrections > 0 ||
+    !!topReworked
+  )
+  if (!workflow || !hasSignal) return null
+
+  const coverage = current.pricingCoverage
+  const showCoverage = typeof coverage === 'number' && coverage < 1
+  const note = workflowCoachingNote(workflow, topReworked)
+  const { correctionRate, corrections, medianTimeToFirstEditMs } = workflow
+
+  return (
+    <div className="ov-card ov-panel ov-workflow-widget">
+      <div className="ov-panel-head">
+        <h3>Workflow</h3>
+        {showCoverage && <span className="ov-priced-chip">{Math.min(99, Math.round(coverage * 100))}% priced</span>}
+      </div>
+      <div className="ov-panel-body">
+        <div className="ov-outcome-metrics">
+          <div>
+            <span>Correction rate</span>
+            <strong>{correctionRate === null ? '—' : `${Math.round(correctionRate * 100)}%`}</strong>
+            {correctionRate !== null && <span>{corrections} {corrections === 1 ? 'correction' : 'corrections'}</span>}
+          </div>
+          <div>
+            <span>Time to first edit</span>
+            <strong>{medianTimeToFirstEditMs === null ? '—' : formatWorkflowDuration(medianTimeToFirstEditMs)}</strong>
+            <span>median</span>
+          </div>
+        </div>
+        {topReworked && (
+          <div className="ov-workflow-rework">
+            Top rework: <strong>{topReworked.path}</strong> · {topReworked.sessions} {topReworked.sessions === 1 ? 'session' : 'sessions'} · {topReworked.edits} {topReworked.edits === 1 ? 'edit' : 'edits'}
+          </div>
+        )}
+        <p className="ov-widget-caption">{note ?? 'Corrections, first-edit latency, and file churn across your sessions.'}</p>
       </div>
     </div>
   )
@@ -343,7 +429,7 @@ function streakDays(daily: DailyHistoryEntry[], now: Date): number {
  * changes (a user action), but never on the 30s poll: a value that arrives
  * under the same `animateKey` snaps in place instead of re-animating.
  */
-function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
+function CountUp({ value, animateKey, animate = true }: { value: number; animateKey: string; animate?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const keyRef = useRef<string | null>(null)
 
@@ -352,7 +438,7 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
     if (!element) return
     const keyChanged = keyRef.current !== animateKey
     keyRef.current = animateKey
-    if (!keyChanged || !motionEnabled()) {
+    if (!animate || !keyChanged || !motionEnabled()) {
       element.textContent = formatUsd(value)
       return
     }
@@ -364,9 +450,9 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
       onUpdate: () => { element.textContent = formatUsd(counter.n) },
     })
     return () => { tween.kill() }
-  }, [value, animateKey])
+  }, [value, animateKey, animate])
 
-  return <div ref={ref} className="ov-hero-num" data-countup={value}>{formatUsd(value)}</div>
+  return <div ref={ref} className="ov-hero-num" data-countup={value} data-countup-animation={animate ? 'enabled' : 'suppressed'}>{formatUsd(value)}</div>
 }
 
 function formatShortDay(date: string): string {
@@ -443,13 +529,19 @@ function ModelsTable({ models }: { models: AggregatedModel[] }) {
   )
 }
 
-function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; animateKey?: string }) {
+function DailyChart({ daily, dataStart = null, animateKey = '' }: { daily: DailyHistoryEntry[]; dataStart?: string | null; animateKey?: string }) {
+  const isNoData = (day: DailyHistoryEntry) => dataStart !== null && day.date < dataStart
   const max = Math.max(...daily.map(day => day.cost), 0)
   const peakIndex = daily.reduce((peak, day, index) => day.cost > (daily[peak]?.cost ?? -1) ? index : peak, 0)
   const peak = daily[peakIndex]
   const yesterday = daily.at(-2)
   const average = mean(daily.map(day => day.cost))
-  const ticks = daily.filter((_, index) => index % 7 === 0)
+  // Weekly labels work for 30 days, but become unreadable at 6M/Life (26-53
+  // labels). Long ranges use five even intervals plus the newest day.
+  const tickStride = daily.length <= 45 ? 7 : Math.ceil((daily.length - 1) / 5)
+  const tickIndexes = daily.map((_, index) => index).filter(index => index % tickStride === 0)
+  if (daily.length > 45 && tickIndexes.at(-1) !== daily.length - 1) tickIndexes.push(daily.length - 1)
+  const ticks = tickIndexes.map(index => daily[index])
   const [tip, setTip] = useState<{ day: DailyHistoryEntry; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -477,22 +569,26 @@ function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; an
   return (
     <>
       <div className="chart" ref={chartRef}>
-        {daily.map((day, index) => (
-          <button
-            type="button"
-            aria-label={`${day.date}: ${formatUsd(day.cost)}`}
-            className={`col${index === peakIndex ? ' hi' : ''}`}
-            key={day.date}
-            style={{ height: `${max > 0 ? Math.max(2, day.cost / max * 100) : 2}%` }}
-            data-date={day.date}
-            data-cost={day.cost}
-            data-calls={day.calls}
-            data-led={day.topModels[0]?.name ?? ''}
-            onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
-            onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
-            onMouseLeave={() => setTip(null)}
-          />
-        ))}
+        {daily.map((day, index) => {
+          const noData = isNoData(day)
+          return (
+            <button
+              type="button"
+              aria-label={`${day.date}: ${noData ? 'no data recorded' : formatUsd(day.cost)}`}
+              className={`col${index === peakIndex && !noData ? ' hi' : ''}${noData ? ' nodata' : ''}`}
+              key={day.date}
+              style={{ height: `${max > 0 ? Math.max(2, day.cost / max * 100) : 2}%` }}
+              data-date={day.date}
+              data-cost={day.cost}
+              data-calls={day.calls}
+              data-led={day.topModels[0]?.name ?? ''}
+              data-nodata={noData ? 'true' : 'false'}
+              onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
+              onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
+              onMouseLeave={() => setTip(null)}
+            />
+          )
+        })}
       </div>
       <div className="ov-xax">
         {ticks.map(day => {
@@ -513,8 +609,14 @@ function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; an
           role="tooltip"
         >
           <div className="chart-tip-d">{formatChartDate(tip.day.date)}</div>
-          <div className="chart-tip-v">{formatUsd(tip.day.cost)}</div>
-          <div className="chart-tip-s">{tip.day.calls} calls · {tip.day.topModels[0]?.name ?? 'No model'} led</div>
+          {isNoData(tip.day) ? (
+            <div className="chart-tip-s">No data recorded</div>
+          ) : (
+            <>
+              <div className="chart-tip-v">{formatUsd(tip.day.cost)}</div>
+              <div className="chart-tip-s">{tip.day.calls} calls · {tip.day.topModels[0]?.name ?? 'No model'} led</div>
+            </>
+          )}
         </div>,
         document.body,
       )}
@@ -557,6 +659,23 @@ export function Overview({ period, provider }: { period: Period; provider: strin
   return <OverviewContent period={period} provider={provider} overview={overview} />
 }
 
+/** Combined-scope hero footer: a per-device cost breakdown plus a reachable/
+ *  total device count, mirroring the menubar's combined view. An unreachable
+ *  device (powered off, off-network) shows its error in place of a cost. */
+function CombinedDevices({ usage }: { usage: CombinedUsage }) {
+  return (
+    <div className="ov-combined-devices">
+      <div className="ov-combined-head">{usage.combined.reachableCount} of {usage.combined.deviceCount} devices</div>
+      {usage.perDevice.map(device => (
+        <div className={device.error ? 'ov-combined-row err' : 'ov-combined-row'} key={device.id}>
+          <span className="ov-combined-name">{device.local ? `${device.name} · this device` : device.name}</span>
+          <span className="ov-combined-val">{device.error ?? formatUsd(device.cost)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function OverviewContent({
   period,
   provider = 'all',
@@ -564,6 +683,8 @@ export function OverviewContent({
   overview,
   onNavigate,
   ready = true,
+  scope = 'local',
+  headlineSnapshot = null,
 }: {
   period: Period
   provider?: string
@@ -571,23 +692,81 @@ export function OverviewContent({
   overview: Polled<MenubarPayload>
   onNavigate?: (section: 'optimize' | 'sessions') => void
   ready?: boolean
+  scope?: Scope
+  headlineSnapshot?: OverviewHeadlineSnapshot | null
 }) {
+  const { data, error } = overview
+  const heroSelectionKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}|${scope}`
+  // Suppress only the single persisted-headline -> live-data handoff. A stored
+  // headline remains available after that handoff, so testing the snapshot prop
+  // directly would disable every later user-triggered period/provider animation.
+  const pendingSnapshotHandoffRef = useRef<string | null>(null)
+  const suppressHeroReplay = pendingSnapshotHandoffRef.current === heroSelectionKey
+  useLayoutEffect(() => {
+    if (!data && headlineSnapshot) {
+      pendingSnapshotHandoffRef.current = heroSelectionKey
+    } else if (data && pendingSnapshotHandoffRef.current === heroSelectionKey) {
+      pendingSnapshotHandoffRef.current = null
+    }
+  }, [data, headlineSnapshot, heroSelectionKey])
   // Gate secondary spawns on the app-level readiness (first overview resolved),
   // so the cold hydration runs once (via overview) rather than 3 parses at once
   // on boot. Defaults true so standalone renders/tests poll normally.
-  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: ready, memoKey: 'overview-act' })
-  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: ready, memoKey: `overview-yield|${period}|${provider}` })
-  const { data, error } = overview
+  // A bounded Overview timeout is not permission to fan out more expensive
+  // analysis. On a real heavy corpus the timeout released act/yield, and a user
+  // Refresh then ran another status parse beside yield. Latch that timeout until
+  // real Overview data arrives: refresh() clears the current error while its new
+  // request is pending, which must not accidentally re-open the secondary gate.
+  const [timeoutBlocked, setTimeoutBlocked] = useState(false)
+  useEffect(() => {
+    if (overview.error?.kind === 'timeout') setTimeoutBlocked(true)
+    else if (overview.data != null) setTimeoutBlocked(false)
+  }, [overview.data, overview.error?.kind])
+  const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
+  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
+  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: reportMemoKey('yield', period, provider) })
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
   if (!data) {
     if (error) return <CliErrorPanel error={error} subject="your usage" />
+    if (headlineSnapshot) {
+      const generated = new Date(headlineSnapshot.generated)
+      const captured = Number.isNaN(generated.getTime()) ? new Date(headlineSnapshot.capturedAt) : generated
+      const capturedLabel = Number.isNaN(captured.getTime())
+        ? 'earlier'
+        : localDateKey(captured) === localDateKey(new Date())
+          ? `at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+          : `${captured.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      const headlineCost = headlineSnapshot.currency
+        ? formatUsdWithCurrency(headlineSnapshot.cost, headlineSnapshot.currency)
+        : formatUsd(headlineSnapshot.cost)
+      return (
+        <div className="ov-dashboard" aria-label="Cached usage summary">
+          <div className="ov-card ov-hero-split snapshot-hero">
+            <div className="ov-hero-main">
+              <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact {capturedLabel}</span></div>
+              <div className="ov-hero-num" data-countup={headlineSnapshot.cost}>{headlineCost}</div>
+              <div className="ov-hero-sub">{headlineSnapshot.calls.toLocaleString('en-US')} calls · sessions updating</div>
+              <p className="ov-widget-caption">Current totals, charts, sessions, and efficiency are refreshing in the background.</p>
+            </div>
+          </div>
+          <SectionSkeleton label="Updating detailed drill-downs…" rows={3} chart />
+        </div>
+      )
+    }
     return <SectionSkeleton label="Scanning sessions…" rows={3} chart />
   }
 
   const now = new Date()
   const rangeActive = !!range
-  const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`
+  // Combined scope shows the paired-device aggregate in the hero KPIs, mirroring
+  // the menubar. Only the hero totals are aggregated; the detailed panels below
+  // (daily chart, models) stay local — the combined payload carries totals only.
+  const combined = scope === 'combined' ? data.combined : undefined
+  const heroCost = combined ? combined.combined.cost : data.current.cost
+  const heroCalls = combined ? combined.combined.calls : data.current.calls
+  const heroSessions = combined ? combined.combined.sessions : data.current.sessions
+  const animateKey = heroSelectionKey
   const stats = deriveStats(data, now)
   const periodDaily = sliceDailyToPeriod(data.history.daily, period, now)
   // Daily chart: contiguous zero-filled calendar window. A custom range spans
@@ -622,15 +801,24 @@ export function OverviewContent({
       {error && <StaleBanner error={error} />}
       <div className="ov-card ov-hero-split" aria-label="Key performance indicators">
         <div className="ov-hero-main">
-          <div className="ov-hero-top"><span className="ov-label">{data.current.label}</span><span className="ov-streak"><b>{streakDays(data.history.daily, now)}</b>-day streak</span></div>
-          <CountUp value={data.current.cost} animateKey={animateKey} />
-          <div className="ov-hero-sub">{data.current.calls.toLocaleString('en-US')} calls · {data.current.sessions.toLocaleString('en-US')} sessions</div>
-          {saved > 0 && (
-            <div className="ov-saved-line"><span>Saved by applied fixes</span><strong>{formatUsd(saved)}</strong><small>across {applied} {applied === 1 ? 'fix' : 'fixes'}</small></div>
-          )}
-          {localSaved > 0 && (
-            <div className="ov-saved-line"><span>Saved via local models</span><strong>{formatUsd(localSaved)}</strong><small>local-model routing</small></div>
-          )}
+          <div className="ov-hero-top"><span className="ov-label">{combined ? `Combined · ${data.current.label}` : data.current.label}</span><span className="ov-streak"><b>{streakDays(data.history.daily, now)}</b>-day streak</span></div>
+          {/* A returning launch already showed a truthful persisted headline.
+              Replaying the live hero from $0 on handoff makes that exact value
+              appear to collapse and recover; snap to the revalidated total. */}
+          <CountUp value={heroCost} animateKey={animateKey} animate={!suppressHeroReplay} />
+          <div className="ov-hero-sub">{heroCalls.toLocaleString('en-US')} calls · {heroSessions.toLocaleString('en-US')} sessions</div>
+          {combined
+            ? <CombinedDevices usage={combined} />
+            : (
+              <>
+                {saved > 0 && (
+                  <div className="ov-saved-line"><span>Saved by applied fixes</span><strong>{formatUsd(saved)}</strong><small>across {applied} {applied === 1 ? 'fix' : 'fixes'}</small></div>
+                )}
+                {localSaved > 0 && (
+                  <div className="ov-saved-line"><span>Saved via local models</span><strong>{formatUsd(localSaved)}</strong><small>local-model routing</small></div>
+                )}
+              </>
+            )}
         </div>
         <ActivityHeatmap daily={data.history.daily} bare />
         <EfficiencyScorecard current={data.current} bare />
@@ -645,8 +833,10 @@ export function OverviewContent({
 
       <div className="ov-card ov-panel ov-chart-widget">
         <div className="ov-panel-head"><h3>Daily spend</h3><span className="r">{topModel ? `Biggest driver: ${topModel.name}` : 'No model driver yet'}</span></div>
-        <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} animateKey={animateKey} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
+        <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} dataStart={dataStartKey(data.history.daily)} animateKey={animateKey} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
       </div>
+
+      <WorkflowCard current={data.current} />
 
       <div className="ov-insight-band">
         <div className="ov-coach">

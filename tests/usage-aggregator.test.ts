@@ -1,11 +1,21 @@
 import { describe, expect, it, beforeAll } from 'vitest'
-import { buildMenubarPayloadForRange } from '../src/usage-aggregator.js'
+import { buildMenubarPayloadForRange, providerSliceHasUsage } from '../src/usage-aggregator.js'
 import { getDateRange } from '../src/cli-date.js'
 import { loadPricing } from '../src/models.js'
 
 describe('buildMenubarPayloadForRange', () => {
   beforeAll(async () => {
     await loadPricing()
+  })
+
+  it('treats token-only provider slices as usage', () => {
+    expect(providerSliceHasUsage({
+      calls: 0,
+      cost: 0,
+      savingsUSD: 0,
+      inputTokens: 1,
+    })).toBe(true)
+    expect(providerSliceHasUsage({ calls: 0, cost: 0, savingsUSD: 0 })).toBe(false)
   })
 
   it('returns a valid payload and skips optimize findings when optimize:false', async () => {
@@ -23,5 +33,6 @@ describe('buildMenubarPayloadForRange', () => {
     expect(payload.current.codexCredits).toBeGreaterThanOrEqual(0)
     // optimize:false => scanAndDetect skipped => empty optimize block regardless of data
     expect(payload.optimize).toEqual({ findingCount: 0, savingsUSD: 0, topFindings: [] })
+    expect(payload.stale).toBeUndefined()
   })
 })

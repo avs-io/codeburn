@@ -1,14 +1,15 @@
 import { readdir, readFile, mkdir, stat, open, rename, unlink } from 'fs/promises'
 import { execFile } from 'child_process'
 import { randomBytes } from 'crypto'
-import { basename, join } from 'path'
+import { basename, join, resolve } from 'path'
 import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import https from 'https'
 
+import { getCodeburnCacheDir, readExistingTextFile } from '../cache-dir.js'
 import { calculateCost } from '../models.js'
 import { isSqliteAvailable, isSqliteBusyError, openDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 type AntigravityConversationRoot = {
   dir: string
@@ -49,6 +50,11 @@ function conversationRoots(): readonly AntigravityConversationRoot[] {
   ]
 }
 const CACHE_VERSION = 5
+export const ANTIGRAVITY_CACHE_VERSION = CACHE_VERSION
+export const ANTIGRAVITY_LEGACY_CACHE_FILE = 'antigravity-results.json'
+export function antigravityCacheFileName(version = CACHE_VERSION): string {
+  return `antigravity-results.v${version}.json`
+}
 
 const RPC_TIMEOUT_MS = 5000
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -161,8 +167,17 @@ type AntigravityGenMetadataRow = {
 
 const cachedServers = new Map<string, ServerInfo | null>()
 const cachedModelMaps = new Map<string, ModelMap>()
-let memCache: AntigravityCache | null = null
-let cacheDirty = false
+type AntigravityCacheState = { cache: AntigravityCache; dirty: boolean }
+const cacheStates = new Map<string, AntigravityCacheState>()
+
+// Dropped by the resident RSS guard. A dirty state holds cascades not yet on
+// disk, so it stays resident until its own flush publishes it.
+export function clearAntigravityCacheStates(): void {
+  for (const [dir, state] of cacheStates) {
+    if (!state.dirty) cacheStates.delete(dir)
+  }
+}
+
 let httpsAgent: https.Agent | undefined
 const protoTextDecoder = new TextDecoder('utf-8', { fatal: false })
 
@@ -175,16 +190,24 @@ function getAgent(): https.Agent {
   return httpsAgent
 }
 
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
+function currentCacheDir(): string {
+  return resolve(getCodeburnCacheDir())
 }
 
-function getCachePath(): string {
-  return join(getCacheDir(), 'antigravity-results.json')
+function getCachePath(cacheDir: string): string {
+  return join(cacheDir, antigravityCacheFileName())
+}
+
+function getLegacyCachePath(cacheDir: string): string {
+  return join(cacheDir, ANTIGRAVITY_LEGACY_CACHE_FILE)
+}
+
+function isCurrentCache(cache: AntigravityCache): boolean {
+  return cache.version === CACHE_VERSION && !!cache.cascades && typeof cache.cascades === 'object'
 }
 
 export function getAntigravityStatusLineEventsPath(): string {
-  return join(getCacheDir(), 'antigravity-statusline.jsonl')
+  return join(getCodeburnCacheDir(), 'antigravity-statusline.jsonl')
 }
 
 function execFileText(command: string, args: string[], timeout = 3000): Promise<string> {
@@ -260,6 +283,18 @@ function parseAntigravityServerCandidates(lines: string[]): ServerCandidate[] {
     .filter((server): server is ServerCandidate => server !== null)
 }
 
+// Antigravity's own model-map config sometimes hasn't caught up with a new
+// model yet, so both the config key and displayName can still be the raw
+// placeholder id (e.g. "MODEL_PLACEHOLDER_M26"). Falling through to that
+// value as the "canonical" model would leak an internal placeholder as a
+// model name; 'unknown' is what this file already uses when no model can be
+// resolved at all (see antigravitySqliteModel).
+const MODEL_PLACEHOLDER_PATTERN = /^MODEL_PLACEHOLDER_/
+
+function dropPlaceholderModelId(model: string): string {
+  return MODEL_PLACEHOLDER_PATTERN.test(model) ? 'unknown' : model
+}
+
 function getCanonicalModelId(key: string, displayName?: string): string {
   if (displayName) {
     const lower = displayName.toLowerCase()
@@ -286,7 +321,7 @@ function getCanonicalModelId(key: string, displayName?: string): string {
       return 'gemini-3-pro'
     }
   }
-  return key
+  return dropPlaceholderModelId(key)
 }
 
 export function extractAntigravityModelMap(resp: unknown): ModelMap {
@@ -311,22 +346,57 @@ export function extractAntigravityGeneratorMetadata(resp: unknown): GeneratorMet
   return Array.isArray(metadata) ? metadata : []
 }
 
-async function loadCache(): Promise<AntigravityCache> {
-  if (memCache) return memCache
-  try {
-    const raw = await readFile(getCachePath(), 'utf-8')
-    const cache = JSON.parse(raw) as AntigravityCache
-    if (cache.version === CACHE_VERSION && cache.cascades && typeof cache.cascades === 'object') {
-      memCache = cache
-      return cache
+async function loadCache(cacheDir: string): Promise<AntigravityCacheState> {
+  const inMemory = cacheStates.get(cacheDir)
+  if (inMemory) return inMemory
+  const versioned = await readExistingTextFile(getCachePath(cacheDir))
+  if (versioned.status === 'ok') {
+    try {
+      const cache = JSON.parse(versioned.text) as AntigravityCache
+      if (isCurrentCache(cache)) {
+        const state = { cache, dirty: false }
+        cacheStates.set(cacheDir, state)
+        return state
+      }
+    } catch { /* present but invalid */ }
+    const invalid: AntigravityCacheState = {
+      cache: { version: CACHE_VERSION, cascades: {} },
+      dirty: false,
     }
-  } catch { /* no cache or invalid */ }
-  memCache = { version: CACHE_VERSION, cascades: {} }
-  return memCache
+    cacheStates.set(cacheDir, invalid)
+    return invalid
+  }
+  if (versioned.status === 'unreadable') {
+    const invalid: AntigravityCacheState = {
+      cache: { version: CACHE_VERSION, cascades: {} },
+      dirty: false,
+    }
+    cacheStates.set(cacheDir, invalid)
+    return invalid
+  }
+  // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
+  // version matches — old binaries still own that path; we never write or delete it.
+  try {
+    const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
+    const cache = JSON.parse(raw) as AntigravityCache
+    if (isCurrentCache(cache)) {
+      const state = { cache, dirty: false }
+      cacheStates.set(cacheDir, state)
+      return state
+    }
+  } catch { /* no legacy cache or invalid */ }
+  const state: AntigravityCacheState = {
+    cache: { version: CACHE_VERSION, cascades: {} },
+    dirty: false,
+  }
+  cacheStates.set(cacheDir, state)
+  return state
 }
 
-async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
-  if (!memCache) return
+async function flushCache(liveCascadeIds?: Set<string>, cacheDir = currentCacheDir()): Promise<void> {
+  const state = cacheStates.get(cacheDir)
+  if (!state) return
+  const memCache = state.cache
   // If the caller supplied liveCascadeIds, we must run the eviction step
   // even when no cascade was added or updated this run; otherwise deleted
   // .pb files would persist in the cache forever once it stops getting
@@ -336,16 +406,14 @@ async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
     for (const id of Object.keys(memCache.cascades)) {
       if (!liveCascadeIds.has(id)) {
         delete memCache.cascades[id]
-        cacheDirty = true
+        state.dirty = true
       }
     }
   }
-  if (!cacheDirty) return
+  if (!state.dirty) return
   try {
-
-    const dir = getCacheDir()
-    await mkdir(dir, { recursive: true })
-    const finalPath = getCachePath()
+    await mkdir(cacheDir, { recursive: true })
+    const finalPath = getCachePath(cacheDir)
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
     const handle = await open(tempPath, 'w', 0o600)
     try {
@@ -359,7 +427,7 @@ async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
     } catch {
       try { await unlink(tempPath) } catch { /* cleanup */ }
     }
-    cacheDirty = false
+    state.dirty = false
   } catch { /* best-effort */ }
 }
 
@@ -880,7 +948,7 @@ function buildCallsFromGeneratorMetadata(
     const responseId = usage.responseId || String(i)
     const dedupKey = `antigravity:${cascadeId}:${responseId}`
 
-    const model = modelMap[usage.model] ?? usage.model
+    const model = dropPlaceholderModelId(modelMap[usage.model] ?? usage.model)
     const pricingModel = normalizePricingModel(model)
     const timestamp = entry.chatModel?.chatStartMetadata?.createdAt ?? ''
     const costUSD = calculateCost(pricingModel, inputTokens, responseTokens + thinkingTokens, 0, 0, 0)
@@ -997,7 +1065,7 @@ export async function recordAntigravityStatusLinePayload(input: unknown): Promis
   if (!event) return false
 
   const path = getAntigravityStatusLineEventsPath()
-  await mkdir(getCacheDir(), { recursive: true, mode: 0o700 })
+  await mkdir(getCodeburnCacheDir(), { recursive: true, mode: 0o700 })
   const fd = await open(path, 'a', 0o600)
   try {
     await fd.appendFile(`${JSON.stringify(event)}\n`, { encoding: 'utf-8' })
@@ -1161,7 +1229,9 @@ export async function snapshotAntigravityStatusLinePayload(input: unknown): Prom
   const s = await stat(source.path).catch(() => null)
   if (!s) return false
 
-  const cache = await loadCache()
+  const cacheDir = currentCacheDir()
+  const state = await loadCache(cacheDir)
+  const cache = state.cache
   const cached = cache.cascades[cascadeId]
   if (cached && cached.mtimeMs === s.mtimeMs && cached.sizeBytes === s.size && cached.calls.length > 0) {
     return true
@@ -1183,8 +1253,8 @@ export async function snapshotAntigravityStatusLinePayload(input: unknown): Prom
       sizeBytes: s.size,
       calls: snapshotCalls,
     }
-    cacheDirty = true
-    await flushCache()
+    state.dirty = true
+    await flushCache(undefined, cacheDir)
     return cache.cascades[cascadeId]!.calls.length > 0
   } catch {
     return false
@@ -1288,7 +1358,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       }
 
       const cascadeId = antigravityCascadeIdFromPath(source.path)
-      const cache = await loadCache()
+      const state = await loadCache(currentCacheDir())
+      const cache = state.cache
 
       const s = await stat(source.path).catch(() => null)
       if (!s) return
@@ -1319,7 +1390,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           sizeBytes: s.size,
           calls: sqliteResults,
         }
-        cacheDirty = true
+        state.dirty = true
 
         for (const call of sqliteResults) {
           if (seenKeys.has(call.deduplicationKey)) continue
@@ -1372,7 +1443,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         sizeBytes: s.size,
         calls: results,
       }
-      cacheDirty = true
+      state.dirty = true
 
       for (const call of results) {
         if (seenKeys.has(call.deduplicationKey)) continue
@@ -1416,6 +1487,13 @@ export function createAntigravityProvider(): Provider {
       return rawTool
     },
 
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [
+        ...conversationRoots().map(root => ({ path: root.dir, label: 'conversations' })),
+        { path: getAntigravityStatusLineEventsPath(), label: 'statusline' },
+      ]
+    },
+
     async discoverSessions(): Promise<SessionSource[]> {
       return discoverAntigravitySessionSources()
     },
@@ -1426,8 +1504,8 @@ export function createAntigravityProvider(): Provider {
   }
 }
 
-export async function flushAntigravityCache(liveCascadeIds?: Set<string>): Promise<void> {
-  await flushCache(liveCascadeIds)
+export async function flushAntigravityCache(liveCascadeIds?: Set<string>, cacheDir?: string): Promise<void> {
+  await flushCache(liveCascadeIds, cacheDir ? resolve(cacheDir) : currentCacheDir())
 }
 
 export const antigravity = createAntigravityProvider()

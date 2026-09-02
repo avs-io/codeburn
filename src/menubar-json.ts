@@ -32,6 +32,46 @@ export type PeriodData = {
   projects?: Array<{ name: string; cost: number; savingsUSD: number; sessions: number; sessionDetails?: Array<{ cost: number; savingsUSD: number; calls: number; inputTokens: number; outputTokens: number; date: string; models: Array<{ name: string; cost: number; savingsUSD: number }> }> }>
   modelEfficiency?: Array<{ name: string; costPerEdit: number | null; oneShotRate: number | null }>
   topSessions?: Array<{ project: string; cost: number; savingsUSD: number; calls: number; date: string }>
+  /// Workflow-intelligence rollups (issue: workflow intelligence). Optional so
+  /// the day-aggregator PeriodData path (which has no per-turn data) can omit
+  /// them; the fresh-parse payload path always sets them.
+  workflow?: { corrections: number; correctionRate: number | null; medianTimeToFirstEditMs: number | null }
+  /// Files most reworked by edit-family calls, relative to project root, ranked
+  /// by distinct sessions then edits. Full (top 15) list; the payload basenames
+  /// and trims it.
+  topReworkedFiles?: ReworkedFile[]
+  /// Share (0-1) of cost-bearing calls that resolved a price.
+  pricingCoverage?: number
+  /// Spend attributed by referenced pull request (from Claude session
+  /// transcripts), at turn granularity. Rows carry attributed cost/calls and ARE
+  /// summable; `attributedCost`/`unattributedCost` split the PR-linked spend.
+  /// Absent when no PR links were observed.
+  pullRequests?: PullRequestsPayload
+  /// Per-branch spend, last-seen branch carried forward across each session's
+  /// turns. A `null` branch is unbranched spend inside a branch-bearing session.
+  /// Rows are by-reference (a session that switched branches counts toward each),
+  /// so never sum them. Absent when no branch data was observed.
+  byBranch?: BranchRow[]
+}
+
+export type PullRequestsPayload = {
+  /// Every attributed PR row, cost-descending.
+  rows: PrRow[]
+  /// PR-linked spend, now INCLUDING the subagent runs folded into those sessions
+  /// (so it can exceed the parents' own spend). Equals `attributedCost +
+  /// unattributedCost`; kept for backward compatibility.
+  distinctCost: number
+  /// Count of distinct PR-linked PARENT sessions.
+  distinctSessions: number
+  /// Count of subagent (sidechain) runs whose spend was folded into those parent
+  /// sessions. Each remains a standalone row in the sessions list; here it only
+  /// explains why the totals exceed the parents' own spend. 0 when none folded.
+  subagentSessions?: number
+  /// Sum of every PR's attributed cost.
+  attributedCost: number
+  /// PR-linked spend not tied to any specific PR (pre-reference session
+  /// overhead). `attributedCost + unattributedCost === distinctCost`.
+  unattributedCost: number
 }
 
 export type ProviderCost = {
@@ -40,10 +80,17 @@ export type ProviderCost = {
   name: string
   displayName: string
   cost: number
+  /** Behavioral calls in the selected period; token-only supplementary usage may be zero. */
+  calls?: number
+  /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
+  hasUsage?: boolean
 }
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
 import type { GranularHistory } from './granular-history.js'
+import { getShortModelName } from './models.js'
+import type { ReworkedFile } from './workflow-insights.js'
+import type { PrRow, BranchRow } from './sessions-report.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
@@ -53,6 +100,7 @@ const SYNTHETIC_MODEL_NAME = '<synthetic>'
 const TOP_PROJECTS_LIMIT = 5
 const TOP_SESSIONS_LIMIT = 3
 const MODEL_EFFICIENCY_LIMIT = 5
+const TOP_REWORKED_FILES_LIMIT = 8
 
 export type DailyModelBreakdown = {
   name: string
@@ -132,8 +180,38 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+/// How much of the corpus is behind the numbers in this payload (#1110).
+/// `complete: false` means the totals cover only the files indexed so far and
+/// a later poll will return more. The counts are progress indicators, not
+/// inventory: they are only meaningful while `complete` is false.
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
 export type MenubarPayload = {
   generated: string
+  /// Optional. Present and `true` only when this payload was assembled from a
+  /// read-only stale serve (see `isSessionHydrationComplete` in `parser.ts`).
+  /// Omitted — never `false` — on a fresh/complete payload, so absence always
+  /// means "assume fresh," including for payloads from a CLI version that
+  /// predates this field.
+  stale?: boolean
+  /// Optional. Emitted ONLY by the resident `codeburn serve` child, the one
+  /// producer whose consumers poll and therefore converge. Every one-shot CLI
+  /// output omits it and is always a full parse, so absence must be read as
+  /// "complete" — including for payloads from a CLI that predates the field.
+  /// A consumer that renders totals MUST check this before presenting them as
+  /// final; it is the only in-band marker that separates a partial answer from
+  /// a converged one. Distinct from `stale`: a first paint is fresh but
+  /// partial, a stale payload is complete but old.
+  hydration?: HydrationState
+  /// Add-only plugin socket sections (teams issue #3), keyed
+  /// `<plugin>.<section>`. Present only when a loaded plugin declared the
+  /// section AND its command wrote it. Surfaces render what they recognize
+  /// and ignore the rest; absence always means "no plugin output today".
+  plugins?: Record<string, unknown>
   current: {
     label: string
     cost: number
@@ -184,9 +262,10 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     /// Provider identity alongside the `providers` map: `id` is the internal
-    /// provider name (round-trips as `--provider`), `label` the display name.
+    /// provider name (round-trips as `--provider`), `label` the display name,
+    /// and `hasUsage` the period-activity signal used by provider pickers.
     /// The `providers` map keys stay lowercased display names for compatibility.
-    providerDetails: Array<{ id: string; label: string; cost: number }>
+    providerDetails: Array<{ id: string; label: string; cost: number; calls: number; hasUsage: boolean }>
     topProjects: Array<{
       name: string
       cost: number
@@ -215,6 +294,23 @@ export type MenubarPayload = {
       calls: number
       date: string
     }>
+    /// Workflow-intelligence rollup for the period. `unansweredSessions` is
+    /// add-only and optional: sessions that ended with no assistant reply are
+    /// not computable from the session cache (the parser drops a trailing
+    /// unanswered user turn), so it stays unset until a parse-time capture lands.
+    workflow: {
+      corrections: number
+      correctionRate: number | null
+      medianTimeToFirstEditMs: number | null
+      unansweredSessions?: number
+    }
+    /// Files most reworked by edit-family calls (top 8). Path is basename-only
+    /// for privacy; distinct sessions and total edit calls per file.
+    topReworkedFiles: Array<{ path: string; sessions: number; edits: number }>
+    /// Share (0-1) of cost-bearing calls that resolved a price.
+    /// null when not computable (no scan data on this path) — "unknown" must
+    /// never render as 100% coverage.
+    pricingCoverage: number | null
     retryTax: {
       totalUSD: number
       retries: number
@@ -241,8 +337,29 @@ export type MenubarPayload = {
     }
     tools: Array<{ name: string; calls: number }>
     skills: Array<{ name: string; turns: number; cost: number }>
-    subagents: Array<{ name: string; calls: number; cost: number }>
+    subagents: Array<{
+      name: string
+      calls: number
+      cost: number
+      agentName?: string
+      model?: string
+      startedAt?: string
+      inputTokens?: number
+      outputTokens?: number
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
+      totalTokens?: number
+    }>
     mcpServers: Array<{ name: string; calls: number }>
+    /// Every pull request with attributed spend, cost-descending, plus the
+    /// multi-link-safe distinct total. Absent when no PR links were observed and
+    /// on payloads produced before the field existed.
+    pullRequests?: PullRequestsPayload
+    /// Per-branch spend (top 15 by cost), last-seen branch carried forward across
+    /// each session's turns; a `null` branch is unbranched spend inside a
+    /// branch-bearing session. By-reference like the PR rows. Absent when no
+    /// branch data was observed, and on payloads produced before the field.
+    byBranch?: BranchRow[]
   }
   optimize: {
     findingCount: number
@@ -300,10 +417,24 @@ function buildTopActivities(categories: PeriodData['categories']): MenubarPayloa
 }
 
 function buildTopModels(models: PeriodData['models']): MenubarPayload['current']['topModels'] {
-  return models
-    .filter(m => m.name !== SYNTHETIC_MODEL_NAME)
+  // Day entries key models by the raw provider id (day-aggregator), so resolve
+  // display names here — the menubar shows "Kimi K3" rather than "k3". Ids that
+  // collapse to one display name (e.g. k3 and kimi-k3) merge into a single row.
+  const merged = new Map<string, { cost: number; calls: number; savingsUSD: number; estimatedCostUSD: number }>()
+  for (const m of models) {
+    if (m.name === SYNTHETIC_MODEL_NAME) continue
+    const name = getShortModelName(m.name)
+    const acc = merged.get(name) ?? { cost: 0, calls: 0, savingsUSD: 0, estimatedCostUSD: 0 }
+    acc.cost += m.cost
+    acc.calls += m.calls
+    acc.savingsUSD += m.savingsUSD ?? 0
+    acc.estimatedCostUSD += m.estimatedCostUSD ?? 0
+    merged.set(name, acc)
+  }
+  return [...merged.entries()]
+    .sort(([, a], [, b]) => b.cost - a.cost)
     .slice(0, TOP_MODELS_LIMIT)
-    .map(m => ({ name: m.name, cost: m.cost, calls: m.calls, savingsUSD: m.savingsUSD, savingsBaselineModel: '', estimatedCostUSD: m.estimatedCostUSD ?? 0 }))
+    .map(([name, d]) => ({ name, cost: d.cost, calls: d.calls, savingsUSD: d.savingsUSD, savingsBaselineModel: '', estimatedCostUSD: d.estimatedCostUSD }))
 }
 
 function buildOptimize(optimize: OptimizeResult | null): MenubarPayload['optimize'] {
@@ -336,7 +467,13 @@ function buildProviders(providers: ProviderCost[]): Record<string, number> {
 function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
   return providers
     .filter(p => p.cost >= 0)
-    .map(p => ({ id: p.name, label: p.displayName, cost: p.cost }))
+    .map(p => ({
+      id: p.name,
+      label: p.displayName,
+      cost: p.cost,
+      calls: p.calls ?? 0,
+      hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+    }))
 }
 
 function buildHistory(daily: DailyHistoryEntry[] | undefined, timeline?: GranularHistory): MenubarPayload['history'] {
@@ -377,6 +514,22 @@ function buildModelEfficiency(models: PeriodData['modelEfficiency']): MenubarPay
     .map(m => ({ name: m.name, costPerEdit: m.costPerEdit, oneShotRate: m.oneShotRate }))
 }
 
+function buildWorkflow(workflow: PeriodData['workflow']): MenubarPayload['current']['workflow'] {
+  return {
+    corrections: workflow?.corrections ?? 0,
+    correctionRate: workflow?.correctionRate ?? null,
+    medianTimeToFirstEditMs: workflow?.medianTimeToFirstEditMs ?? null,
+  }
+}
+
+function buildTopReworkedFiles(files: PeriodData['topReworkedFiles']): MenubarPayload['current']['topReworkedFiles'] {
+  return (files ?? [])
+    .slice(0, TOP_REWORKED_FILES_LIMIT)
+    // Basename only: the menubar/web payload can leave the machine, so drop the
+    // directory path and keep just the file name.
+    .map(f => ({ path: f.path.split('/').pop() || f.path, sessions: f.sessions, edits: f.edits }))
+}
+
 function buildTopSessions(sessions: PeriodData['topSessions']): MenubarPayload['current']['topSessions'] {
   return (sessions ?? [])
     .sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD))
@@ -407,6 +560,8 @@ export function buildMenubarPayload(
   breakdowns?: BreakdownArrays,
   claudeConfigs?: ClaudeConfigSelector,
   granularHistory?: GranularHistory,
+  stale?: boolean,
+  hydration?: HydrationState,
 ): MenubarPayload {
   const payload: MenubarPayload = {
     generated: new Date().toISOString(),
@@ -432,12 +587,20 @@ export function buildMenubarPayload(
       topProjects: buildTopProjects(current.projects ?? []),
       modelEfficiency: buildModelEfficiency(current.modelEfficiency ?? []),
       topSessions: buildTopSessions(current.topSessions ?? []),
+      workflow: buildWorkflow(current.workflow),
+      topReworkedFiles: buildTopReworkedFiles(current.topReworkedFiles),
+      pricingCoverage: current.pricingCoverage ?? null,
       retryTax: retryTax ?? { totalUSD: 0, retries: 0, editTurns: 0, byModel: [] },
       routingWaste: routingWaste ?? { totalSavingsUSD: 0, baselineModel: '', baselineCostPerEdit: 0, byModel: [] },
       tools: breakdowns?.tools ?? [],
       skills: breakdowns?.skills ?? [],
       subagents: breakdowns?.subagents ?? [],
       mcpServers: breakdowns?.mcpServers ?? [],
+      // Add-only: emitted only when the producer computed them (all-provider
+      // path), omitted otherwise so the schema stays stable for consumers that
+      // predate the fields.
+      ...(current.pullRequests ? { pullRequests: current.pullRequests } : {}),
+      ...(current.byBranch ? { byBranch: current.byBranch } : {}),
     },
     optimize: buildOptimize(optimize),
     history: buildHistory(dailyHistory, granularHistory),
@@ -448,6 +611,12 @@ export function buildMenubarPayload(
   }
   if (claudeConfigs && claudeConfigs.options.length > 1) {
     payload.claudeConfigs = claudeConfigs
+  }
+  if (stale) {
+    payload.stale = true
+  }
+  if (hydration) {
+    payload.hydration = hydration
   }
   return payload
 }

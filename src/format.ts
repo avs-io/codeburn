@@ -1,5 +1,6 @@
 import chalk from 'chalk'
 import type { ProjectSummary } from './types.js'
+import { behavioralCallCount } from './behavioral-weight.js'
 
 // Re-exported from currency.ts so existing imports from './format.js' keep working.
 // The currency-aware version applies exchange rate and symbol automatically.
@@ -13,6 +14,16 @@ export { formatCost }
 /// once. `isEstimated` is typically `entry.estimatedCostUSD > 0`.
 export function markEstimated(costStr: string, isEstimated: boolean): string {
   return isEstimated ? `~${costStr}` : costStr
+}
+
+/// Shared wording for the durable-cache carry-forward footnote: some of a
+/// period's total came from days whose session logs have since expired, but
+/// the figure is real (preserved in the durable daily cache). overview.ts and
+/// dashboard.tsx both show this so a headline that includes carried days
+/// doesn't read as inconsistent with detail views that can only see
+/// surviving session files.
+export function carriedCostNote(carriedCostUSD: number): string | null {
+  return carriedCostUSD > 0 ? `includes ${formatCost(carriedCostUSD)} preserved from expired session logs` : null
 }
 
 export function formatTokens(n: number): string {
@@ -36,12 +47,28 @@ function localDateString(d: Date): string {
   return `${y}-${m}-${day}`
 }
 
-export function renderStatusBar(projects: ProjectSummary[]): string {
+/// Precomputed today/month totals from the durable daily cache. When supplied,
+/// the status bar renders these instead of bucketing the live parse, so the
+/// figures match the menubar exactly (carried, expired-source days included).
+export type StatusBarTotals = {
+  today: { cost: number; calls: number }
+  month: { cost: number; calls: number }
+}
+
+export function renderStatusBar(projects: ProjectSummary[], totals?: StatusBarTotals): string {
   const now = new Date()
   const today = localDateString(now)
   const monthStart = `${today.slice(0, 7)}-01`
 
   let todayCost = 0, todayCalls = 0, monthCost = 0, monthCalls = 0
+  if (totals) {
+    todayCost = totals.today.cost; todayCalls = totals.today.calls
+    monthCost = totals.month.cost; monthCalls = totals.month.calls
+    const lines: string[] = ['']
+    lines.push(`  ${chalk.bold('Today')}  ${chalk.yellowBright(formatCost(todayCost))}  ${chalk.dim(`${todayCalls} calls`)}    ${chalk.bold('Month')}  ${chalk.yellowBright(formatCost(monthCost))}  ${chalk.dim(`${monthCalls} calls`)}`)
+    lines.push('')
+    return lines.join('\n')
+  }
 
   for (const project of projects) {
     for (const session of project.sessions) {
@@ -56,7 +83,9 @@ export function renderStatusBar(projects: ProjectSummary[]): string {
         if (!bucketTs) continue
         const day = localDateString(new Date(bucketTs))
         const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
-        const turnCalls = turn.assistantCalls.length
+        // Cost keeps every call; the calls figure counts only behavioral ones,
+        // so a supplementary-only turn still spends but adds no requests.
+        const turnCalls = behavioralCallCount(turn.assistantCalls)
         if (day === today) { todayCost += turnCost; todayCalls += turnCalls }
         if (day >= monthStart) { monthCost += turnCost; monthCalls += turnCalls }
       }

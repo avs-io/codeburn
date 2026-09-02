@@ -1,16 +1,18 @@
 import { readdir, stat } from 'fs/promises'
 import { createReadStream } from 'fs'
 import { createInterface } from 'readline'
-import { basename, join } from 'path'
+import { basename, join, resolve } from 'path'
 import { homedir } from 'os'
 
-import { readSessionLines } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
-import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile } from '../codex-cache.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from '../fs-utils.js'
+import { billableOutputTokens, calculateCost, getModelCosts } from '../models.js'
+import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
+import { mergeToolIntervals } from '../codex-throughput.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { defaultBilledCodexHome, defaultLauncherRoots, FIRST_LINE_READ_CAP, isNestedLauncherCodexHome, listRolloutSessionIds, rolloutFileSessionId, sameCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -32,6 +34,9 @@ const modelDisplayEntries = Object.entries(modelDisplayNames).sort((a, b) => b[0
 
 const toolNameMap: Record<string, string> = {
   exec_command: 'Bash',
+  // Codex Desktop's custom-tool transport uses the shorter `exec` name for
+  // the same shell tool that CLI rollouts record as `exec_command`.
+  exec: 'Bash',
   read_file: 'Read',
   write_file: 'Edit',
   apply_diff: 'Edit',
@@ -63,11 +68,7 @@ const toolNameMap: Record<string, string> = {
 // false-positive, an accepted tradeoff for the common case. \s+ and the token
 // class don't overlap, so there is no catastrophic backtracking.
 const MCP_CLI_CALL = /(?<![\w.-])mcp-cli(?:\s+(?!call\b)[^\s;|&]+)*\s+call\s+(\S+)\s+(\S+)/
-function mcpToolFromShellCommand(command: unknown): string | null {
-  const text = typeof command === 'string'
-    ? command
-    : Array.isArray(command) ? command.filter(x => typeof x === 'string').join(' ') : ''
-  if (!text) return null
+function mcpToolFromShellCommand(text: string): string | null {
   const m = MCP_CLI_CALL.exec(text)
   if (!m) return null
   const server = m[1]!.replace(/['"]/g, '')
@@ -76,11 +77,62 @@ function mcpToolFromShellCommand(command: unknown): string | null {
   return `mcp__${server}__${tool}`
 }
 
+// Codex has no dedicated skill tool: loading a skill is an ordinary shell exec
+// that reads the skill's `SKILL.md`, so the usage landed entirely under Bash and
+// the Skills dimension stayed empty (#478). Recognize only a *read* of a
+// SKILL.md, deliberately narrowly:
+//   - the command segment must start with a file-reading binary (cat/sed/head/
+//     tail/less/more/bat) — a `grep`/`rg`/`ls` that merely mentions a SKILL.md
+//     is a search near the file, not a skill load, and stays plain Bash;
+//   - the path it reads must END in `<name>/SKILL.md`, so `<name>` is the skill.
+// The name is the parent directory, the same key `src/providers/pi.ts` derives
+// for a native skill read (#588) and the same vocabulary the Claude parser
+// records from the `Skill` tool, so the Skills breakdown stays cross-provider
+// coherent. Substring matching, so a command that merely quotes the phrase can
+// false-positive — the same accepted tradeoff as MCP_CLI_CALL above.
+const SKILL_MD_READ = /(?<![\w.-])(?:cat|bat|sed|head|tail|less|more)\b[^;|&]*?[\s'"]([^\s;|&'"]*[\\/]([^\\/;|&'"]+)[\\/]SKILL\.md)\b/
+function skillFromShellCommand(text: string): string | null {
+  const m = SKILL_MD_READ.exec(text)
+  const name = m?.[2]?.trim()
+  return name ? name : null
+}
+
+/// Flatten every shape Codex records a shell command in to one string:
+/// `function_call` arguments carry it as a plain string, the item model's
+/// `CommandExecution` item as an argv array (`["/bin/zsh","-lc","..."]`), and
+/// the `exec` custom tool as the JS program that calls `tools.exec_command`.
+/// One text, one classification pipeline (#478).
+function shellCommandText(command: unknown): string {
+  if (typeof command === 'string') return command
+  if (Array.isArray(command)) return command.filter(x => typeof x === 'string').join(' ')
+  return ''
+}
+
+// Count added/removed lines from a Codex `patch_apply_end` change's
+// `unified_diff`. A leading '+' is an added line and '-' a removed line; the
+// '+++'/'---' file headers and '@@' hunk headers are excluded. Numbers only —
+// the diff text is never stored. Rich-session-capture (capture-only).
+export function countUnifiedDiffLoc(diff: unknown): { added: number; removed: number } {
+  let added = 0
+  let removed = 0
+  if (typeof diff !== 'string') return { added, removed }
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) added++
+    else if (line.startsWith('-') && !line.startsWith('---')) removed++
+  }
+  return { added, removed }
+}
+
 type CodexEntry = {
   type: string
   timestamp?: string
   payload?: {
     type?: string
+    turn_id?: string
+    call_id?: string
+    started_at?: number
+    duration_ms?: number
+    duration?: { secs?: number; nanos?: number } | string
     role?: string
     cwd?: string
     model_provider?: string
@@ -89,6 +141,7 @@ type CodexEntry = {
     forked_from_id?: string
     model?: string
     name?: string
+    invocation?: { server?: string; tool?: string }
     content?: Array<{ type?: string; text?: string }>
     info?: {
       model?: string
@@ -102,6 +155,10 @@ type CodexEntry = {
 type CodexTokenUsage = {
   input_tokens?: number
   cached_input_tokens?: number
+  /// Portion of `input_tokens` that was WRITTEN to the prompt cache this call
+  /// (codex PR #33454). Like `cached_input_tokens`, it is carved out of
+  /// `input_tokens`, not added on top.
+  cache_write_input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
   total_tokens?: number
@@ -121,7 +178,7 @@ function sanitizeProject(cwd: string): string {
 // Cap how many bytes we'll read while looking for the first newline. Real
 // Codex session_meta lines are ~22-27 KB; this leaves plenty of headroom while
 // keeping memory bounded if a corrupt file has no newline at all.
-const FIRST_LINE_READ_CAP = 1024 * 1024
+// FIRST_LINE_READ_CAP is shared with rolloutFileSessionId.
 
 async function readFirstLine(filePath: string): Promise<CodexEntry | null> {
   // Codex CLI 0.128+ writes a session_meta line that can exceed 20 KB because
@@ -161,12 +218,30 @@ async function readFirstLine(filePath: string): Promise<CodexEntry | null> {
   }
 }
 
+// Validation is STRUCTURAL, never string-matching on `payload.originator`.
+// `originator` is a free-form CLIENT IDENTITY string, not a format marker: any
+// tool driving `codex app-server` writes structurally identical rollouts under
+// ~/.codex/sessions with its own value ("codex-tui", "Codex Desktop",
+// "t3code_desktop", "JetBrains.IntelliJ IDEA", ...). Gating on the spelling
+// silently dropped every third-party frontend and needed a new allowlist entry
+// per client (issues #626, #873).
+//
+// A `session_meta` first line with a well-formed payload object is signal
+// enough: the walker only visits `rollout-*.jsonl` under the strict
+// YYYY/MM/DD path or `archived_sessions/`, and codex.ts is the only provider
+// that reads ~/.codex, so directory ownership — not originator content —
+// decides the provider. Genuinely foreign files (wrong entry type, missing or
+// non-object payload, malformed JSON) are still rejected.
 async function isValidCodexSession(filePath: string): Promise<{ valid: boolean; meta?: CodexEntry }> {
   const entry = await readFirstLine(filePath)
   if (!entry) return { valid: false }
+  // `entry` comes from an unchecked JSON.parse cast, so re-check the payload
+  // shape at runtime instead of trusting the declared type.
+  const payload: unknown = entry.payload
   const valid = entry.type === 'session_meta' &&
-    typeof entry.payload?.originator === 'string' &&
-    entry.payload.originator.toLowerCase().startsWith('codex')
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload)
   return { valid, meta: valid ? entry : undefined }
 }
 
@@ -181,9 +256,127 @@ function getRawJsonStringField(head: string, field: string): string | undefined 
   }
 }
 
+function getRawJsonNumberField(head: string, field: string): number | undefined {
+  const match = new RegExp(`"${field}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(head)
+  if (!match) return undefined
+  const value = Number(match[1])
+  return Number.isFinite(value) ? value : undefined
+}
+
+function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
+  const payloadKey = Buffer.from('"payload"')
+  const payloadIndex = source.indexOf(payloadKey)
+  if (payloadIndex < 0) return undefined
+  let payloadStart = source.indexOf(0x7b, payloadIndex + payloadKey.length) // {
+  if (payloadStart < 0) return undefined
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = payloadStart; i < source.length; i++) {
+    const byte = source[i]!
+    if (inString) {
+      if (escaped) escaped = false
+      else if (byte === 0x5c) escaped = true // \\
+      else if (byte === 0x22) inString = false // "
+      continue
+    }
+    if (byte === 0x22) {
+      const keyStart = i + 1
+      let keyEnd = keyStart
+      let keyEscaped = false
+      for (; keyEnd < source.length; keyEnd++) {
+        const keyByte = source[keyEnd]!
+        if (keyEscaped) { keyEscaped = false; continue }
+        if (keyByte === 0x5c) { keyEscaped = true; continue }
+        if (keyByte === 0x22) break
+      }
+      if (depth === 1 && keyEnd < source.length) {
+        const key = source.subarray(keyStart, keyEnd).toString('utf-8')
+        let valueStart = keyEnd + 1
+        while (valueStart < source.length && (source[valueStart] === 0x20 || source[valueStart] === 0x09 || source[valueStart] === 0x0a || source[valueStart] === 0x0d)) valueStart++
+        if (source[valueStart] === 0x3a && key === field) {
+          return source.subarray(i, Math.min(source.length, i + windowBytes)).toString('utf-8')
+        }
+      }
+      i = keyEnd
+      inString = false
+      continue
+    }
+    if (byte === 0x22) inString = true
+    else if (byte === 0x7b || byte === 0x5b) depth++ // { or [
+    else if (byte === 0x7d || byte === 0x5d) depth-- // } or ]
+    if (depth < 0) break
+  }
+  return undefined
+}
+
+function getRawDurationMs(head: string): number | undefined {
+  const objectMatch = /"duration"\s*:\s*\{\s*"secs"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"nanos"\s*:\s*(-?\d+(?:\.\d+)?)\s*\}/.exec(head)
+  if (objectMatch) {
+    const seconds = Number(objectMatch[1])
+    const nanos = Number(objectMatch[2])
+    if (Number.isFinite(seconds) && Number.isFinite(nanos)) return seconds * 1000 + nanos / 1e6
+  }
+  const text = getRawJsonStringField(head, 'duration')
+  if (text) {
+    const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(text.trim())
+    if (match) {
+      const value = Number(match[1])
+      if (Number.isFinite(value)) return value * (match[2] === 's' ? 1000 : 1)
+    }
+  }
+  return undefined
+}
+
+function durationValueMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'object' && value) {
+    const record = value as Record<string, unknown>
+    const seconds = record['secs']
+    const nanos = record['nanos']
+    if (typeof seconds === 'number' && typeof nanos === 'number' && Number.isFinite(seconds) && Number.isFinite(nanos)) {
+      return seconds * 1000 + nanos / 1e6
+    }
+  }
+  if (typeof value === 'string') {
+    const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(value.trim())
+    if (match) {
+      const parsed = Number(match[1])
+      if (Number.isFinite(parsed)) return parsed * (match[2] === 's' ? 1000 : 1)
+    }
+  }
+  return undefined
+}
+
+function getRawTokenUsage(head: string, field: 'last_token_usage' | 'total_token_usage'): CodexTokenUsage | undefined {
+  const match = new RegExp(`"${field}"\\s*:\\s*\\{([^}]*)\\}`).exec(head)
+  if (!match) return undefined
+  const body = match[1]!
+  return {
+    input_tokens: getRawJsonNumberField(body, 'input_tokens'),
+    cached_input_tokens: getRawJsonNumberField(body, 'cached_input_tokens'),
+    cache_write_input_tokens: getRawJsonNumberField(body, 'cache_write_input_tokens'),
+    output_tokens: getRawJsonNumberField(body, 'output_tokens'),
+    reasoning_output_tokens: getRawJsonNumberField(body, 'reasoning_output_tokens'),
+    total_tokens: getRawJsonNumberField(body, 'total_tokens'),
+  }
+}
+
 function payloadHead(head: string): string {
   const idx = head.indexOf('"payload"')
   return idx === -1 ? head : head.slice(idx)
+}
+
+function getRawInvocation(head: string): { server?: string; tool?: string } | undefined {
+  const idx = head.indexOf('"invocation"')
+  if (idx === -1) return undefined
+  // Server/tool are shallow fields and precede the potentially huge arguments
+  // object in Codex MCP records. Limit this scan to keep compact parsing cheap.
+  const invocationHead = head.slice(idx, idx + 8192)
+  const server = getRawJsonStringField(invocationHead, 'server')
+  const tool = getRawJsonStringField(invocationHead, 'tool')
+  return server || tool ? { server, tool } : undefined
 }
 
 function countJsonStringBytes(source: Buffer, valueStart: number): number {
@@ -255,6 +448,40 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
   const pHead = payloadHead(head)
   const payloadType = getRawJsonStringField(pHead, 'type')
   const role = getRawJsonStringField(pHead, 'role')
+  // task_complete appends the potentially huge final assistant message before
+  // its duration fields. Fall back to the full Buffer only for this event so
+  // timing metadata is not lost when the compact head stops early.
+  const needsTimingTail = type === 'event_msg' && (payloadType === 'task_complete' || payloadType === 'mcp_tool_call_end')
+  const timingTail = needsTimingTail && line.length > RAW_HEAD_BYTES
+    ? line.subarray(Math.max(0, line.length - 16 * 1024)).toString('utf-8')
+    : pHead
+  const timingNumber = (field: string): number | undefined =>
+    getRawJsonNumberField(pHead, field) ?? getRawJsonNumberField(timingTail, field)
+  // MCP records can place a large invocation.arguments object before duration
+  // and a large result after it. Searching a small window around the field
+  // avoids materializing the middle of the Buffer while still preserving wait
+  // timing for those records.
+  const payloadDuration = payloadType === 'mcp_tool_call_end'
+    ? getRawDurationMs(getRawPayloadFieldWindow(line, 'duration') ?? '')
+    : undefined
+  const timingDuration = payloadDuration ?? getRawDurationMs(pHead) ?? getRawDurationMs(timingTail)
+  // session_meta can embed same-name keys under base_instructions /
+  // dynamic_tools (including provenance.model). A depth-agnostic scan of the
+  // compact head steals the first nested hit and can overwrite turn_context.
+  // Restrict every session_meta string field to payload depth 1. Other event
+  // types keep the cheap first-match scan.
+  const payloadString = (field: string): string | undefined =>
+    type === 'session_meta'
+      ? getRawJsonStringField(getRawPayloadFieldWindow(line, field) ?? '', field)
+      : getRawJsonStringField(pHead, field)
+  const compactModel = payloadString('model')
+  const compactModelName = getRawJsonStringField(pHead, 'model_name')
+  const compactLastUsage = getRawTokenUsage(pHead, 'last_token_usage')
+  const compactTotalUsage = getRawTokenUsage(pHead, 'total_token_usage')
+  const compactInfo = compactModel || compactModelName || compactLastUsage || compactTotalUsage
+    ? { model: compactModel, model_name: compactModelName, last_token_usage: compactLastUsage, total_token_usage: compactTotalUsage }
+    : undefined
+  const invocation = getRawInvocation(pHead) ?? getRawInvocation(timingTail)
 
   const entry: CodexEntry = {
     type,
@@ -262,13 +489,23 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     payload: {
       type: payloadType,
       role,
-      cwd: getRawJsonStringField(pHead, 'cwd'),
-      model_provider: getRawJsonStringField(pHead, 'model_provider'),
-      originator: getRawJsonStringField(pHead, 'originator'),
-      session_id: getRawJsonStringField(pHead, 'session_id'),
-      forked_from_id: getRawJsonStringField(pHead, 'forked_from_id'),
-      model: getRawJsonStringField(pHead, 'model'),
-      name: getRawJsonStringField(pHead, 'name'),
+      cwd: payloadString('cwd'),
+      model_provider: payloadString('model_provider'),
+      originator: payloadString('originator'),
+      session_id: payloadString('session_id'),
+      forked_from_id: payloadString('forked_from_id'),
+      model: compactModel,
+      name: payloadString('name'),
+      invocation,
+      call_id: getRawJsonStringField(pHead, 'call_id'),
+      turn_id: getRawJsonStringField(pHead, 'turn_id'),
+      // On mcp_tool_call_end a coincidental `duration_ms` inside the large
+      // invocation.arguments object can shadow the payload-level duration, so the
+      // depth-aware value wins. The naive scan stays as the fallback for
+      // task_complete, which records duration_ms at the payload level directly.
+      duration_ms: timingDuration ?? timingNumber('duration_ms'),
+      started_at: timingNumber('started_at'),
+      info: compactInfo,
     },
   }
 
@@ -285,6 +522,8 @@ async function discoverSessionFile(filePath: string): Promise<SessionSource | nu
   const s = await stat(filePath).catch(() => null)
   if (!s?.isFile()) return null
 
+  // Fast path: cached results already know the project, so avoid opening the
+  // file. This keeps discovery cheap on large session directories.
   const cachedProject = await getCachedCodexProject(filePath)
   if (cachedProject) {
     return { path: filePath, project: cachedProject, provider: 'codex' }
@@ -293,129 +532,394 @@ async function discoverSessionFile(filePath: string): Promise<SessionSource | nu
   const { valid, meta } = await isValidCodexSession(filePath)
   if (!valid || !meta) return null
 
-  const cwd = meta.payload?.cwd ?? 'unknown'
+  // Same unchecked-cast caveat as the payload check above: `cwd` is declared
+  // `string` but comes straight off JSON.parse. A rollout carrying a number,
+  // object or array here would throw out of sanitizeProject, escape
+  // discoverSessions, and make safeDiscoverSessions return [] for the WHOLE
+  // codex provider — every Codex report reading zero because of one bad file.
+  const rawCwd: unknown = meta.payload?.cwd
+  const cwd = typeof rawCwd === 'string' && rawCwd ? rawCwd : 'unknown'
   return { path: filePath, project: sanitizeProject(cwd), provider: 'codex' }
 }
 
 async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]> {
   const sources: SessionSource[] = []
+  // Codex archives a session by moving it from sessions/YYYY/MM/DD/ to
+  // archived_sessions/, keeping the same basename. Deduplicate by basename so
+  // a session does not appear twice while it exists in both roots. This avoids
+  // reading every file to extract session_id and preserves the cheap cached
+  // fast path.
+  const seenBasenames = new Set<string>()
   const sessionsDir = join(codexDir, 'sessions')
 
-  const years = await readdir(sessionsDir).catch(() => [] as string[])
+  const years = (await readdir(sessionsDir).catch(() => [] as string[])).filter(y => /^\d{4}$/.test(y))
 
-  for (const year of years) {
-    if (!/^\d{4}$/.test(year)) continue
+  const monthDirs = (await mapWithConcurrency(years, FS_SCAN_CONCURRENCY, async year => {
     const yearDir = join(sessionsDir, year)
-    const months = await readdir(yearDir).catch(() => [] as string[])
+    return (await readdir(yearDir).catch(() => [] as string[]))
+      .filter(m => /^\d{2}$/.test(m))
+      .map(m => join(yearDir, m))
+  })).flat()
 
-    for (const month of months) {
-      if (!/^\d{2}$/.test(month)) continue
-      const monthDir = join(yearDir, month)
-      const days = await readdir(monthDir).catch(() => [] as string[])
+  const dayDirs = (await mapWithConcurrency(monthDirs, FS_SCAN_CONCURRENCY, async monthDir =>
+    (await readdir(monthDir).catch(() => [] as string[]))
+      .filter(d => /^\d{2}$/.test(d))
+      .map(d => join(monthDir, d)),
+  )).flat()
 
-      for (const day of days) {
-        if (!/^\d{2}$/.test(day)) continue
-        const dayDir = join(monthDir, day)
-        const files = await readdir(dayDir).catch(() => [] as string[])
-
-        for (const file of files) {
-          if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue
-          const filePath = join(dayDir, file)
-          const source = await discoverSessionFile(filePath)
-          if (source) sources.push(source)
-        }
-      }
-    }
-  }
+  const dated = (await mapWithConcurrency(dayDirs, FS_SCAN_CONCURRENCY, async dayDir =>
+    (await readdir(dayDir).catch(() => [] as string[]))
+      .filter(f => f.startsWith('rollout-') && f.endsWith('.jsonl'))
+      .map(f => ({ file: f, path: join(dayDir, f) })),
+  )).flat()
 
   // Codex moves archived sessions into a flat directory. Keep them in usage
   // reports so archiving a conversation does not erase its historical usage.
+  // Call-level deduplication (seenKeys) already collapses any remaining
+  // archived copies, while basename dedup below prevents double discovery.
   const archivedDir = join(codexDir, 'archived_sessions')
-  const archivedFiles = await readdir(archivedDir).catch(() => [] as string[])
-  for (const file of archivedFiles) {
-    if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue
-    const source = await discoverSessionFile(join(archivedDir, file))
-    if (source) sources.push(source)
+  const archived = (await readdir(archivedDir).catch(() => [] as string[]))
+    .filter(f => f.startsWith('rollout-') && f.endsWith('.jsonl'))
+    .map(f => ({ file: f, path: join(archivedDir, f) }))
+
+  // Dedup before the reads so a basename is opened once, and keep the dated
+  // pass ahead of the archived one — the same precedence the serial walk had.
+  const candidates: Array<{ file: string; path: string }> = []
+  for (const entry of [...dated, ...archived]) {
+    if (seenBasenames.has(entry.file)) continue
+    seenBasenames.add(entry.file)
+    candidates.push(entry)
   }
+  const discovered = await mapWithConcurrency(candidates, FS_SCAN_CONCURRENCY, c => discoverSessionFile(c.path))
+  for (const source of discovered) if (source) sources.push(source)
 
   return sources
 }
 
-function resolveModel(info: CodexEntry['payload'], sessionModel?: string): string {
-  return info?.model
-    ?? info?.info?.model
-    ?? info?.info?.model_name
-    ?? sessionModel
-    ?? 'gpt-5'
+// The model fields come off an unchecked JSON.parse cast, so a third-party
+// rollout can carry a non-string `model`. It flows straight into calculateCost,
+// which calls `.replace()` on it, so pick the first genuine string and never let
+// a number/object/array through.
+function firstModelString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value) return value
+  }
+  return undefined
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+function resolveModel(info: CodexEntry['payload'], sessionModel?: string): string {
+  return firstModelString(info?.model, info?.info?.model, info?.info?.model_name, sessionModel) ?? 'gpt-5'
+}
+
+// Everything the single-pass decode carries across a `task_started` boundary.
+// A rollout is append-only, so recording this at such a boundary (where the
+// previous task has been flushed to `results` and the per-task accumulators are
+// empty) lets a later run restart there and produce byte-identical output
+// instead of re-reading the whole file. Every field the loop below reads from a
+// PRIOR line must appear here, or a resumed decode silently diverges.
+type CodexResumeState = {
+  sessionModel?: string
+  sessionId: string
+  sessionCwd?: string
+  forkedFromId: string
+  forkCutoff: string
+  prevCumulativeTotal: number | null
+  prevInput: number
+  prevCached: number
+  prevCacheWrite: number
+  prevOutput: number
+  prevReasoning: number
+  pendingTools: string[]
+  pendingToolSequence: ToolCall[][]
+  /// Optional so a resume state written before skills attribution existed still
+  /// decodes (isResumeState does not require it); absent reads as "no skills".
+  pendingSkills?: string[]
+  pendingUserMessage: string
+  pendingOutputChars: number
+  pendingLocAdded: number
+  pendingLocRemoved: number
+  pendingEditFailed: number
+  estCounter: number
+  turnCounter: number
+  currentTurnId: string
+  taskStartedAt?: number
+  // #1088 BUG-1: timestamp of the first request-context event (turn_context,
+  // world_state, event_msg/user_message, or response_item/message) seen since
+  // the last task_started. Codex fires task_started before it assembles the
+  // request, so the gap up to this event is CLI/harness startup, not model
+  // wait -- the active window for Tok/s starts here, not at task_started.
+  taskActiveStartedAt?: number
+}
+
+// The state comes back off our own JSON cache; a truncated or hand-edited file
+// must fall back to a full re-parse rather than decode against nonsense.
+function isResumeState(value: unknown): value is CodexResumeState {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return typeof v['sessionId'] === 'string'
+    && typeof v['forkedFromId'] === 'string'
+    && typeof v['forkCutoff'] === 'string'
+    && (v['prevCumulativeTotal'] === null || typeof v['prevCumulativeTotal'] === 'number')
+    && typeof v['prevInput'] === 'number'
+    && typeof v['prevCached'] === 'number'
+    && typeof v['prevCacheWrite'] === 'number'
+    && typeof v['prevOutput'] === 'number'
+    && typeof v['prevReasoning'] === 'number'
+    && Array.isArray(v['pendingTools'])
+    && Array.isArray(v['pendingToolSequence'])
+    && typeof v['pendingUserMessage'] === 'string'
+    && typeof v['pendingOutputChars'] === 'number'
+    && typeof v['pendingLocAdded'] === 'number'
+    && typeof v['pendingLocRemoved'] === 'number'
+    && typeof v['pendingEditFailed'] === 'number'
+    && typeof v['estCounter'] === 'number'
+    && typeof v['turnCounter'] === 'number'
+    && typeof v['currentTurnId'] === 'string'
+}
+
+/** What the serial path would have written to the codex cache for one file. */
+export type CodexCacheWrite = {
+  project: string
+  fingerprint: CodexFileFingerprint
+  resume?: { offset: number; state: unknown; callCount: number }
+}
+
+// When `capture` is passed the parse is a whole-file decode that never touches
+// the codex cache: no hit lookup (so no resume), and the entry it would have
+// written comes back through `capture` for the caller to install. That is what
+// lets a worker thread run this exact decode without owning the cache module's
+// per-directory state.
+function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { write?: CodexCacheWrite }): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const cached = await readCachedCodexResults(source.path)
-      if (cached) {
-        for (const call of cached) {
+      const hit = capture ? null : await readCachedCodexResults(source.path)
+      if (hit?.kind === 'exact') {
+        for (const call of hit.calls) {
           if (seenKeys.has(call.deduplicationKey)) continue
           seenKeys.add(call.deduplicationKey)
           yield call
         }
         return
       }
+      const resume = hit && isResumeState(hit.state)
+        ? { offset: hit.offset, state: hit.state, calls: hit.calls.slice(0, hit.callCount) }
+        : null
 
       const fp = await fingerprintFile(source.path)
       if (!fp) return
 
-      let sessionModel: string | undefined
-      let sessionId = ''
-      let forkedFromId = ''
-      let forkCutoff = ''
+      let sessionModel: string | undefined = resume?.state.sessionModel
+      let sessionId = resume?.state.sessionId ?? ''
+      let sessionCwd: string | undefined = resume?.state.sessionCwd
+      let forkedFromId = resume?.state.forkedFromId ?? ''
+      let forkCutoff = resume?.state.forkCutoff ?? ''
       // Null sentinel rather than `0` so the FIRST event is never confused
       // with a duplicate. A session that only emits last_token_usage (no
       // total_token_usage) reports cumulativeTotal=0 on every event; with a
       // 0-initialized prev, the first event would have matched and been
       // dropped. Once we've observed any event, we record its cumulative
       // total and dedup on equality regardless of whether it is zero.
-      let prevCumulativeTotal: number | null = null
-      let prevInput = 0
-      let prevCached = 0
-      let prevOutput = 0
-      let prevReasoning = 0
-      let pendingTools: string[] = []
-      let pendingToolSequence: ToolCall[][] = []
-      let pendingUserMessage = ''
-      let pendingOutputChars = 0
-      let estCounter = 0
-      let turnCounter = 0
-      let currentTurnId = `${sessionId}:t0`
+      let prevCumulativeTotal: number | null = resume?.state.prevCumulativeTotal ?? null
+      let prevInput = resume?.state.prevInput ?? 0
+      let prevCached = resume?.state.prevCached ?? 0
+      let prevCacheWrite = resume?.state.prevCacheWrite ?? 0
+      let prevOutput = resume?.state.prevOutput ?? 0
+      let prevReasoning = resume?.state.prevReasoning ?? 0
+      let pendingTools: string[] = resume ? [...resume.state.pendingTools] : []
+      let pendingToolSequence: ToolCall[][] = resume ? [...resume.state.pendingToolSequence] : []
+      let pendingSkills: string[] = resume?.state.pendingSkills ? [...resume.state.pendingSkills] : []
+      // Attribution names already emitted from a `response_item` tool call.
+      // Codex's item model repeats a finished shell command as
+      // `item_completed`/`CommandExecution`; a rollout that carries BOTH shapes
+      // must attribute the call once, and one that carries ONLY the item must
+      // still attribute it. Counting per derived name (not per command text,
+      // which the two shapes spell differently - argv array vs plain string)
+      // makes repeats of the same call line up one-for-one. The response item is
+      // always written first (the model requests the call, the item completes
+      // it), so the item side only ever cancels an attribution, never adds a
+      // duplicate.
+      const itemDedup = new Map<string, number>()
+
+      /// The single classification pipeline every Codex shell-command shape
+      /// feeds (#478): `function_call` arguments, the `exec` custom tool's JS
+      /// `input`, and the item model's `CommandExecution` item. It adds MCP and
+      /// Skill attribution only - the exec itself is counted as Bash by its
+      /// response item, and `viaItem` calls never add a tool of their own, so
+      /// call/token/cost totals cannot move.
+      const attributeShellCommand = (text: string, viaItem: boolean): void => {
+        if (!text) return
+        const claim = (name: string): boolean => {
+          const pending = itemDedup.get(name) ?? 0
+          if (!viaItem) { itemDedup.set(name, pending + 1); return true }
+          if (pending === 0) return true
+          itemDedup.set(name, pending - 1)
+          return false
+        }
+        const mcpTool = mcpToolFromShellCommand(text)
+        if (mcpTool && claim(mcpTool)) {
+          pendingTools.push(mcpTool)
+          pendingToolSequence.push([{ tool: mcpTool }])
+        }
+        const skill = skillFromShellCommand(text)
+        if (skill && claim(`skill:${skill}`)) {
+          pendingSkills.push(skill)
+          pendingTools.push('Skill')
+          pendingToolSequence.push([{ tool: 'Skill', file: skill }])
+        }
+      }
+      let pendingUserMessage = resume?.state.pendingUserMessage ?? ''
+      let pendingOutputChars = resume?.state.pendingOutputChars ?? 0
+      // Rich-session-capture: edit LOC deltas and failed-patch count accumulated
+      // across a turn's patch_apply_end events, flushed onto the turn's call.
+      let pendingLocAdded = resume?.state.pendingLocAdded ?? 0
+      let pendingLocRemoved = resume?.state.pendingLocRemoved ?? 0
+      let pendingEditFailed = resume?.state.pendingEditFailed ?? 0
+      let estCounter = resume?.state.estCounter ?? 0
+      let turnCounter = resume?.state.turnCounter ?? 0
+      let currentTurnId = resume?.state.currentTurnId ?? `${sessionId}:t0`
       let sawAnyLine = false
       const results: ParsedProviderCall[] = []
+      // Calls already decoded before the resume boundary. They pass through the
+      // same cross-provider dedup a full decode would have applied to them.
+      if (resume) {
+        for (const call of resume.calls) {
+          if (seenKeys.has(call.deduplicationKey)) continue
+          seenKeys.add(call.deduplicationKey)
+          results.push(call)
+        }
+      }
+      // Calls decoded since the last task_started, held back so task_complete can
+      // stamp active/toolWait timing before they are appended to results. Emitting
+      // a task only once its timing is known keeps single-pass and split/resume
+      // decodes in agreement instead of back-patching already-emitted calls.
+      // Bounded by one task's calls; flushed at the next task_started and at EOF.
+      let pendingTaskCalls: ParsedProviderCall[] = []
+      let taskGeneratedTokens = 0
+      let taskToolIntervals: Array<[number, number]> = []
+      let taskStartedAt: number | undefined = resume?.state.taskStartedAt
+      let taskActiveStartedAt: number | undefined = resume?.state.taskActiveStartedAt
+      const openToolStarts = new Map<string, number>()
+
+      // Resume point for the NEXT run, refreshed at every task boundary.
+      const tracker = { lastCompleteLineOffset: resume?.offset ?? 0 }
+      let resumeOffset = resume?.offset ?? 0
+      let resumeState: CodexResumeState | null = resume?.state ?? null
+      let resumeCallCount = results.length
 
       // Stream the session file line by line. Heavy Codex sessions can exceed
       // 250 MB on disk; reading the entire file into a string would either hit
       // the readSessionFile cap or push V8 toward its 512 MB string limit
       // after split('\n'). readSessionLines streams raw buffers and hands
       // huge lines to the compact parser without full string conversion.
-      for await (const rawLine of readSessionLines(source.path, undefined, { largeLineAsBuffer: true })) {
+      for await (const rawLine of readSessionLines(source.path, undefined, {
+        largeLineAsBuffer: true,
+        byteOffsetTracker: tracker,
+        ...(resume ? { startByteOffset: resume.offset } : {}),
+      })) {
         sawAnyLine = true
         const entry = parseCodexLine(rawLine)
         if (!entry) continue
 
         if (entry.type === 'session_meta') {
           sessionId = entry.payload?.session_id ?? basename(source.path, '.jsonl')
+          // Guarded for the same reason as discoverSessionFile: parseCodexLine
+          // hands back an unchecked JSON.parse cast, and a non-string cwd would
+          // ride into projectPath/workingDirectory where the parser's path
+          // helpers (normalizeProjectPathKey, resolveCanonicalProjectPath) call
+          // string methods on it.
+          const rawSessionCwd: unknown = entry.payload?.cwd
+          if (typeof rawSessionCwd === 'string' && rawSessionCwd) sessionCwd = rawSessionCwd
           forkedFromId = entry.payload?.forked_from_id ?? ''
           if (forkedFromId && entry.timestamp) {
-            forkCutoff = new Date(new Date(entry.timestamp).getTime() + 5000).toISOString()
+            // An unparseable timestamp (a garbage string, or a non-string from
+            // the unchecked JSON.parse cast) makes `new Date(NaN).toISOString()`
+            // throw RangeError, which would sink this whole session to zero.
+            const forkBaseMs = new Date(entry.timestamp).getTime()
+            if (Number.isFinite(forkBaseMs)) forkCutoff = new Date(forkBaseMs + 5000).toISOString()
           }
-          sessionModel = entry.payload?.model ?? sessionModel
+          if (typeof entry.payload?.model === 'string') sessionModel = entry.payload.model
           continue
         }
 
-        if (entry.type === 'turn_context' && entry.payload?.model) {
+        // #1088 BUG-1: the first request-context event since task_started marks
+        // where model-request assembly actually began. Checked before any of
+        // these types `continue` below, and unconditionally (like turn_context's
+        // model capture above) so a forked replay's own request-context events
+        // still mark it -- matching how those events are already read regardless
+        // of isForkReplay, which only filters task boundaries and tool events.
+        if (taskActiveStartedAt === undefined && (
+          entry.type === 'turn_context'
+          || entry.type === 'world_state'
+          || (entry.type === 'event_msg' && entry.payload?.type === 'user_message')
+          || (entry.type === 'response_item' && entry.payload?.type === 'message')
+        )) {
+          const ctxAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          if (Number.isFinite(ctxAt)) taskActiveStartedAt = ctxAt
+        }
+
+        if (entry.type === 'turn_context' && typeof entry.payload?.model === 'string') {
           sessionModel = entry.payload.model
           continue
         }
 
-        if (entry.type === 'response_item' && entry.payload?.type === 'function_call') {
+        const isForkReplay = Boolean(forkCutoff && entry.timestamp && entry.timestamp < forkCutoff)
+        if (isForkReplay && (
+          entry.payload?.type === 'task_started' ||
+          entry.payload?.type === 'task_complete' ||
+          entry.payload?.type === 'function_call' ||
+          entry.payload?.type === 'function_call_output' ||
+          entry.payload?.type === 'custom_tool_call' ||
+          entry.payload?.type === 'custom_tool_call_output' ||
+          entry.payload?.type === 'mcp_tool_call_end' ||
+          entry.payload?.type === 'item_completed' ||
+          entry.payload?.type === 'patch_apply_end'
+        )) continue
+
+        if (entry.type === 'event_msg' && entry.payload?.type === 'task_started') {
+          // Emit the previous task. If it never reached task_complete its timing
+          // fields simply stay unset, matching the un-buffered behaviour.
+          results.push(...pendingTaskCalls)
+          pendingTaskCalls = []
+          taskGeneratedTokens = 0
+          taskToolIntervals = []
+          const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
+          taskActiveStartedAt = undefined
+          openToolStarts.clear()
+          // Everything decoded so far is now in `results` and the per-task
+          // accumulators are empty: a clean restart point for an appended tail.
+          resumeOffset = tracker.lastCompleteLineOffset
+          resumeCallCount = results.length
+          resumeState = {
+            ...(sessionModel !== undefined ? { sessionModel } : {}),
+            sessionId,
+            ...(sessionCwd !== undefined ? { sessionCwd } : {}),
+            forkedFromId,
+            forkCutoff,
+            prevCumulativeTotal,
+            prevInput,
+            prevCached,
+            prevCacheWrite,
+            prevOutput,
+            prevReasoning,
+            pendingTools: [...pendingTools],
+            pendingToolSequence: [...pendingToolSequence],
+            pendingSkills: [...pendingSkills],
+            pendingUserMessage,
+            pendingOutputChars,
+            pendingLocAdded,
+            pendingLocRemoved,
+            pendingEditFailed,
+            estCounter,
+            turnCounter,
+            currentTurnId,
+            ...(taskStartedAt !== undefined ? { taskStartedAt } : {}),
+            ...(taskActiveStartedAt !== undefined ? { taskActiveStartedAt } : {}),
+          }
+          continue
+        }
+
+        if (entry.type === 'response_item' && (entry.payload?.type === 'function_call' || entry.payload?.type === 'custom_tool_call')) {
           const rawName = entry.payload.name ?? ''
           const mapped = toolNameMap[rawName] ?? rawName
           pendingTools.push(mapped)
@@ -429,15 +933,72 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             if (typeof fp === 'string') call.file = fp
             const cmd = args['command'] ?? args['cmd']
             if (typeof cmd === 'string') call.command = cmd
-            // Attribute a CLI-wrapped MCP call (e.g. `mcp-cli call server tool`)
-            // to the MCP breakdown too; the exec still counts as Bash above.
-            const mcpTool = mcpToolFromShellCommand(cmd)
-            if (mcpTool) {
-              pendingTools.push(mcpTool)
-              pendingToolSequence.push([{ tool: mcpTool }])
+            attributeShellCommand(shellCommandText(cmd), false)
+          }
+          // A `custom_tool_call` has no `arguments`: the shell tool's payload is
+          // the `input` program that calls `tools.exec_command({cmd: ...})`. The
+          // MCP/skill matchers never saw it, so a CLI-wrapped MCP call or a
+          // SKILL.md read made through Codex's custom-tool transport counted only
+          // as Bash (#478). Restricted to the shell tool: `apply_patch` is a
+          // custom tool too and its `input` is file content, where a documented
+          // command would read as a real invocation. `call.command` is
+          // deliberately NOT set from it either - that field feeds the retry
+          // heuristic's read-shaped-command test, and a JS program is not a
+          // shell command.
+          if (mapped === 'Bash') {
+            const input = (entry.payload as Record<string, unknown>)['input']
+            if (typeof input === 'string') attributeShellCommand(input, false)
+          }
+          const callId = entry.payload.call_id
+          const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          if (callId && Number.isFinite(started)) openToolStarts.set(callId, started)
+          pendingToolSequence.push([call])
+          continue
+        }
+
+        if (entry.type === 'response_item' && (entry.payload?.type === 'function_call_output' || entry.payload?.type === 'custom_tool_call_output')) {
+          const callId = entry.payload.call_id
+          const ended = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          const started = callId ? openToolStarts.get(callId) : undefined
+          if (started !== undefined && Number.isFinite(ended) && ended > started) taskToolIntervals.push([started, ended])
+          if (callId) openToolStarts.delete(callId)
+          continue
+        }
+
+        if (entry.type === 'event_msg' && entry.payload?.type === 'task_complete') {
+          // #1088 BUG-8: task_complete's duration can arrive as {secs,nanos} or
+          // a string too (mcp_tool_call_end already tolerates both, below, via
+          // this same durationValueMs helper); read it the same permissive way
+          // instead of only the plain-number `duration_ms` field.
+          const durationMs = durationValueMs(entry.payload.duration_ms) ?? durationValueMs(entry.payload.duration)
+          if (typeof durationMs === 'number' && durationMs > 0 && taskGeneratedTokens > 0 && pendingTaskCalls.length > 0) {
+            const completedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+            // #1088 BUG-1: Codex fires task_started before it assembles the
+            // request, so the gap up to the first request-context event is
+            // CLI/harness startup, not model wait. The active window starts
+            // there instead of at task_started; task completion (windowEnd,
+            // inside mergeToolIntervals) is unchanged.
+            const activeWindowStart = taskActiveStartedAt ?? taskStartedAt
+            const startupGapMs = activeWindowStart !== undefined && taskStartedAt !== undefined
+              ? activeWindowStart - taskStartedAt
+              : 0
+            const effectiveDurationMs = Math.max(0, durationMs - startupGapMs)
+            // #1088 BUG-8: shared with codex-throughput.ts's live estimate
+            // instead of a second inline copy of the same clip/merge/cap.
+            const toolWaitMs = mergeToolIntervals(taskToolIntervals, effectiveDurationMs, activeWindowStart, Number.isFinite(completedAt) ? completedAt : undefined)
+            const activeMs = effectiveDurationMs - toolWaitMs
+            if (activeMs <= 0) continue
+            for (const call of pendingTaskCalls) {
+              // Reasoning is already inside output_tokens (#1075/#1078); the
+              // throughput numerator must agree with the cost numerator or
+              // Tok/s reads high for reasoning-heavy calls (#1079).
+              const generated = billableOutputTokens('codex', call.outputTokens, call.reasoningTokens)
+              if (generated <= 0) continue
+              call.activeGeneratedTokens = generated
+              call.activeDurationMs = activeMs * (generated / taskGeneratedTokens)
+              call.toolWaitMs = toolWaitMs * (generated / taskGeneratedTokens)
             }
           }
-          pendingToolSequence.push([call])
           continue
         }
 
@@ -445,14 +1006,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           pendingTools.push('Edit')
           const p = entry.payload as Record<string, unknown>
           const changes = p['changes']
-          const filePaths = typeof changes === 'object' && changes ? Object.keys(changes as object) : []
+          const changesObj = typeof changes === 'object' && changes ? changes as Record<string, unknown> : {}
+          const filePaths = Object.keys(changesObj)
           if (filePaths.length > 0) {
             for (const fp of filePaths) {
               pendingToolSequence.push([{ tool: 'Edit', file: fp }])
+              const diff = (changesObj[fp] as Record<string, unknown> | undefined)?.['unified_diff']
+              const loc = countUnifiedDiffLoc(diff)
+              pendingLocAdded += loc.added
+              pendingLocRemoved += loc.removed
             }
           } else {
             pendingToolSequence.push([{ tool: 'Edit' }])
           }
+          // Only an explicit failure counts; a missing `success` is treated as ok.
+          if (p['success'] === false) pendingEditFailed++
           continue
         }
 
@@ -461,6 +1029,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         // attributed. Rebuild the canonical `mcp__<server>__<tool>` name the
         // classifier recognizes.
         if (entry.type === 'event_msg' && entry.payload?.type === 'mcp_tool_call_end') {
+          const endedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          const durationMs = entry.payload.duration_ms ?? durationValueMs(entry.payload.duration)
+          if (typeof durationMs === 'number' && durationMs > 0 && Number.isFinite(endedAt)) {
+            taskToolIntervals.push([endedAt - durationMs, endedAt])
+          }
           const inv = (entry.payload as Record<string, unknown>)['invocation'] as Record<string, unknown> | undefined
           const server = typeof inv?.['server'] === 'string' ? inv['server'] as string : ''
           const tool = typeof inv?.['tool'] === 'string' ? inv['tool'] as string : ''
@@ -468,6 +1041,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             const name = `mcp__${server}__${tool}`
             pendingTools.push(name)
             pendingToolSequence.push([{ tool: name }])
+          }
+          continue
+        }
+
+        // Codex's item model records a finished shell command as
+        // `event_msg`/`item_completed` carrying a `CommandExecution` item whose
+        // `command` is the argv array (`["/bin/zsh","-lc","..."]`) - a shape the
+        // `function_call`-only tool path never reached, so a CLI-wrapped MCP call
+        // or a SKILL.md read made under it stayed invisible (#478). Attribution
+        // only: the exec's own Bash count comes from its response item, exactly
+        // as `exec_command_end` is left alone for the classic transport.
+        if (entry.type === 'event_msg' && entry.payload?.type === 'item_completed') {
+          const item = (entry.payload as Record<string, unknown>)['item'] as Record<string, unknown> | undefined
+          if (item && item['type'] === 'CommandExecution') {
+            attributeShellCommand(shellCommandText(item['command']), true)
           }
           continue
         }
@@ -508,12 +1096,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             const timestamp = entry.timestamp ?? ''
             const dedupKey = `codex:${sessionId}:${timestamp}:est${estCounter++}`
 
-            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; continue }
+            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingSkills = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
             seenKeys.add(dedupKey)
 
             const costUSD = calculateCost(model, estInput, estOutput, 0, 0, 0)
 
-            results.push({
+            pendingTaskCalls.push({
               provider: 'codex',
               model,
               inputTokens: estInput,
@@ -532,14 +1120,24 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
               deduplicationKey: dedupKey,
               turnId: currentTurnId,
               toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+              ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
               userMessage: pendingUserMessage,
               sessionId,
+              ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
+              ...(pendingLocAdded ? { locAdded: pendingLocAdded } : {}),
+              ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
+              ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
             })
+            taskGeneratedTokens += estOutput
 
             pendingTools = []
             pendingToolSequence = []
+            pendingSkills = []
             pendingUserMessage = ''
             pendingOutputChars = 0
+            pendingLocAdded = 0
+            pendingLocRemoved = 0
+            pendingEditFailed = 0
             continue
           }
 
@@ -555,12 +1153,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           const last = info.last_token_usage
           let inputTokens = 0
           let cachedInputTokens = 0
+          let cacheWriteTokens = 0
           let outputTokens = 0
           let reasoningTokens = 0
 
           if (last) {
             inputTokens = last.input_tokens ?? 0
             cachedInputTokens = last.cached_input_tokens ?? 0
+            cacheWriteTokens = last.cache_write_input_tokens ?? 0
             outputTokens = last.output_tokens ?? 0
             reasoningTokens = last.reasoning_output_tokens ?? 0
           } else if (cumulativeTotal > 0) {
@@ -568,6 +1168,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             if (!total) continue
             inputTokens = (total.input_tokens ?? 0) - prevInput
             cachedInputTokens = (total.cached_input_tokens ?? 0) - prevCached
+            cacheWriteTokens = (total.cache_write_input_tokens ?? 0) - prevCacheWrite
             outputTokens = (total.output_tokens ?? 0) - prevOutput
             reasoningTokens = (total.reasoning_output_tokens ?? 0) - prevReasoning
           }
@@ -583,6 +1184,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           if (total) {
             prevInput = total.input_tokens ?? 0
             prevCached = total.cached_input_tokens ?? 0
+            prevCacheWrite = total.cache_write_input_tokens ?? 0
             prevOutput = total.output_tokens ?? 0
             prevReasoning = total.reasoning_output_tokens ?? 0
           }
@@ -594,7 +1196,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           // Normalize to Anthropic semantics: inputTokens = non-cached only.
           const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
 
+          // Cache writes are carved out of the uncached input, never added to
+          // it: clamp so a malformed or lagging count can never drive the plain
+          // input bucket negative.
+          const cacheWriteInputTokens = Math.max(0, Math.min(cacheWriteTokens, uncachedInputTokens))
+
           const model = resolveModel(entry.payload, sessionModel)
+          // Only move tokens into the cache-write bucket when the pricing
+          // source publishes a real cache-write rate for this model (gpt-5.6+
+          // charges 1.25x input; everything before it charges nothing extra).
+          // Otherwise buildCosts' fabricated 1.25x default would invent a
+          // surcharge that OpenAI never billed, so the tokens stay where they
+          // already were -- in plain input, priced exactly as before.
+          const billedCacheWriteTokens = cacheWriteInputTokens > 0 && getModelCosts(model)?.cacheWriteCostIsExplicit
+            ? cacheWriteInputTokens
+            : 0
+          const billedInputTokens = uncachedInputTokens - billedCacheWriteTokens
           const timestamp = entry.timestamp ?? ''
           // Forked sessions copy the parent's entire token_count history
           // (re-timestamped), so replays must collide with the parent's events
@@ -612,24 +1229,32 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           // key would spuriously diverge on a replay and double-count it.
           const dedupKey = `codex:${forkedFromId || sessionId}:${cumulativeTotal}:${total?.input_tokens ?? 0}:${total?.cached_input_tokens ?? 0}:${total?.output_tokens ?? 0}:${total?.reasoning_output_tokens ?? 0}`
 
+          // A drop here can only be a byte-identical replay: the
+          // prevCumulativeTotal guard above already discards a repeated
+          // running total, so nothing reaching this point ever loses real
+          // tokens -- no active-time rescaling needed (#1088 investigation).
           if (seenKeys.has(dedupKey)) continue
           seenKeys.add(dedupKey)
 
+          // Reasoning tokens are already inside output_tokens, so they are NOT
+          // added here. The cache-rehydration twin of this line lives in
+          // src/parser.ts (cachedCallToApiCall); both call billableOutputTokens
+          // so a fresh parse and a cache read can never price differently.
           const costUSD = calculateCost(
             model,
-            uncachedInputTokens,
-            outputTokens + reasoningTokens,
-            0,
+            billedInputTokens,
+            billableOutputTokens('codex', outputTokens, reasoningTokens),
+            billedCacheWriteTokens,
             cachedInputTokens,
             0,
           )
 
-          results.push({
+          pendingTaskCalls.push({
             provider: 'codex',
             model,
-            inputTokens: uncachedInputTokens,
+            inputTokens: billedInputTokens,
             outputTokens,
-            cacheCreationInputTokens: 0,
+            cacheCreationInputTokens: billedCacheWriteTokens,
             cacheReadInputTokens: cachedInputTokens,
             cachedInputTokens,
             reasoningTokens,
@@ -642,23 +1267,46 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             deduplicationKey: dedupKey,
             turnId: currentTurnId,
             toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+            ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
             userMessage: pendingUserMessage,
             sessionId,
+            ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
+            ...(pendingLocAdded ? { locAdded: pendingLocAdded } : {}),
+            ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
+            ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
           })
+          taskGeneratedTokens += billableOutputTokens('codex', outputTokens, reasoningTokens)
 
           pendingTools = []
           pendingToolSequence = []
+          pendingSkills = []
           pendingUserMessage = ''
           pendingOutputChars = 0
+          pendingLocAdded = 0
+          pendingLocRemoved = 0
+          pendingEditFailed = 0
         }
       }
 
       // If the stream yielded nothing the file was unreadable, oversized, or
       // empty. Skip cache write so a transient failure can't pin an empty
-      // result set against a fingerprint that would otherwise be re-parsed.
-      if (!sawAnyLine) return
+      // result set against a fingerprint that would otherwise be re-parsed. On a
+      // resume the earlier calls are still valid output, so serve them - but
+      // still leave the cache entry alone.
+      if (!sawAnyLine) {
+        if (resume) for (const call of results) yield call
+        return
+      }
 
-      await writeCachedCodexResults(source.path, source.project, results, fp)
+      // Flush the final task, which has no following task_started to trigger it.
+      results.push(...pendingTaskCalls)
+
+      const resumeWrite = resumeState ? { offset: resumeOffset, state: resumeState, callCount: resumeCallCount } : undefined
+      if (capture) {
+        capture.write = { project: source.project, fingerprint: fp, ...(resumeWrite ? { resume: resumeWrite } : {}) }
+      } else {
+        await writeCachedCodexResults(source.path, source.project, results, fp, resumeWrite)
+      }
 
       for (const call of results) {
         yield call
@@ -667,8 +1315,54 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
   }
 }
 
-export function createCodexProvider(codexDir?: string): Provider {
+export type CodexFullParse = { calls: ParsedProviderCall[]; write?: CodexCacheWrite }
+
+/// Decode one rollout end to end, exactly as the serial path does for a file
+/// with no cache entry, without reading or writing the codex cache. `seenKeys`
+/// is the dedup set the decode runs against — pass an empty one off-thread and
+/// let the caller prove no earlier file claimed any of the keys before
+/// installing the result.
+export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<string>): Promise<CodexFullParse> {
+  const capture: { write?: CodexCacheWrite } = {}
+  const calls: ParsedProviderCall[] = []
+  for await (const call of createParser(source, seenKeys, capture).parse()) calls.push(call)
+  return { calls, ...(capture.write ? { write: capture.write } : {}) }
+}
+
+function rootsFor(home: string): ProbeRoot[] {
+  return [
+    { path: join(home, 'sessions'), label: 'sessions' },
+    { path: join(home, 'archived_sessions'), label: 'archived' },
+  ]
+}
+
+function dropOverlappingNestSources(sources: SessionSource[], billedHome: string): SessionSource[] {
+  const billedIds = listRolloutSessionIds(billedHome)
+  return sources.filter(source => {
+    const id = rolloutFileSessionId(source.path)
+    return !(id && billedIds.has(id))
+  })
+}
+
+export function createCodexProvider(
+  codexDir?: string,
+  opts?: { primaryDir?: string; launcherRoots?: string[] },
+): Provider {
   const dir = getCodexDir(codexDir)
+  const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
+  const launcherRoots = opts?.launcherRoots ?? defaultLauncherRoots()
+  // Explicit nest factory whose path is a realpath alias of the billed home:
+  // empty so a second factory cannot double-count the same tree. The no-arg
+  // singleton must not take this branch — CODEX_HOME may be that alias.
+  const duplicateHome =
+    codexDir !== undefined &&
+    sameCodexHome(dir, primaryDir) &&
+    resolve(dir) !== resolve(primaryDir)
+  const nestHome = isNestedLauncherCodexHome(dir, { primaryDir, launcherRoots })
+  // Production `codex` singleton is createCodexProvider() with no args. When
+  // the resolved dir is a launcher nest and ~/.codex is a distinct existing
+  // tree, walk BOTH and drop nest sources whose session id is already billed.
+  const scanBoth = nestHome && codexDir === undefined
 
   return {
     name: 'codex',
@@ -685,17 +1379,25 @@ export function createCodexProvider(codexDir?: string): Provider {
       return toolNameMap[rawTool] ?? rawTool
     },
 
-    // Same `dir` discoverSessionsInDir walks: <codexDir>/sessions (dated
-    // rollout files) and <codexDir>/archived_sessions. Honors CODEX_HOME.
+    // Trees discoverSessions actually walks. Honors CODEX_HOME; when the
+    // production singleton scans nest + billed home, both appear here.
     async probeRoots(): Promise<ProbeRoot[]> {
-      return [
-        { path: join(dir, 'sessions'), label: 'sessions' },
-        { path: join(dir, 'archived_sessions'), label: 'archived' },
-      ]
+      if (duplicateHome) return []
+      if (scanBoth) return [...rootsFor(primaryDir), ...rootsFor(dir)]
+      return rootsFor(dir)
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInDir(dir)
+      // Same physical tree via two factories is complete overlap, not a
+      // distinct nest. isNestedLauncherCodexHome is false in that case.
+      if (duplicateHome) return []
+      const sources = await discoverSessionsInDir(dir)
+      if (scanBoth) {
+        const billed = await discoverSessionsInDir(primaryDir)
+        return [...billed, ...dropOverlappingNestSources(sources, primaryDir)]
+      }
+      if (!nestHome) return sources
+      return dropOverlappingNestSources(sources, primaryDir)
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

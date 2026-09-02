@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult } from './cli'
+import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -14,9 +14,66 @@ let updateChecker: UpdateChecker | null = null
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
 
+type QuitTelemetry = Pick<Telemetry, 'trackClose' | 'flush'>
+type BeforeQuitEvent = { preventDefault: () => void }
+type BeforeQuitDeps = {
+  getTelemetry: () => QuitTelemetry | null
+  killAll: () => void | Promise<void>
+  quit: () => void
+  timeoutMs?: number
+}
+
+const QUIT_FLUSH_TIMEOUT_MS = 1500
+
+/** Intercept one quit pass, then allow the re-entrant pass after a bounded flush. */
+export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQuitEvent) => void {
+  let flushStarted = false
+  let allowQuit = false
+  let closeTracked = false
+
+  return event => {
+    if (allowQuit) return
+    try { event.preventDefault() } catch { /* keep the quit path moving */ }
+    if (flushStarted) return
+    flushStarted = true
+
+    void (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        let childCleanup: Promise<unknown> = Promise.resolve()
+        try { childCleanup = Promise.resolve(deps.killAll()).catch(() => undefined) } catch { /* child cleanup must not wedge quit */ }
+
+        let telemetry: QuitTelemetry | null = null
+        try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
+
+        let flush: Promise<unknown> = Promise.resolve(false)
+        if (telemetry) {
+          if (!closeTracked) {
+            closeTracked = true
+            try { telemetry.trackClose() } catch { /* flush the existing queue anyway */ }
+          }
+          try { flush = Promise.resolve(telemetry.flush()) } catch { /* use the resolved fallback */ }
+        }
+
+        const timeout = new Promise<void>(resolve => {
+          timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
+        })
+        await Promise.race([
+          Promise.all([flush.catch(() => false), childCleanup]),
+          timeout,
+        ])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        allowQuit = true
+        try { deps.quit() } catch { /* a throwing quit call must not reset the guard */ }
+      }
+    })()
+  }
+}
+
 // Result envelope: handlers never throw across IPC so the structured error
 // `kind` survives contextBridge serialization. preload.ts unwraps it.
-export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error: { kind: string; message: string } }
+export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error: { kind: string; message: string; cold?: true } }
 
 // The first overview fetch after boot hydrates a cold cache from scratch (a full
 // history parse). That can far exceed the 45s read timeout, and killing it means
@@ -24,9 +81,7 @@ export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error:
 // slowness. Give the first (cold) overview a long window; revert to the default
 // once it succeeds. Sections gate their own first poll on this one resolving so
 // the cold hydration runs ONCE, not once per section in parallel.
-const WARMUP_TIMEOUT_MS = 10 * 60_000
-// Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX).
-const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
+const WARMUP_TIMEOUT_MS = DESKTOP_COLD_TIMEOUT_MS
 // IPC channel carrying cold-start scan-progress events to the splash.
 export const PROGRESS_CHANNEL = 'codeburn:progress'
 // IPC channel pushing update-availability status to open windows (launch + 24h).
@@ -80,7 +135,7 @@ function configSourceArgs(source: string | null): string[] {
 // Renderer-supplied strings become argv, so reject anything that could smuggle a
 // flag or shell metacharacter before it reaches the CLI. Thrown from the argv
 // builders, these surface through the same error envelope as any CliError.
-const PERIODS = new Set(['today', 'week', '30days', 'month', 'all'])
+const PERIODS = new Set(['today', 'week', '30days', 'month', 'all', 'lifetime'])
 function vPeriod(period: string): string {
   if (!PERIODS.has(period)) throw new CliError('bad-args', 'invalid period')
   return period
@@ -111,6 +166,11 @@ function vConfigSource(source: string | null | undefined): string | null {
   if (source == null) return null
   if (!/^[A-Za-z0-9][A-Za-z0-9:_-]*$/.test(source)) throw new CliError('bad-args', 'invalid claude config source')
   return source
+}
+function vScope(scope: string | undefined): 'local' | 'combined' {
+  if (scope === 'combined') return 'combined'
+  if (scope === undefined || scope === 'local') return 'local'
+  throw new CliError('bad-args', 'invalid scope')
 }
 function vOutPath(outPath: string): string {
   if (outPath.startsWith('-') || !path.isAbsolute(outPath)) throw new CliError('bad-args', 'export path must be absolute')
@@ -161,7 +221,7 @@ function cliErrorProps(err: unknown, cmd: string | undefined): Record<string, un
 }
 
 type Deps = {
-  spawnCli: (args: string[], opts?: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv }) => Promise<unknown>
+  spawnCli: (args: string[], opts?: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv; priority?: SpawnPriority }) => Promise<unknown>
   spawnCliAction: (args: string[], opts?: { timeoutMs?: number }) => Promise<ActionResult>
   resolveCodeburnPath: () => string | null
   getQuota: typeof getQuota
@@ -200,14 +260,44 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     telemetry?.track('cold_start', { ms: Date.now() - (coldStartBegan ?? Date.now()), timedOut })
   }
 
-  const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
+  // Until the cold hydration finishes, EVERY read shares the overview's floor.
+  // Sections start polling the moment `ready` flips (which an overview error
+  // also does), and a 45s section spawn queued behind a still-running cold parse
+  // was killed on arrival — the `act report`/`plan` red panels in the repro.
+  const readOpts = (): { timeoutMs: number } | undefined =>
+    overviewWarmed ? undefined : { timeoutMs: WARMUP_TIMEOUT_MS }
+  // Marks a TIMEOUT that happened while the cold hydration was still running, so
+  // the renderer keeps the splash instead of painting a red error panel. Only
+  // timeouts: a permission or nonzero failure is real news even while cold.
+  //
+  // BOUNDED, deliberately. `overviewWarmed` only flips on success, so an install
+  // that can never hydrate would otherwise sit behind an indexing splash forever
+  // with no error and no way to reach the "Locate the CLI" recovery. Past the
+  // cold window itself, a timeout stops being "still indexing" and surfaces.
+  const bootedAt = Date.now()
+  const stillCold = (): boolean =>
+    !overviewWarmed && Date.now() - (coldStartBegan ?? bootedAt) < WARMUP_TIMEOUT_MS
+  const coldError = (err: unknown): { kind: string; message: string; cold?: true } => {
+    const error = toEnvelopeError(err)
+    return stillCold() && error.kind === 'timeout' ? { ...error, cold: true } : error
+  }
+
+  const run = (build: (...args: any[]) => string[], backgroundIndex?: number): Handler => async (...args: any[]) => {
     let cmd: string | undefined
     try {
-      const argv = build(...args)
+      const background = backgroundIndex !== undefined && args[backgroundIndex] === true
+      // `background` is renderer scheduling metadata, not a CLI argument.
+      const argv = build(...(backgroundIndex === undefined ? args : args.slice(0, backgroundIndex)))
       cmd = argv[0]
-      return { ok: true, value: await deps.spawnCli(argv) }
+      const baseOpts = readOpts()
+      return {
+        ok: true,
+        value: await deps.spawnCli(argv, background
+          ? { ...(baseOpts ?? {}), priority: 'background' }
+          : baseOpts),
+      }
     } catch (err) {
-      const error = toEnvelopeError(err)
+      const error = coldError(err)
       telemetry?.track('cli_error', cliErrorProps(err, cmd))
       return { ok: false, error }
     }
@@ -216,27 +306,41 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // The desktop never renders the granular timeline, so it always passes
   // --no-timeline (skips buildGranularHistory on every poll). The Swift menubar
   // omits the flag and keeps the timeline unchanged.
-  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null): string[] => [
-    'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
-    ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
-  ]
+  //
+  // Combined scope aggregates paired-device usage: the CLI rejects --scope
+  // combined alongside --provider/--project/--exclude (paired devices report
+  // unfiltered usage), so the provider filter is dropped in that mode. The
+  // caller (renderer) forces provider='all' when combined, so nothing is lost.
+  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string): string[] => {
+    const vScopeValue = vScope(scope)
+    return [
+      'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
+      ...(vScopeValue === 'combined' ? ['--scope', 'combined'] : providerArgs(vProvider(provider))),
+      ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
+    ]
+  }
 
-  const getOverview: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null) => {
+  // `background` (renderer prefetch only) drops this fetch to background priority
+  // so it yields the CLI's run slots to any interactive poll or click. Optional
+  // and defaulting to interactive, so an older preload that omits it is unchanged.
+  const getOverview: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => {
     coldStartBegan ??= Date.now()
+    const priority: SpawnPriority | undefined = background ? 'background' : undefined
     try {
-      const args = buildOverviewArgs(period, provider, range, configSource)
-      if (overviewWarmed) return { ok: true, value: await deps.spawnCli(args) }
+      const args = buildOverviewArgs(period, provider, range, configSource, scope)
+      if (overviewWarmed) return { ok: true, value: await deps.spawnCli(args, priority ? { priority } : undefined) }
       const value = await deps.spawnCli(args, {
         timeoutMs: WARMUP_TIMEOUT_MS,
         extraEnv: { CODEBURN_PROGRESS: '1' },
         onStderr: makeProgressReader(emitProgress),
+        ...(priority ? { priority } : {}),
       })
       overviewWarmed = true
       emitProgress({ kind: 'done' })
       emitColdStart(false)
       return { ok: true, value }
     } catch (err) {
-      const error = toEnvelopeError(err)
+      const error = coldError(err)
       if (!overviewWarmed) emitColdStart(error.kind === 'timeout')
       telemetry?.track('cli_error', cliErrorProps(err, 'status'))
       return { ok: false, error }
@@ -252,34 +356,39 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   }
 
   return {
-    'codeburn:getQuota': async (force?: boolean) => {
-      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force) }) } }
+    'codeburn:getQuota': async (force?: boolean, disabled?: string[]) => {
+      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force), disabled }) } }
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,
-    'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)]),
+    // Timeline variant for the Spend punchcard only: identical payload WITH
+    // history.timeline (every other fetch keeps --no-timeline lean).
+    'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
+      'status', '--format', 'menubar-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+    ]),
+    'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)], 1),
     'codeburn:getActReport': run(() => ['act', 'report', '--json']),
     'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [
       'models', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...(byTask ? ['--by-task'] : []), ...rangeArgs(vRange(range)),
-    ]),
+    ], 4),
     'codeburn:getSessions': run((period: string, provider: string, range?: DateRange) => [
       'sessions', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getCompareModels': run((period: string, provider: string) => [
       'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
-    ]),
+    ], 2),
     'codeburn:getCompare': run((period: string, provider: string, modelA: string, modelB: string) => [
       'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), '--model-a', vToken(modelA), '--model-b', vToken(modelB),
     ]),
     'codeburn:getYield': run((period: string, provider: string, range?: DateRange) => [
       'yield', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
       'spend', '--format', 'flow-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getOptimizeReport': run((period: string, provider: string, range?: DateRange) => [
       'optimize', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getDevices': run((period: string) => ['devices', '--format', 'json', '--period', vPeriod(period)]),
     'codeburn:getDevicesScan': run(() => ['devices', 'scan', '--format', 'json']),
     'codeburn:getShareStatus': run(() => ['share', 'status', '--format', 'json']),
@@ -318,6 +427,33 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // One-shot read of the cached update-availability status. The check itself
     // runs in the background (launch + 24h); this returns whatever is known.
     'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
+    // Plugin management reads (all return parsed JSON)
+    'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
+    'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
+    'codeburn:syncAutoStatus': run(() => ['sync', 'auto', 'status', '--json']),
+    // Plugin management mutations
+    'codeburn:pluginAdd': runAction((source: string) => ['plugin', 'add', vToken(source)]),
+    'codeburn:pluginRemove': runAction((name: string) => ['plugin', 'remove', vToken(name), '--confirm']),
+    'codeburn:pluginVerify': runAction((name: string) => ['plugin', 'verify', vToken(name)]),
+    // Sync auto enable: special case - when accept=false, capture disclosure text from stdout
+    'codeburn:syncAutoEnable': async (cadence?: string, attribution?: boolean, accept?: boolean) => {
+      try {
+        const args = ['sync', 'auto', 'enable', '--cadence', cadence === 'hourly' ? 'hourly' : 'daily']
+        if (attribution) args.push('--attribution')
+        if (accept) args.push('--accept')
+
+        const result = await deps.spawnCliAction(args)
+        // When accept=false, the disclosure text is in stdout, we return it for display
+        // When accept=true, it succeeds with no special output needed
+        if (!accept && result.stdout) {
+          return { ok: true, value: { ok: true, disclosure: result.stdout, code: result.code } }
+        }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+      } catch (err) {
+        return { ok: false, error: toEnvelopeError(err) }
+      }
+    },
+    'codeburn:syncAutoDisable': runAction(() => ['sync', 'auto', 'disable']),
   }
 }
 
@@ -430,11 +566,9 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Chromium's default (kept explicit): when the window is minimized or fully
-      // occluded the renderer's document.visibilityState flips to 'hidden' and a
-      // visibilitychange fires. usePolled and the flame animation gate on that to
-      // stop background CLI polls and compositor wakeups while hidden. A merely
-      // unfocused-but-visible window stays 'visible' and keeps polling.
+      // Keep Chromium's normal background throttling so minimizing/occluding the
+      // window updates the Page Visibility API and pauses renderer animations.
+      // Data intervals remain registered and use a visibility catch-up on return.
       backgroundThrottling: true,
     },
   })
@@ -485,14 +619,21 @@ function bootstrap(): void {
     win.focus()
   })
 
-  app.on('before-quit', () => {
-    killAll()
-    // Best-effort final beat: session duration + whatever is still queued.
-    telemetryInstance?.trackClose()
-    void telemetryInstance?.flush()
-  })
+  app.on('before-quit', createBeforeQuitHandler({
+    getTelemetry: () => telemetryInstance,
+    killAll: shutdownAll,
+    quit: () => app.quit(),
+  }))
 
   void app.whenReady().then(() => {
+    // Start the resident child early, but issue no artificial warm-up query:
+    // the first real overview request is the single cache hydration and streams
+    // its progress through serve. Every later panel reuses that parsed cache.
+    // A crash leaves no one to close the previous child's stdin, so reap it
+    // first — orphans hold FSEvents handles and a stale cache refresh lock.
+    const servePidFile = path.join(app.getPath('userData'), 'serve.pid')
+    reapOrphanServe(servePidFile)
+    startServe(servePidFile)
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
     // the onboarding consent screen is completed and the toggle is on; EU/EEA/
     // UK/CH installs default the toggle off. Dev builds never send.

@@ -1,17 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readFile, rm, writeFile, mkdir } from 'fs/promises'
+import { readFile, rm, utimes, writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 
 import {
   CACHE_VERSION,
+  PROVIDER_ENV_VARS,
   type CachedCall,
   type CachedFile,
   type CachedTurn,
   type FileFingerprint,
   type SessionCache,
   cleanupOrphanedTempFiles,
+  clearLoadCacheMemo,
   computeEnvFingerprint,
   emptyCache,
   fingerprintFile,
@@ -19,11 +21,13 @@ import {
   mergeCallByDedupKey,
   reconcileFile,
   saveCache,
-  sessionCachePath,
+  sessionCacheDir,
+  sourcePathStatCandidates,
 } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
-// Version-suffixed filename (e.g. session-cache.v5.json) the cache now writes to.
-const CACHE_FILE = () => basename(sessionCachePath())
+// Version-suffixed directory (e.g. session-cache.v8) the cache now writes to.
+const CACHE_DIR = () => basename(sessionCacheDir())
 
 const TMP_DIR = join(tmpdir(), `codeburn-scache-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
 
@@ -183,8 +187,7 @@ describe('loadCache / saveCache', () => {
 
   it('atomic write does not leave partial file on error', async () => {
     await saveCache(emptyCache())
-    const raw = await readFile(sessionCachePath(), 'utf-8')
-    expect(JSON.parse(raw)).toEqual(emptyCache())
+    expect(await readCacheOnDisk()).toEqual(emptyCache())
   })
 })
 
@@ -194,14 +197,15 @@ describe('versioned cache file + legacy adoption', () => {
   function validCache(): SessionCache {
     return {
       version: CACHE_VERSION,
+      complete: false,
       providers: { claude: { envFingerprint: 'abc123', files: { '/path/to/session.jsonl': makeCachedFile() } } },
     }
   }
 
-  it('writes and reads the version-suffixed file, never the legacy name', async () => {
-    expect(basename(sessionCachePath())).toBe(`session-cache.v${CACHE_VERSION}.json`)
+  it('writes and reads the version-suffixed directory, never the legacy name', async () => {
+    expect(basename(sessionCacheDir())).toBe(`session-cache.v${CACHE_VERSION}`)
     await saveCache(validCache())
-    expect(existsSync(sessionCachePath())).toBe(true)
+    expect(existsSync(sessionCacheDir())).toBe(true)
     expect(existsSync(join(TMP_DIR, 'session-cache.json'))).toBe(false)
     expect(await loadCache()).toEqual(validCache())
   })
@@ -211,9 +215,9 @@ describe('versioned cache file + legacy adoption', () => {
     const legacy = join(TMP_DIR, 'session-cache.json')
     await writeFile(legacy, JSON.stringify(validCache()))
 
-    // Versioned file absent → adopt-copy from legacy on first load.
+    // Versioned directory absent → adopt-copy from legacy on first load.
     expect(await loadCache()).toEqual(validCache())
-    expect(existsSync(sessionCachePath())).toBe(true)
+    expect(existsSync(sessionCacheDir())).toBe(true)
     // Legacy left intact (not deleted, not rewritten).
     expect(existsSync(legacy)).toBe(true)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(validCache())
@@ -222,7 +226,7 @@ describe('versioned cache file + legacy adoption', () => {
     // file exists.
     const mutated: SessionCache = { version: CACHE_VERSION, providers: { codex: { envFingerprint: 'zzz', files: {} } } }
     await writeFile(legacy, JSON.stringify(mutated))
-    expect(await loadCache()).toEqual(validCache())
+    expect(await readCacheOnDisk()).toEqual(validCache())
   })
 
   it('ignores a different-version legacy file and never touches it', async () => {
@@ -232,8 +236,8 @@ describe('versioned cache file + legacy adoption', () => {
     await writeFile(legacy, JSON.stringify(stale))
 
     expect((await loadCache()).providers).toEqual({})
-    // No versioned file adopted; legacy left byte-intact.
-    expect(existsSync(sessionCachePath())).toBe(false)
+    // No versioned directory adopted; legacy left byte-intact.
+    expect(existsSync(sessionCacheDir())).toBe(false)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(stale)
   })
 
@@ -244,9 +248,9 @@ describe('versioned cache file + legacy adoption', () => {
     await writeFile(legacy, legacyContent)
 
     await saveCache(validCache())
-    // The versioned file holds the new data; the legacy file is byte-untouched.
+    // The shards hold the new data; the legacy file is byte-untouched.
     expect(await readFile(legacy, 'utf-8')).toBe(legacyContent)
-    expect(JSON.parse(await readFile(sessionCachePath(), 'utf-8'))).toEqual(validCache())
+    expect(await readCacheOnDisk()).toEqual(validCache())
   })
 })
 
@@ -278,6 +282,129 @@ describe('computeEnvFingerprint', () => {
     expect(computeEnvFingerprint('copilot')).not.toBe(computeEnvFingerprint('unknown-provider'))
     expect(computeEnvFingerprint('kiro')).not.toBe(computeEnvFingerprint('unknown-provider'))
     expect(computeEnvFingerprint('warp')).not.toBe(computeEnvFingerprint('unknown-provider'))
+  })
+})
+
+// ── provider env overrides invalidate the fingerprint (#920) ─────────────
+
+describe('provider env overrides invalidate the fingerprint (#920)', () => {
+  // Nine providers honored an env var that relocates where discovery looks
+  // without the var being declared in PROVIDER_ENV_VARS, so
+  // computeEnvFingerprint did not hash it and the cache section survived the
+  // change: sessions parsed from the old root kept being reported and the new
+  // root was never read. Each pair below must change the fingerprint when the
+  // var is set. codex/CODEX_HOME is the control — it already worked and must
+  // keep working.
+  const CASES: Array<[provider: string, varName: string]> = [
+    ['kiro', 'KIRO_HOME'],
+    ['grok', 'GROK_HOME'],
+    ['kimi', 'KIMI_SHARE_DIR'],
+    ['mux', 'MUX_ROOT'],
+    ['mistral-vibe', 'VIBE_HOME'],
+    ['zerostack', 'ZS_DATA_DIR'],
+    ['codebuff', 'CODEBUFF_DATA_DIR'],
+    ['goose', 'GOOSE_PATH_ROOT'],
+    ['crush', 'CRUSH_GLOBAL_DATA'],
+    ['codex', 'CODEX_HOME'],
+  ]
+  const VARS = CASES.map(([, varName]) => varName)
+
+  // Save and restore every var we touch (beforeEach/afterEach), so a leaked
+  // env var never breaks unrelated tests in the same worker — and an ambient
+  // value never makes the "unset" case a lie.
+  const saved = new Map<string, string | undefined>()
+
+  beforeEach(() => {
+    for (const varName of VARS) {
+      saved.set(varName, process.env[varName])
+      delete process.env[varName]
+    }
+  })
+
+  afterEach(() => {
+    for (const varName of VARS) {
+      const original = saved.get(varName)
+      if (original === undefined) delete process.env[varName]
+      else process.env[varName] = original
+    }
+  })
+
+  for (const [provider, varName] of CASES) {
+    it(`changes the ${provider} fingerprint when ${varName} is set`, () => {
+      const unset = computeEnvFingerprint(provider)
+      process.env[varName] = '/tmp/codeburn-920-override'
+      const set = computeEnvFingerprint(provider)
+      expect(set).not.toBe(unset)
+      // Round trip: restoring the variable to its original state restores the
+      // original fingerprint, so the hash is a pure function of the
+      // environment.
+      delete process.env[varName]
+      expect(computeEnvFingerprint(provider)).toBe(unset)
+    })
+  }
+
+  it('changes the vercel-gateway fingerprint when AI_GATEWAY_API_KEY is set', () => {
+    const prev = process.env['AI_GATEWAY_API_KEY']
+    try {
+      const unset = computeEnvFingerprint('vercel-gateway')
+      process.env['AI_GATEWAY_API_KEY'] = 'sk-live-secret-abc'
+      const set = computeEnvFingerprint('vercel-gateway')
+      expect(set).not.toBe(unset)
+      delete process.env['AI_GATEWAY_API_KEY']
+      expect(computeEnvFingerprint('vercel-gateway')).toBe(unset)
+    } finally {
+      if (prev === undefined) delete process.env['AI_GATEWAY_API_KEY']
+      else process.env['AI_GATEWAY_API_KEY'] = prev
+    }
+  })
+
+  // Copilot is deliberately NOT declared in PROVIDER_ENV_VARS (Ruling 1 of
+  // lane 04): its OTel discovery returns one source per DB file
+  // ({ path: dbPath }, src/providers/copilot.ts:1935), and the durable
+  // carry-forward in getOrCreateProviderSection (src/parser.ts:2650) drops
+  // every cached entry whose source still exists on a fingerprint change — so
+  // declaring any CODEBURN_COPILOT_* var would force a re-parse that destroys
+  // conversations Copilot has since pruned from the DB, which only the cache
+  // still holds. The fingerprint must therefore NOT move when one is set.
+  // This reads as intent, not as an oversight — and the assertions below pin
+  // the WHOLE invariant (no entry at all, plus every one of the nine deferred
+  // reads), so a future "completing" edit fails a test instead of silently
+  // re-opening the durable history-loss path.
+  describe('copilot is deliberately undeclared in PROVIDER_ENV_VARS', () => {
+    it('has no PROVIDER_ENV_VARS entry at all', () => {
+      expect(PROVIDER_ENV_VARS['copilot']).toBeUndefined()
+    })
+
+    // The nine reads copilot.ts performs whose declaration is deferred (each
+    // is allowlisted in tests/provider-env-declarations.test.ts): setting any
+    // of them must leave the copilot fingerprint untouched.
+    const DEFERRED_COPILOT_VARS = [
+      'CODEBURN_COPILOT_SESSION_STATE_DIR',
+      'CODEBURN_COPILOT_OTEL_DB',
+      'CODEBURN_COPILOT_JETBRAINS_DIR',
+      'CODEBURN_COPILOT_WS_STORAGE_DIR',
+      'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR',
+      'CODEBURN_COPILOT_DISABLE_OTEL',
+      'APPDATA',
+      'LOCALAPPDATA',
+      'XDG_CONFIG_HOME',
+    ]
+
+    for (const varName of DEFERRED_COPILOT_VARS) {
+      it(`does not move the copilot fingerprint when ${varName} is set (deliberately undeclared)`, () => {
+        const prev = process.env[varName]
+        try {
+          const before = computeEnvFingerprint('copilot')
+          process.env[varName] = `/tmp/codeburn-copilot-920/${varName}`
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+          delete process.env[varName]
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+        } finally {
+          if (prev === undefined) delete process.env[varName]
+          else process.env[varName] = prev
+        }
+      })
+    }
   })
 })
 
@@ -337,6 +464,78 @@ describe('fingerprintFile', () => {
     expect(fp).not.toBeNull()
     expect(fp!.sizeBytes).toBe(9)
   })
+
+  // SQLite WAL mode parks committed writes in `<db>-wal`; the main file's
+  // stat only moves on checkpoint, which a long-lived writer defers for
+  // hours. A fingerprint from the main file alone reports data older than
+  // what is really committed (issue #913). The WAL sibling must be folded in.
+  it('folds -wal sibling into a # compound fingerprint (Hermes session)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'state.db')
+    await writeFile(dbPath, 'main-db')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'wal-frames')
+
+    const fp = await fingerprintFile(`${dbPath}#hermes-session=abc`)
+    expect(fp).not.toBeNull()
+    // mtime: the fresh WAL wins over the checkpoint-stale main file.
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    // size: main + wal, so WAL growth alone changes the fingerprint.
+    expect(fp!.sizeBytes).toBe('main-db'.length + 'wal-frames'.length)
+  })
+
+  it('folds -wal sibling into a : compound fingerprint (OpenCode session)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'opencode.db')
+    await writeFile(dbPath, 'oc-db')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'oc-wal')
+
+    const fp = await fingerprintFile(`${dbPath}:ses_abc123`)
+    expect(fp).not.toBeNull()
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    expect(fp!.sizeBytes).toBe('oc-db'.length + 'oc-wal'.length)
+  })
+
+  it('folds -wal sibling into a bare SQLite path (copilot agent-traces.db)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'agent-traces.db')
+    await writeFile(dbPath, 'traces')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'traces-wal')
+
+    const fp = await fingerprintFile(dbPath)
+    expect(fp).not.toBeNull()
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    expect(fp!.sizeBytes).toBe('traces'.length + 'traces-wal'.length)
+  })
+
+  it('keeps compound fingerprints working when no -wal sibling exists', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'state.db')
+    await writeFile(dbPath, 'main-only')
+
+    const fp = await fingerprintFile(`${dbPath}#hermes-session=abc`)
+    expect(fp).not.toBeNull()
+    expect(fp!.sizeBytes).toBe('main-only'.length)
+  })
+
+  it('does not fold sibling files into non-SQLite fingerprints', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const filePath = join(TMP_DIR, 'session.jsonl')
+    await writeFile(filePath, 'jsonl-data')
+    // A stray neighbor that happens to match the -wal naming must not leak
+    // into a transcript fingerprint (offset-based append detection relies on
+    // sizeBytes being the transcript's real byte length).
+    await writeFile(`${filePath}-wal`, 'stray')
+
+    const fp = await fingerprintFile(filePath)
+    expect(fp).not.toBeNull()
+    expect(fp!.sizeBytes).toBe('jsonl-data'.length)
+  })
 })
 
 // ── reconcileFile ──────────────────────────────────────────────────────
@@ -385,6 +584,17 @@ describe('reconcileFile', () => {
     })
     const changed: FileFingerprint = { dev: 1, ino: 100, mtimeMs: 2000, sizeBytes: 6000 }
     expect(reconcileFile(changed, marker)).toEqual({ action: 'modified' })
+  })
+
+  it('returns "modified" when the cached offset is stranded beyond the current EOF', () => {
+    // A truncate-then-regrow can leave the resume offset past live bytes; resuming
+    // there would drop the appended tail, so it must fall back to a full re-parse.
+    const cached = makeCachedFile({
+      fingerprint: { dev: 1, ino: 100, mtimeMs: 1000, sizeBytes: 5000 },
+      lastCompleteLineOffset: 9_000_000,
+    })
+    const current: FileFingerprint = { dev: 1, ino: 100, mtimeMs: 2000, sizeBytes: 8000 }
+    expect(reconcileFile(current, cached)).toEqual({ action: 'modified' })
   })
 
   it('returns "modified" when size shrank', () => {
@@ -612,7 +822,7 @@ describe('loadCache validation', () => {
       } } },
     }
     await writeRawCache(cache)
-    expect((await loadCache())).toEqual(cache)
+    expect(await loadCache()).toEqual(cache)
   })
 
   it('accepts a fully valid cache with all fields populated', async () => {
@@ -637,7 +847,8 @@ describe('cleanupOrphanedTempFiles', () => {
   it('removes .tmp files older than 5 minutes', async () => {
     await mkdir(TMP_DIR, { recursive: true })
 
-    const oldTmp = join(TMP_DIR, `${CACHE_FILE()}.abc123.tmp`)
+    await mkdir(join(TMP_DIR, CACHE_DIR()), { recursive: true })
+    const oldTmp = join(TMP_DIR, CACHE_DIR(), 'claude.abc123.json.tmp')
     await writeFile(oldTmp, 'stale')
     const { utimes } = await import('fs/promises')
     const oldTime = new Date(Date.now() - 10 * 60 * 1000)
@@ -650,7 +861,8 @@ describe('cleanupOrphanedTempFiles', () => {
   it('preserves recent .tmp files', async () => {
     await mkdir(TMP_DIR, { recursive: true })
 
-    const recentTmp = join(TMP_DIR, `${CACHE_FILE()}.def456.tmp`)
+    await mkdir(join(TMP_DIR, CACHE_DIR()), { recursive: true })
+    const recentTmp = join(TMP_DIR, CACHE_DIR(), 'claude.def456.json.tmp')
     await writeFile(recentTmp, 'recent')
 
     await cleanupOrphanedTempFiles()
@@ -673,5 +885,94 @@ describe('cleanupOrphanedTempFiles', () => {
   it('does not fail when cache dir does not exist', async () => {
     process.env['CODEBURN_CACHE_DIR'] = '/no/such/dir'
     await cleanupOrphanedTempFiles()
+  })
+})
+
+// ── loadCache memo (serve fast-path) ─────────────────────────────────────
+
+describe('loadCache memo', () => {
+  it('returns the identical object while the file is unchanged, reloads on rewrite', async () => {
+    clearLoadCacheMemo()
+    const cache = emptyCache()
+    cache.providers['memo-test'] = { envFingerprint: 'x', files: {} }
+    await saveCache(cache)
+
+    // saveCache write-through: the very object just published is served back.
+    const first = await loadCache()
+    expect(first).toBe(cache)
+    const second = await loadCache()
+    expect(second).toBe(first)
+
+    // An external rewrite (another process) moves mtime/size: fresh parse.
+    const external = emptyCache()
+    external.providers['memo-test-2'] = { envFingerprint: 'y', files: {} }
+    await saveCache(external)
+    const third = await loadCache()
+    expect(third).toBe(external)
+    expect(third).not.toBe(first)
+    clearLoadCacheMemo()
+  })
+})
+
+describe('sourcePathStatCandidates', () => {
+  it('mirrors the fingerprint fallbacks: plain, #-suffixed, and :-suffixed paths', () => {
+    expect(sourcePathStatCandidates('/a/b/state.vscdb')).toEqual(['/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/state.vscdb#cursor-ws=ws1'))
+      .toEqual(['/a/b/state.vscdb#cursor-ws=ws1', '/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/db.sqlite:sess-1'))
+      .toEqual(['/a/b/db.sqlite:sess-1', '/a/b/db.sqlite'])
+    // A plain Windows path must NOT yield the bare drive letter — a stat
+    // error on a cwd-relative 'C' must never hold hydration.
+    expect(sourcePathStatCandidates('C:\\data\\gone.jsonl')).toEqual(['C:\\data\\gone.jsonl'])
+  })
+})
+
+// A scoped load must read DURABLE_PROVIDER_NAMES providers in full even when
+// the persisted section carries no durable stamp (a section written before
+// the stamp landed, or by an older codeburn): copilot's serve-time
+// reconciliation runs over the complete serve set, and a scope-skipped shard
+// would silently make it range-dependent.
+describe('scoped load durable-by-name exemption', () => {
+  it('loads an unstamped copilot section in full while scoping out a non-durable control', async () => {
+    const oldTurnTs = '2026-01-10T10:00:00.000Z'
+    const fileWithJanTurn = (): CachedFile => makeCachedFile({
+      turns: [{ ...makeTurn(), timestamp: oldTurnTs }],
+    })
+    await writeCacheOnDisk({
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        // Deliberately NO durable stamp on either section.
+        copilot: { envFingerprint: computeEnvFingerprint('copilot'), files: { '/x/session-store.db': fileWithJanTurn() } },
+        claude: { envFingerprint: computeEnvFingerprint('claude'), files: { '/x/old.jsonl': fileWithJanTurn() } },
+      },
+    })
+    const scoped = await loadCache({ fromMonth: '2026-06', toMonth: '2026-07' })
+    // The claude control proves the scope actually skipped the January shard;
+    // copilot's presence is then attributable only to the by-name exemption.
+    expect(scoped.providers['claude']?.files?.['/x/old.jsonl']).toBeUndefined()
+    expect(scoped.providers['copilot']?.files?.['/x/session-store.db']?.turns).toHaveLength(1)
+  })
+})
+
+// Capture-only copilot billing metadata must survive the sharded save/load
+// round trip — including the per-shard call validation, which would silently
+// drop the call if the optional-field checks and the fields ever disagree.
+describe('copilot billing metadata round trip', () => {
+  it('keeps nanoAiu and requestMultiplier through save and load', async () => {
+    const file = makeCachedFile()
+    file.turns[0]!.calls[0] = { ...file.turns[0]!.calls[0]!, nanoAiu: 24594000000, requestMultiplier: 15 }
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: false,
+      providers: { copilot: { envFingerprint: 'fp-1', durable: true, files: { '/home/u/.copilot/session-store.db': file } } },
+    }
+    await saveCache(cache)
+    // Through the DISK, not the write-through memo — the read path is where
+    // the per-shard call validator could strip unknown or mistyped fields.
+    const loaded = await readCacheOnDisk()
+    const call = loaded.providers['copilot']!.files['/home/u/.copilot/session-store.db']!.turns[0]!.calls[0]!
+    expect(call.nanoAiu).toBe(24594000000)
+    expect(call.requestMultiplier).toBe(15)
   })
 })

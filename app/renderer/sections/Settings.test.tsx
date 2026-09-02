@@ -52,6 +52,9 @@ const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
   setItem: (key: string, value: string) => stored.set(key, value),
+  removeItem: (key: string) => stored.delete(key),
+  key: (index: number) => [...stored.keys()][index] ?? null,
+  get length() { return stored.size },
   clear: () => stored.clear(),
 })
 
@@ -126,6 +129,22 @@ describe('Settings', () => {
     expect(screen.queryByText('Claude config')).not.toBeInTheDocument()
   })
 
+  it('discloses and clears local report snapshots without deleting preferences', async () => {
+    stored.set('codeburn.reportSnapshot.v1.sessions|today|all|-||2026-08-28', '{"at":1}')
+    stored.set('codeburn.overview-headlines.v2', '{}')
+    stored.set('codeburn.theme', 'dark')
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(screen.getByText('Local report snapshots')).toBeInTheDocument()
+    expect(screen.getByText(/Calculated usage and cost reports/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear snapshots' }))
+    expect([...stored.keys()].some(key => key.startsWith('codeburn.reportSnapshot.v1.'))).toBe(false)
+    expect(stored.has('codeburn.overview-headlines.v2')).toBe(false)
+    expect(stored.get('codeburn.theme')).toBe('dark')
+    expect(await screen.findByText('Cached report snapshots cleared')).toBeInTheDocument()
+  })
+
   it('stores a positive daily budget from General', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
@@ -143,6 +162,17 @@ describe('Settings', () => {
     await user.type(screen.getByLabelText('Daily budget amount'), '-5')
     expect(screen.getByText('Enter a positive number.')).toBeInTheDocument()
     expect(localStorage.getItem('codeburn.dailyBudget')).toBeFalsy()
+  })
+
+  it('reflects the current scope and reports a change through onScopeChange', async () => {
+    const user = userEvent.setup()
+    const onScopeChange = vi.fn()
+    render(<Settings period="month" scope="local" onScopeChange={onScopeChange} />)
+    const scope = screen.getByLabelText('Scope')
+    expect(scope).toHaveTextContent('Local')
+    await user.click(scope)
+    await user.click(screen.getByRole('option', { name: 'Combined' }))
+    expect(onScopeChange).toHaveBeenCalledWith('combined')
   })
 
   it('lists providers from the real overview payload', async () => {
@@ -245,7 +275,7 @@ describe('Settings', () => {
     expect(await screen.findByText('Detected subscriptions')).toBeInTheDocument()
     expect(screen.getByText('Max 20x')).toBeInTheDocument()
     expect(screen.getByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
-    expect(mocks.getQuota).toHaveBeenCalledWith(false)
+    expect(mocks.getQuota).toHaveBeenCalledWith(false, [])
   })
 
   it('expands the DetectedRow Connect affordance and forces a keychain refresh', async () => {
@@ -257,7 +287,7 @@ describe('Settings', () => {
     expect(screen.getByText('codex login')).toBeInTheDocument()
     mocks.getQuota.mockClear()
     await user.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true, []))
   })
 
   it('offers only non-OAuth budget presets; Claude and Codex are excluded', async () => {

@@ -7,20 +7,25 @@ import { Dropdown } from '../components/Dropdown'
 import { Panel } from '../components/Panel'
 import { ProviderLogo } from '../components/ProviderLogo'
 import type { Section } from '../components/Sidebar'
-import { usePolled } from '../hooks/usePolled'
-import { releasePageUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
+import { clearPolledMemo, usePolled } from '../hooks/usePolled'
+import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
 import { version as appVersion } from '../../package.json'
 import { readDailyBudget } from '../lib/budget'
 import { formatConverted, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { shortcutLabel } from '../lib/platform'
 import { motionClass } from '../lib/motion'
+import { clearOverviewHeadlines } from '../lib/overviewSnapshot'
+import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledProviders } from '../lib/providers'
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import { showToast } from '../lib/toast'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
-import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import { SharingPane } from './SettingsSharing'
+import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 
-export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy'
+export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing'
 type Pane = SettingsPane
 type Theme = 'system' | 'light' | 'dark'
 
@@ -60,6 +65,7 @@ const RAIL_ITEMS: Array<{ id: Pane; label: string; icon: React.ReactNode }> = [
   { id: 'plans', label: 'Plans', icon: <><rect x="2" y="5" width="20" height="14" rx="2" /><line x1="2" y1="10" x2="22" y2="10" /></> },
   { id: 'devices', label: 'Devices', icon: <><rect x="3" y="4" width="18" height="12" rx="1.5" /><line x1="8" y1="20" x2="16" y2="20" /><line x1="12" y1="16" x2="12" y2="20" /></> },
   { id: 'export', label: 'Export', icon: <><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M4 21h16" /></> },
+  { id: 'sharing', label: 'Automatic Sync', icon: <><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M4 21h16" /></> },
   { id: 'privacy', label: 'Privacy & data', icon: <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" /> },
 ]
 
@@ -97,7 +103,7 @@ function ConfirmButton({ label, prompt, onConfirm }: { label: string; prompt: st
   )
 }
 
-export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void }) {
+export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
   const [pane, setPane] = useState<Pane>(initialPane ?? 'general')
 
   return (
@@ -113,24 +119,27 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
           ))}
         </nav>
         <main className="set-pane">
-          {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} />}
+          {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} />}
           {pane === 'providers' && <ProvidersPane period={period} refreshToken={refreshToken} />}
           {pane === 'aliases' && <AliasesPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'pricing' && <PricingPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'plans' && <PlansPane period={period} refreshToken={refreshToken} onNavigate={onNavigate} onConfigMutated={onConfigMutated} />}
           {pane === 'devices' && <DevicesPane period={period} refreshToken={refreshToken} />}
           {pane === 'export' && <ExportPane period={period} refreshToken={refreshToken} />}
+          {pane === 'sharing' && <SharingPane />}
           {pane === 'privacy' && <PrivacyPane />}
         </main>
       </div>
-      <Hint items={[{ k: '⌘1-7', label: 'Navigate' }, { k: '⌘R', label: 'Refresh' }]} right="pairing uses mutual TLS · approve-style, no PIN" />
+      <Hint items={[{ k: shortcutLabel('1-8'), label: 'Navigate' }, { k: shortcutLabel('R'), label: 'Refresh' }]} right="pairing uses mutual TLS · approve-style, no PIN" />
     </>
   )
 }
 
-function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, onConfigMutated }: { period: Period; refreshToken: number; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource: string | null; onConfigMutated?: () => void }) {
+function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken: number; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
   const [currencyNonce, setCurrencyNonce] = useState(0)
-  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, currencyNonce])
+  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, currencyNonce], {
+    memoKey: reportMemoKey('plans', period),
+  })
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = readSetting('codeburn.theme')
     return saved === 'light' || saved === 'dark' ? saved : 'system'
@@ -202,13 +211,14 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
             <button className="set-text-button" onClick={() => void codeburn.resetCurrency().then(finishCurrency)}>Reset to USD</button>
           </span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>How often data auto-refreshes. Manual updates only on ⌘R.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>Combined aggregates usage across every paired device, like the menubar. Local shows this device only.</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={[{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>Runs automatically at this interval. Press {shortcutLabel('R')} to refresh sooner.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
           {budgetError && <p className="set-action-msg error">{budgetError}</p>}
         </div>
         <div className="about-sec set-last-sec">
           <div className="about-sec-h">About</div>
-          <div className="about-row"><span className="tx">Version {version}{updateNote && <small>{updateNote}</small>}</span><span className="r">{update?.updateAvailable && update.tag ? <button className="set-text-button" onClick={() => { void codeburn.openExternal(releasePageUrl(update.tag!)) }}>Download</button> : null}</span></div>
+          <div className="about-row"><span className="tx">Version {version}{updateNote && <small>{updateNote}</small>}</span><span className="r">{update?.updateAvailable && update.tag ? <button className="set-text-button" onClick={() => { void codeburn.openExternal(updateDownloadUrl(update.tag!)) }}>Download</button> : null}</span></div>
         </div>
       </div>
     </section>
@@ -222,7 +232,7 @@ function ProvidersPane({ period, refreshToken }: { period: Period; refreshToken:
   // the internal id. Fall back to the providers map keys (lowercased display
   // names) for older CLIs that omit providerDetails.
   const providers = details
-    ? details.filter(entry => entry.cost > 0).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
+    ? details.filter(entry => entry.hasUsage ?? entry.cost > 0).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
     : Object.entries(overview.data?.current.providers ?? {}).map(([id, cost]) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1), cost }))
   return <section className="set-p on">
     <div><h3 className="set-h">Providers</h3><p className="set-sub">codeburn auto-detects coding tools from local session files. No setup needed.</p></div>
@@ -325,16 +335,20 @@ function planSummaries(status: StatusJson): JsonPlanSummary[] {
   return status.plan ? [status.plan] : []
 }
 
-function DetectedRow({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
-  const name = quota.provider === 'claude' ? 'Claude' : 'Codex'
+function DetectedRow({ quota, enabled, onToggle, onReconnect }: { quota: QuotaProvider; enabled: boolean; onToggle: () => void; onReconnect: () => void }) {
   return <div className="about-row">
     <ProviderLogo provider={quota.provider} />
-    <span className="tx">{name}</span>
-    {quota.connection === 'disconnected' || quota.connection === 'accessDenied'
+    <span className="tx">{PROVIDER_NAMES[quota.provider]}</span>
+    {!enabled
+      ? <span className="r set-status"><span className="set-cap">Off</span></span>
+      : quota.connection === 'disconnected' || quota.connection === 'accessDenied'
       ? <div className="r set-status"><ConnectAffordance provider={quota.provider} connection={quota.connection} onRefresh={onReconnect} /></div>
       : quota.rateLimited
       ? <span className="r set-status"><span className="set-dot" />{rateLimitedNote(quota.provider)}</span>
+      : quota.connection === 'terminalFailure'
+      ? <span className="r set-status"><span className="set-dot" />{quota.footerLines[0] ?? 'Quota unavailable'}</span>
       : <span className="r set-status"><span className="set-dot ok" />{quota.planLabel ?? 'Connected'}</span>}
+    <button type="button" role="switch" aria-checked={enabled} aria-label={`${PROVIDER_NAMES[quota.provider]} live quota`} className={enabled ? 'switch on' : 'switch'} onClick={onToggle}><span className="switch-knob" /></button>
   </div>
 }
 
@@ -343,14 +357,17 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   // Steady poll serves cached quota (force=false); the Connect affordance's
   // Refresh forces a keychain-allowed fetch via the same path as Plans.tsx.
   const [reconnectNonce, setReconnectNonce] = useState(0)
+  const [disabledProviders, setDisabledProviders] = useState<ProviderName[]>(() => readDisabledProviders())
   const lastForced = useRef(`${refreshToken}:${reconnectNonce}`)
   const quota = usePolled<QuotaProvider[]>(() => {
     const key = `${refreshToken}:${reconnectNonce}`
     const force = key !== lastForced.current
     lastForced.current = key
-    return codeburn.getQuota(force)
-  }, [refreshToken, reconnectNonce])
-  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce])
+    return codeburn.getQuota(force, disabledProviders)
+  }, [refreshToken, reconnectNonce, disabledProviders])
+  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce], {
+    memoKey: reportMemoKey('plans', period),
+  })
   const [presetId, setPresetId] = useState(MANUAL_PLAN_PRESETS[0]!.id)
   const configured = plans.data ? planSummaries(plans.data) : []
 
@@ -360,6 +377,17 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   }
   const remove = (plan: JsonPlanSummary) => {
     void codeburn.resetPlan(plan.provider).then(finish)
+  }
+  // Toggling a provider off stops polling it entirely (the main process never
+  // contacts its endpoints); toggling on forces a fresh fetch so the row
+  // repopulates immediately.
+  const toggleProvider = (provider: ProviderName) => {
+    const next = disabledProviders.includes(provider)
+      ? disabledProviders.filter(item => item !== provider)
+      : [...disabledProviders, provider]
+    writeDisabledProviders(next)
+    setDisabledProviders(next)
+    setReconnectNonce(value => value + 1)
   }
   const add = () => {
     const preset = MANUAL_PLAN_PRESETS.find(item => item.id === presetId)!
@@ -371,7 +399,17 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
     <div className="card">
       <div className="about-sec set-last-sec">
         <div className="about-sec-h">Detected subscriptions</div>
-        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : !quota.data ? <p className="set-cap">Detecting subscriptions…</p> : quota.data.length === 0 ? <p className="set-cap">No detectable subscriptions.</p> : quota.data.map(provider => <DetectedRow key={provider.provider} quota={provider} onReconnect={() => setReconnectNonce(value => value + 1)} />)}
+        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : QUOTA_PROVIDERS.map(provider => {
+          const row = quota.data?.find(item => item.provider === provider)
+          if (!row && !disabledProviders.includes(provider)) return null
+          return <DetectedRow
+            key={provider}
+            quota={row ?? { provider, connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] }}
+            enabled={!disabledProviders.includes(provider)}
+            onToggle={() => toggleProvider(provider)}
+            onReconnect={() => setReconnectNonce(value => value + 1)}
+          />
+        })}
       </div>
     </div>
     <div className="card">
@@ -435,9 +473,15 @@ function DevicesPane({ period, refreshToken }: { period: Period; refreshToken: n
 }
 
 function PrivacyPane() {
+  const clearSnapshots = () => {
+    clearPolledMemo()
+    clearOverviewHeadlines()
+    showToast('Cached report snapshots cleared', 'ok')
+  }
   return <section className="set-p on"><div><h3 className="set-h">Privacy &amp; data</h3><p className="set-sub">What codeburn does, and does not do, with your data.</p></div><div className="card">
     <PrivacyClaim title="Local-only" detail="Everything runs on your machine. Data is read from local session files." icon={<><rect x="4.5" y="10" width="15" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>} />
     <PrivacyClaim title="No API keys" detail="Usage is detected from local files; no provider API keys are required." icon={<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />} />
+    <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M6 7l1 14h10l1-14M9 7V4h6v3" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Local report snapshots</div><div className="set-claim-d">Calculated usage and cost reports are compressed and kept on this Mac so screens open immediately after restart. Credentials are never included.</div></div><button type="button" className="btnp" onClick={clearSnapshots}>Clear snapshots</button></div>
     <TelemetryClaim />
   </div></section>
 }

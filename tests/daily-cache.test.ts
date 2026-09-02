@@ -68,11 +68,11 @@ describe('loadDailyCache', () => {
     expect(cache.days).toEqual([])
   })
 
-  // With version-suffixed filenames, a legacy unversioned file whose version is
-  // not the current one is simply IGNORED — never migrated, never backed up,
-  // never touched (old binaries still own it). Load returns an empty cache and
-  // the legacy file is left intact on disk.
-  it('ignores (and never rewrites) a legacy file too old to migrate', async () => {
+  // With carry-forward (v14), a legacy unversioned file whose version is not
+  // the current one is ADOPTED as a carried baseline — its days survive into
+  // the new cache, marked `carried` and pending re-derivation. The legacy file
+  // itself is never rewritten, backed up, or deleted (old binaries still own it).
+  it('adopts a legacy file too old to trust as a carried baseline, without rewriting it', async () => {
     const saved = {
       version: 1,
       lastComputedDate: '2026-04-10',
@@ -83,15 +83,17 @@ describe('loadDailyCache', () => {
     const legacy = join(TMP_CACHE_ROOT, 'daily-cache.json')
     await writeFile(legacy, JSON.stringify(saved), 'utf-8')
     const cache = await loadDailyCache()
-    expect(cache.days).toEqual([])
-    expect(cache.lastComputedDate).toBeNull()
-    // Legacy file untouched (no .bak, contents intact); no versioned file written.
+    expect(cache.days).toHaveLength(1)
+    expect(cache.days[0]).toMatchObject({ date: '2026-04-10', cost: 10, calls: 5, carried: true })
+    // Adopted days are not yet finalized under current accounting.
+    expect(cache.complete).not.toBe(true)
+    // Legacy file untouched (no .bak, contents intact); versioned file persisted.
     expect(existsSync(join(TMP_CACHE_ROOT, 'daily-cache.json.v1.bak'))).toBe(false)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(saved)
-    expect(existsSync(dailyCachePath())).toBe(false)
+    expect(existsSync(dailyCachePath())).toBe(true)
   })
 
-  it('ignores a legacy v2 cache (provider rollups would be stale) and leaves it intact', async () => {
+  it('adopts a legacy v2 cache as carried days and leaves the file intact', async () => {
     const saved = {
       version: 2,
       lastComputedDate: '2026-04-10',
@@ -107,13 +109,14 @@ describe('loadDailyCache', () => {
     await writeFile(legacy, JSON.stringify(saved), 'utf-8')
     const cache = await loadDailyCache()
     expect(cache.version).toBe(DAILY_CACHE_VERSION)
-    expect(cache.days).toEqual([])
-    expect(cache.lastComputedDate).toBeNull()
+    expect(cache.days).toHaveLength(1)
+    expect(cache.days[0]).toMatchObject({ date: '2026-04-10', cost: 10, calls: 5, sessions: 2, carried: true })
+    expect(cache.days[0]!.models['claude-opus-4-6']!.cost).toBe(10)
     expect(existsSync(join(TMP_CACHE_ROOT, 'daily-cache.json.v2.bak'))).toBe(false)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(saved)
   })
 
-  it('ignores a legacy v5 cache (predates 1-hour cache pricing) and leaves it intact', async () => {
+  it('adopts a legacy v5 cache including its provider slices', async () => {
     const saved = {
       version: 5,
       lastComputedDate: '2026-05-01',
@@ -139,8 +142,9 @@ describe('loadDailyCache', () => {
     await writeFile(legacy, JSON.stringify(saved), 'utf-8')
     const cache = await loadDailyCache()
     expect(cache.version).toBe(DAILY_CACHE_VERSION)
-    expect(cache.days).toEqual([])
-    expect(cache.lastComputedDate).toBeNull()
+    expect(cache.days).toHaveLength(1)
+    expect(cache.days[0]).toMatchObject({ date: '2026-05-01', cost: 0.37575, calls: 1, carried: true })
+    expect(cache.days[0]!.providers['claude']).toMatchObject({ calls: 1, cost: 0.37575 })
     expect(existsSync(join(TMP_CACHE_ROOT, 'daily-cache.json.v5.bak'))).toBe(false)
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(saved)
   })
@@ -179,6 +183,7 @@ describe('loadDailyCache', () => {
       lastComputedDate: '2026-04-10',
       days: [emptyDay('2026-04-09', 12.5, 40), emptyDay('2026-04-10', 7.25, 28)],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(saved)
     const loaded = await loadDailyCache()
@@ -256,7 +261,7 @@ describe('addNewDays', () => {
   })
 
   it('still prunes when newestDate is valid', () => {
-    const old = '2020-01-01'
+    const old = '2010-01-01'
     const recent = '2026-04-10'
     const base: DailyCache = {
       version: DAILY_CACHE_VERSION,
@@ -265,7 +270,7 @@ describe('addNewDays', () => {
       days: [emptyDay(old, 1), emptyDay(recent, 2)],
     }
     const updated = addNewDays(base, [], recent)
-    // 730-day retention from 2026-04-10 → cutoff ~2024-04-11; 2020-01-01 must be gone.
+    // 3650-day retention from 2026-04-10 puts the cutoff in 2016; 2010-01-01 must be gone.
     expect(updated.days.find(d => d.date === old)).toBeUndefined()
     expect(updated.days.find(d => d.date === recent)).toBeDefined()
   })
@@ -314,6 +319,7 @@ describe('ensureCacheHydrated', () => {
       lastComputedDate: '2026-06-11',
       days: [emptyDay('2026-06-11', 5, 10)],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(saved)
 
@@ -360,6 +366,82 @@ describe('ensureCacheHydrated', () => {
   })
 })
 
+// Codex discovery went structural in v16 (#873/#626), admitting rollouts from
+// third-party frontends that v15 rollups never counted. Every historical day is
+// served from this cache (usage-aggregator only recomputes today) and retention
+// is ten years, so without a schema bump an upgrading user keeps the pre-fix
+// numbers forever: the session COUNT moves because discovery reruns, while
+// cost/calls stay frozen — a self-contradicting report that reads as "fixed".
+describe('ensureCacheHydrated: schema version invalidation (#873)', () => {
+  it('re-derives a warm v15 cache instead of serving its pre-fix rollups', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    // A cache exactly as a pre-fix release left it: current schema at the time,
+    // finalized off a complete parse, watermark at yesterday, matching tz.
+    // Nothing but the version bump can invalidate it.
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => {
+        parseCalls += 1
+        return []
+      },
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // The whole point: the window is re-parsed rather than served frozen.
+    expect(parseCalls).toBe(1)
+    // ...and the fresh derivation wins over the stale v15 day.
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.calls).toBe(2)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    // The v15 file is never rewritten or deleted — old binaries still own it.
+    expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), 'utf-8')).version).toBe(15)
+  })
+
+  it('carries a v15 day forward when its sources can no longer re-derive it', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-04-02', 7, 3), emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    // The parse can only still see the recent day; April's sources are gone.
+    const hydrated = await ensureCacheHydrated(
+      async () => [],
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // NEVER-LOSE (v14) still holds across this bump: the sourceless day keeps
+    // its old accounting rather than being dropped or zeroed.
+    expect(hydrated.days.find(d => d.date === '2026-04-02')?.cost).toBe(7)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
+  })
+})
+
 describe('withDailyCacheLock', () => {
   it('serializes concurrent operations', async () => {
     const sequence: string[] = []
@@ -380,7 +462,7 @@ describe('withDailyCacheLock', () => {
 })
 
 describe('ensureCacheHydrated: savings config invalidation', () => {
-  it('discards cached days when the savingsConfigHash changes between calls', async () => {
+  it('re-derives on savingsConfigHash change but CARRIES days the parse cannot re-derive', async () => {
     // Seed a cache with a day OLDER than yesterday so the hydration window
     // (which keeps `d.date < yesterdayStr`) actually retains it.
     const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000)
@@ -394,15 +476,18 @@ describe('ensureCacheHydrated: savings config invalidation', () => {
     }
     await saveDailyCache(seeded)
 
+    // The re-derive parse finds NOTHING (session files already deleted). The
+    // day must survive as carried — this exact path used to wipe it.
     const parseSessions = async (): Promise<ProjectSummary[]> => []
     const aggregateDays = (): DailyEntry[] => []
 
-    // Hash mismatch → ensureCacheHydrated must drop the stale day and start fresh.
     const rehydrated = await ensureCacheHydrated(parseSessions, aggregateDays, 'cfg-B')
     expect(rehydrated.savingsConfigHash).toBe('cfg-B')
-    expect(rehydrated.days).toEqual([])
+    expect(rehydrated.days).toHaveLength(1)
+    expect(rehydrated.days[0]).toMatchObject({ date: twoDaysAgoStr, cost: 1.5, calls: 3, carried: true })
+    expect(rehydrated.complete).toBe(true)
 
-    // Same hash → cached days survive.
+    // Same hash → cached days survive untouched (no carried marker).
     const seeded2: DailyCache = {
       version: DAILY_CACHE_VERSION,
       savingsConfigHash: 'cfg-C',
@@ -414,6 +499,7 @@ describe('ensureCacheHydrated: savings config invalidation', () => {
     const preserved = await ensureCacheHydrated(parseSessions, aggregateDays, 'cfg-C')
     expect(preserved.days).toHaveLength(1)
     expect(preserved.days[0]!.date).toBe(twoDaysAgoStr)
+    expect(preserved.days[0]!.carried).toBeUndefined()
   })
 })
 
@@ -423,10 +509,11 @@ describe('ensureCacheHydrated: timezone invalidation', () => {
   const parseSessions = async (): Promise<ProjectSummary[]> => []
   const aggregateDays = (): DailyEntry[] => []
 
-  it('re-hydrates when the cached tzKey differs from the current timezone', async () => {
+  it('re-derives on timezone change but keeps days whose sources are gone', async () => {
     // Days are bucketed by local midnight, so a cache tagged under a different
-    // timezone mis-buckets every day and must be discarded (like a savings-hash
-    // mismatch). 'Test/OtherZone' can never equal a real IANA zone.
+    // timezone re-derives everything. Days that can no longer be re-derived stay
+    // (old-tz bucketing beats a silent zero). 'Test/OtherZone' can never equal a
+    // real IANA zone.
     const seeded: DailyCache = {
       version: DAILY_CACHE_VERSION,
       savingsConfigHash: '',
@@ -438,7 +525,8 @@ describe('ensureCacheHydrated: timezone invalidation', () => {
     await saveDailyCache(seeded)
     const rehydrated = await ensureCacheHydrated(parseSessions, aggregateDays, '')
     expect(rehydrated.tzKey).toBe(currentTzKey())
-    expect(rehydrated.days).toEqual([])
+    expect(rehydrated.days).toHaveLength(1)
+    expect(rehydrated.days[0]).toMatchObject({ date: twoDaysAgoStr, cost: 1.5, carried: true })
   })
 
   it('keeps cached days when the tzKey matches the current timezone', async () => {

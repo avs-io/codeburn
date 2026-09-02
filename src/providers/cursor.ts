@@ -5,10 +5,19 @@ import { homedir } from 'os'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
-import { isSqliteAvailable, isSqliteBusyError, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
+import {
+  isSqliteAvailable,
+  isSqliteBusyError,
+  getSqliteLoadError,
+  openDatabase,
+  blobToText,
+  isSqliteReadonlyError,
+  warnSqliteReadonlyOnce,
+  type SqliteDatabase,
+} from '../sqlite.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { DateRange } from '../types.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 /** Matches cli-date.ts "all" period cap (6 months). */
 const CURSOR_MAX_LOOKBACK_MONTHS = 6
@@ -188,7 +197,8 @@ function loadWorkspaceMap(workspaceStorageDir: string): WorkspaceMapping {
     let db: SqliteDatabase
     try {
       db = openDatabase(wsDbPath)
-    } catch {
+    } catch (err) {
+      if (isSqliteReadonlyError(err)) warnSqliteReadonlyOnce(wsDbPath)
       continue
     }
     try {
@@ -1043,6 +1053,10 @@ export function createCursorProvider(dbPathOverride?: string): Provider {
 
     toolDisplayName(rawTool: string): string {
       return rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: dbPathOverride ?? getCursorDbPath(), label: 'db' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

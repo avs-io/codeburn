@@ -7,15 +7,26 @@ import {
   findUnpricedModels,
   getModelCosts,
   getShortModelName,
+  resolveCanonicalModelId,
   calculateCost,
+  CACHE_SCHEMA_VERSION,
   loadPricing,
   setModelAliases,
   setPriceOverrides,
   setLocalModelSavings,
+  setFlatRateModels,
+  setFlatRateRemoved,
+  isExpectedFreeModel,
+  isFlatRateModel,
   getLocalModelSavingsConfigHash,
   getPriceOverridesConfigHash,
+  getModelAliasesConfigHash,
+  getFlatRateModelsConfigHash,
+  parseLiteLLMEntry,
+  unpricedModelHint,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
+import snapshotData from '../src/data/litellm-snapshot.json' with { type: 'json' }
 
 beforeAll(async () => {
   await loadPricing()
@@ -25,6 +36,8 @@ afterEach(() => {
   setModelAliases({})
   setPriceOverrides({})
   setLocalModelSavings({})
+  setFlatRateModels([])
+  setFlatRateRemoved([])
 })
 
 describe('getModelCosts', () => {
@@ -56,6 +69,186 @@ describe('getModelCosts', () => {
     expect(upper).not.toBeNull()
     expect(lower!.inputCostPerToken).toBe(upper!.inputCostPerToken)
     expect(lower!.outputCostPerToken).toBe(upper!.outputCostPerToken)
+  })
+
+  it('prices glm-5.3 (Hermes / Cline spelling) instead of leaving it unpriced', () => {
+    const lower = getModelCosts('glm-5.3')
+    const upper = getModelCosts('GLM-5.3')
+    const sibling = getModelCosts('glm-5p2')
+    expect(lower).not.toBeNull()
+    expect(upper).not.toBeNull()
+    expect(sibling).not.toBeNull()
+    expect(lower!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(upper!.outputCostPerToken).toBe(sibling!.outputCostPerToken)
+    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('cmd/deepseek/deepseek-v4-flash')).not.toBeNull()
+    expect(getModelCosts('provider/org/glm-5.3')).toBeNull()
+    expect(getModelCosts('provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('cp/provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('omniroute:provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('unknown/deepseek-v4-flash')).toBeNull()
+    expect(getModelCosts('z-ai/glm-5.2')).not.toBeNull()
+    expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+  })
+
+  it('prices gpt-5.6-codex and gpt-5.6-codex-max, sourced directly from the snapshot (#1077)', () => {
+    // Directly checks the bundled snapshot data (not just the resolved lookup),
+    // so this fails if the litellm-snapshot.json entries are ever reverted even
+    // though getModelCosts would still resolve both ids via the `gpt-5.6` prefix
+    // fallback - explicit rows are still correct and match every other Codex
+    // generation LiteLLM ships (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-max,
+    // gpt-5.2-codex, gpt-5.3-codex all carry their base model's exact rate).
+    const snapshot = snapshotData as Record<string, unknown>
+    // 2026-08-24: OpenAI cut the gpt-5.6 base rate ($5/$30 to $4/$20) and
+    // LiteLLM updated the base row before the codex SKUs, so codex-equals-base
+    // cannot be asserted until upstream syncs. The codex rows must still exist
+    // explicitly and carry the pre-cut rate they ship with today.
+    expect(snapshot['gpt-5.6-codex']).toBeDefined()
+    expect(snapshot['gpt-5.6-codex-max']).toEqual(snapshot['gpt-5.6-codex'])
+
+    const codex = getModelCosts('gpt-5.6-codex')
+    const codexMax = getModelCosts('gpt-5.6-codex-max')
+    expect(codex).not.toBeNull()
+    expect(codexMax).not.toBeNull()
+    expect(codex!.inputCostPerToken).toBe(5e-6)
+    expect(codex!.outputCostPerToken).toBe(3e-5)
+    expect(codex!.cacheWriteCostPerToken).toBe(6.25e-6)
+    expect(codex!.cacheReadCostPerToken).toBe(5e-7)
+    expect(codex!.cacheWriteCostIsExplicit).toBe(true)
+    expect(codexMax).toEqual(codex)
+
+    expect(calculateCost('gpt-5.6-codex', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  describe('grok-4.6 prompt tier', () => {
+    it('uses the low tier below 200000 prompt tokens', () => {
+      expect(calculateCost('grok-4.6', 100_000, 10_000, 0, 99_999, 0)).toBeCloseTo(0.3099995, 12)
+    })
+
+    it('uses the high tier for every token at exactly 200000 prompt tokens', () => {
+      expect(calculateCost('grok-4.6', 100_000, 10_000, 0, 100_000, 0)).toBeCloseTo(0.62, 12)
+    })
+
+    it('uses the high tier above 200000 prompt tokens', () => {
+      expect(calculateCost('grok-4.6', 100_001, 10_000, 0, 100_000, 0)).toBeCloseTo(0.620004, 12)
+    })
+
+    it('uses an aliased price override instead of the built-in prompt tier', () => {
+      setModelAliases({ 'xai-oauth/grok-4.6': 'grok-4.6' })
+      setPriceOverrides({ 'grok-4.6': { input: 2, output: 6, cacheRead: 0.5 } })
+
+      expect(calculateCost('xai-oauth/grok-4.6', 100_000, 10_000, 0, 100_000, 0)).toBeCloseTo(0.31, 12)
+    })
+  })
+
+  it('prices claude-haiku-4.5 (copilot session-store raw id), aliased to the existing claude-haiku-4-5 row (#1093)', () => {
+    const haiku45 = getModelCosts('claude-haiku-4.5')
+    const haiku45Dash = getModelCosts('claude-haiku-4-5')
+    expect(haiku45).not.toBeNull()
+    expect(haiku45).toEqual(haiku45Dash)
+    expect(haiku45!.inputCostPerToken).toBe(1e-6)
+    expect(haiku45!.outputCostPerToken).toBe(5e-6)
+    expect(haiku45!.cacheWriteCostPerToken).toBe(1.25e-6)
+    expect(haiku45!.cacheReadCostPerToken).toBe(1e-7)
+    expect(haiku45!.cacheWriteCostIsExplicit).toBe(true)
+    expect(calculateCost('claude-haiku-4.5', 1_000_000, 1_000_000, 0, 0, 0)).toBe(6)
+  })
+
+  // A price override on a synthetic bare id can only be reached if the leading
+  // segment was stripped, so these assert the namespace allowlist itself without
+  // pinning to any real model's presence in (or absence from) the snapshot.
+  it('strips vendor namespaces the pricing catalog knows and fails closed on the rest', () => {
+    setPriceOverrides({ 'zzz-namespace-probe': { input: 1, output: 2 } })
+
+    const known = ['anthropic', 'x-ai', 'xai', 'qwen', 'moonshotai', 'nousresearch', 'kimi',
+      'litellm_proxy', 'openai_like', 'zhipu', 'mimo', 'xiaomi',
+      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter']
+    for (const ns of known) {
+      expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).not.toBeNull()
+    }
+
+    // Local runners and unknown vendors must never strip down to a priced row.
+    const unknown = ['ollama', 'local', 'lmstudio', 'hosted_vllm', 'unsloth', 'nosuchvendor']
+    for (const ns of unknown) {
+      expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).toBeNull()
+    }
+  })
+
+  it('peels every routing wrapper but not an unknown vendor inside one', () => {
+    setPriceOverrides({ 'zzz-router-probe': { input: 1, output: 2 } })
+
+    const routed = [
+      'omniroute:zzz-router-probe',
+      'omniroute:cp/cline-pass/zzz-router-probe',
+      'omniroute:cline-free/zzz-router-probe',
+      'omniroute:antigravity/zzz-router-probe',
+      'omniroute:cmd/zzz-router-probe',
+      'omniroute:orcarouter/zzz-router-probe',
+    ]
+    for (const id of routed) expect(getModelCosts(id), id).not.toBeNull()
+
+    expect(getModelCosts('omniroute:nosuchvendor/zzz-router-probe')).toBeNull()
+    // A nested unknown vendor inside a known routing wrapper must fail closed.
+    expect(getModelCosts('omniroute:orcarouter/nosuchvendor/zzz-router-probe')).toBeNull()
+  })
+
+  it('lets a user price override for a bare id win over the routed catalog row', () => {
+    setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
+    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
+    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
+
+  it('prices OrcaRouter fusion and nested upstreams; auto stays fail-closed', () => {
+    // `orcarouter/auto` rotates onto a Qwen/Llama flash model. No live probe
+    // pins a rate, so it stays unpriced rather than inheriting Sonnet.
+    expect(getModelCosts('orcarouter/auto')).toBeNull()
+
+    // The fusion routes currently resolve to openai/gpt-oss-120b (live 2026-08).
+    expect(getModelCosts('orcarouter/fusion')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/fusion-flash')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/fusion-mini')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+
+    // Fully-qualified upstream ids peel to the exact LiteLLM row.
+    expect(getModelCosts('orcarouter/deepseek/deepseek-v4-pro')!.inputCostPerToken).toBe(
+      getModelCosts('deepseek/deepseek-v4-pro')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/deepseek/deepseek-v4-flash')!.outputCostPerToken).toBe(
+      getModelCosts('deepseek/deepseek-v4-flash')!.outputCostPerToken,
+    )
+
+    // A route id for an unknown upstream stays unpriced (fail closed).
+    expect(getModelCosts('orcarouter/nosuchvendor/zzz-router-probe')).toBeNull()
+  })
+})
+
+describe('resolveCanonicalModelId', () => {
+  it('aliases, peels path-form ids, and leaves display-only collisions distinct', () => {
+    expect(resolveCanonicalModelId('k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('k3-agent')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('accounts/fireworks/models/glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
+    expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
+    expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
+    expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
+    expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
+    expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('orcarouter/auto')).not.toBe(resolveCanonicalModelId('claude-sonnet-4-5'))
+    expect(resolveCanonicalModelId('orcarouter/fusion')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-flash')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-mini')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/deepseek/deepseek-v4-pro')).toBe(
+      resolveCanonicalModelId('deepseek/deepseek-v4-pro'),
+    )
   })
 })
 
@@ -111,11 +304,69 @@ describe('getShortModelName', () => {
     expect(getShortModelName('GLM-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5p1')).toBe('GLM-5.2')
+    expect(getShortModelName('glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('GLM-5.3')).toBe('GLM-5.3')
+    // Prices via the glm-5p2 sibling, but must not be LABELLED as GLM-5.2.
+    expect(getShortModelName('cmd/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('z-ai/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('xiaomi/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('cp/cline-pass/glm-5.3')).toBe('GLM-5.3')
+    // OrcaRouter route ids peel to the upstream id, which keeps the upstream label.
+    expect(getShortModelName('orcarouter/deepseek/deepseek-v4-pro')).toBe('DeepSeek v4 Pro')
+    // Route ids display as the model they route to, not a branded gateway label.
+    expect(getShortModelName('orcarouter/auto')).not.toBe(getShortModelName('claude-sonnet-4-5'))
+    expect(getShortModelName('orcarouter/fusion')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-flash')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-mini')).toBe(getShortModelName('openai/gpt-oss-120b'))
     // Grok Build prices via the grok-build-0.1 sibling.
     expect(getShortModelName('grok-build')).toBe('Grok Build')
     expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')
     // grok-composer has no alias, just a missing display entry.
     expect(getShortModelName('grok-composer-2.5-fast')).toBe('Grok Composer 2.5 Fast')
+  })
+
+  it('shows the last path segment for an unmapped path-style raw id', () => {
+    expect(getShortModelName('fireworks/routers/glm-fast-latest')).toBe('glm-fast-latest')
+    expect(getShortModelName('accounts/fireworks/models/some-unlisted-slug')).toBe('some-unlisted-slug')
+  })
+
+  it('names GPT-5.6 variants individually rather than collapsing them', () => {
+    expect(getShortModelName('gpt-5.6-sol')).toBe('GPT-5.6 Sol')
+    expect(getShortModelName('gpt-5.6-terra')).toBe('GPT-5.6 Terra')
+    expect(getShortModelName('gpt-5.6-luna')).toBe('GPT-5.6 Luna')
+    // No bare `gpt-5.6` entry exists, so an unlisted future variant must still
+    // fall through to its raw id rather than borrow a sibling's label.
+    expect(getShortModelName('gpt-5.6-unlisted')).toBe('gpt-5.6-unlisted')
+  })
+
+  it('names grok-4.5 without disturbing the Grok Build harness label', () => {
+    // The Grok Build CLI reports the model it runs, so the model id gets the
+    // model's name; ids that really are grok-build keep the harness label.
+    expect(getShortModelName('grok-4.5')).toBe('Grok 4.5')
+    expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')
+  })
+
+  it('names ClinePass-routed slugs through the path fallback', () => {
+    // ClinePass ids arrive as `cline-pass/<slug>`; the path fallback strips the
+    // prefix and re-resolves the bare slug, as it does for Fireworks ids.
+    expect(getShortModelName('cline-pass/qwen3.7-max')).toBe('Qwen 3.7 Max')
+    expect(getShortModelName('cline-pass/minimax-m3')).toBe('MiniMax M3')
+    expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getShortModelName('cline-pass/kimi-k3')).toBe('Kimi K3')
+  })
+
+  it('names MiniMax M3 in both the lowercase-slug and capitalized spellings', () => {
+    expect(getShortModelName('minimax-m3')).toBe('MiniMax M3')
+    expect(getShortModelName('MiniMax-M3')).toBe('MiniMax M3')
+  })
+
+  it('resolves Fireworks-hosted fleet models to friendly names via the path fallback', () => {
+    // Real ids are the full Fireworks path `accounts/fireworks/models/<slug>`.
+    expect(getShortModelName('accounts/fireworks/models/glm-5p2')).toBe('GLM-5.2')
+    expect(getShortModelName('accounts/fireworks/models/qwen3p7-plus')).toBe('Qwen 3.7 Plus')
+    expect(getShortModelName('accounts/fireworks/models/kimi-k2p7-code')).toBe('Kimi K2.7 Code')
+    expect(getShortModelName('accounts/fireworks/models/deepseek-v4-pro')).toBe('DeepSeek v4 Pro')
+    expect(getShortModelName('accounts/fireworks/models/deepseek-v4-flash')).toBe('DeepSeek v4 Flash')
   })
 })
 
@@ -201,6 +452,32 @@ describe('builtin aliases - getShortModelName', () => {
   })
 })
 
+// Codex driving a Kimi backend records the model as `kimi/k3[1m]` (provider
+// prefix + context-length tag). getCanonicalName strips the prefix but the
+// `[1m]` tag used to survive, so it matched no alias and priced to $0 - the
+// Kimi-via-codex spend was silently reported as free.
+describe('codex Kimi context-tag normalization (kimi/k3[1m])', () => {
+  it('prices kimi/k3[1m] the same as canonical kimi-k3 instead of $0', () => {
+    expect(getModelCosts('kimi/k3[1m]')).not.toBeNull()
+    expect(getModelCosts('kimi/k3[1m]')).toEqual(getModelCosts('kimi-k3'))
+    expect(calculateCost('kimi/k3[1m]', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('resolves the bare k3[1m] tag too', () => {
+    expect(getModelCosts('k3[1m]')).toEqual(getModelCosts('kimi-k3'))
+  })
+
+  it('names kimi/k3[1m] as Kimi K3', () => {
+    expect(getShortModelName('kimi/k3[1m]')).toBe('Kimi K3')
+  })
+
+  it('does not strip a non-bracket suffix from an ordinary model id', () => {
+    expect(getShortModelName('gpt-5.5')).toBe('GPT-5.5')
+    expect(getModelCosts('gpt-5.5')).toEqual(getModelCosts('gpt-5.5'))
+    expect(calculateCost('gpt-5.5', 1_000_000, 100_000, 0, 0, 0)).toBeCloseTo(8, 5)
+  })
+})
+
 describe('Antigravity Gemini 3.5 Flash variants resolve to pricing', () => {
   const variants = [
     'gemini-3.5-flash',
@@ -236,6 +513,13 @@ describe('user aliases via setModelAliases', () => {
   it('user alias overrides builtin', () => {
     setModelAliases({ 'anthropic--claude-4.6-opus': 'claude-sonnet-4-5' })
     expect(getModelCosts('anthropic--claude-4.6-opus')).toEqual(getModelCosts('claude-sonnet-4-5'))
+  })
+
+  it('user alias whose source already has a short name displays the target', () => {
+    setModelAliases({ 'gpt-4o': 'claude-opus-4-6' })
+    expect(getModelCosts('gpt-4o')).toEqual(getModelCosts('claude-opus-4-6'))
+    expect(getShortModelName('gpt-4o')).toBe('Opus 4.6')
+    setModelAliases({})
   })
 
   it('resetting aliases restores builtins', () => {
@@ -338,6 +622,17 @@ describe('user price overrides', () => {
     expect(secondCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(firstCombined)
   })
+
+  it('includes flat-rate marks in the daily cache config hash', () => {
+    setLocalModelSavings({})
+    setPriceOverrides({})
+    setFlatRateModels([])
+    const baseline = getDailyCacheConfigHash()
+    setFlatRateModels(['zz-flat-hash'])
+    expect(getDailyCacheConfigHash()).not.toBe(baseline)
+    setFlatRateModels([])
+    expect(getDailyCacheConfigHash()).toBe(baseline)
+  })
 })
 
 describe('calculateCost - OMP names produce non-zero cost', () => {
@@ -433,7 +728,7 @@ describe('Cursor model variants resolve to pricing', () => {
     // Sonnet family
     ['claude-4-sonnet', 'claude-sonnet-4'],
     ['claude-4-sonnet-1m', 'claude-sonnet-4'],
-    ['claude-4-sonnet-thinking', 'claude-sonnet-4-5'],
+    ['claude-4-sonnet-thinking', 'claude-sonnet-4'],
     ['claude-4.5-sonnet', 'claude-sonnet-4-5'],
     ['claude-4.5-sonnet-thinking', 'claude-sonnet-4-5'],
     ['claude-4.6-sonnet', 'claude-sonnet-4-6'],
@@ -461,6 +756,8 @@ describe('Cursor model variants resolve to pricing', () => {
     ['claude-4.6-haiku', 'claude-haiku-4-5'],
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
+    // Codex activity surface (official rate card, observed raw id)
+    ['codex-auto-review', 'gpt-5.5'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -486,6 +783,37 @@ describe('Cursor model variants resolve to pricing', () => {
       expect(costs!.outputCostPerToken).toBe(expected!.outputCostPerToken)
     })
   }
+
+  // Regression for #912: Cursor's unversioned `claude-4-sonnet-thinking`
+  // slug is the thinking variant of Sonnet 4, not Sonnet 4.5. The two models
+  // currently share a price, so the display name pins the canonical identity
+  // independently of today's pricing coincidence.
+  it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
+    expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
+})
+
+describe('Codex activity ids (#1047)', () => {
+  it('keeps the activity label instead of collapsing to the underlying model name', () => {
+    expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
+  })
+
+  it('prices as the exact bundled GPT-5.5 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.5'))
+    const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
+    const gpt55 = calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0)
+    expect(auto).toBeGreaterThan(0)
+    expect(auto).toBe(gpt55)
+  })
+
+  it('does not invent a family or an unobserved sibling id', () => {
+    expect(getModelCosts('codex-code-review')).toBeNull()
+    expect(getModelCosts('codex-cloud-task')).toBeNull()
+    expect(getModelCosts('codex-automation')).toBeNull()
+    expect(getModelCosts('code-review')).toBeNull()
+    expect(getModelCosts('auto-review')).toBeNull()
+    expect(calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
+  })
 })
 
 describe('Cursor house model pricing', () => {
@@ -572,9 +900,15 @@ describe('DeepSeek v4 models resolve to pricing', () => {
     expect(costs!.cacheWriteCostPerToken).toBe(0)
   })
 
-  it('provider-prefixed DeepSeek v4 names resolve to the same pricing', () => {
-    expect(getModelCosts('deepseek/deepseek-v4-pro')).toEqual(getModelCosts('deepseek-v4-pro'))
-    expect(getModelCosts('deepseek/deepseek-v4-flash')).toEqual(getModelCosts('deepseek-v4-flash'))
+  it('provider-prefixed DeepSeek v4 names resolve to real pricing', () => {
+    // 2026-08-24: DeepSeek repriced v4-pro and LiteLLM updated the
+    // `deepseek/`-namespaced row before the bare one, so the two spellings
+    // legitimately differ until upstream syncs. Both must still price
+    // non-null; flash rows are in sync and must stay equal.
+    expect(getModelCosts('deepseek/deepseek-v4-pro')).not.toBeNull()
+    expect(getModelCosts('deepseek-v4-pro')).not.toBeNull()
+    expect(getModelCosts('deepseek/deepseek-v4-flash')).not.toBeNull()
+    expect(getModelCosts('deepseek-v4-flash')).not.toBeNull()
   })
 
   it('calculates non-zero costs for observed DeepSeek v4 Claude usage', () => {
@@ -597,6 +931,7 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await mkdir(cacheRoot, { recursive: true })
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: CACHE_SCHEMA_VERSION,
         timestamp: Date.now(),
         data: {
           'gpt-4o-mini': {
@@ -615,6 +950,42 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       expect(getModelCosts('gpt-4o-mini')!.inputCostPerToken).toBe(9e-7)
       expect(getModelCosts('deepseek-v4-pro')!.inputCostPerToken).toBe(4.35e-7)
       expect(getModelCosts('deepseek-v4-flash')!.inputCostPerToken).toBe(1.4e-7)
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true })
+      await loadPricing()
+    }
+  })
+})
+
+describe('pricing cache schema version (#1075/#1078 follow-up)', () => {
+  it('discards a cache written by a pre-#1078 binary instead of reading its missing cacheWriteCostIsExplicit as false', async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), 'codeburn-pricing-cache-'))
+    try {
+      process.env['CODEBURN_CACHE_DIR'] = cacheRoot
+      await mkdir(cacheRoot, { recursive: true })
+      // Shape of a cache file written before #1078 added `version` and
+      // `cacheWriteCostIsExplicit`: no version field, and entries missing the
+      // key despite carrying a real (non-default) cache-write rate.
+      await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        timestamp: Date.now(),
+        data: {
+          'gpt-5.6': {
+            inputCostPerToken: 5e-6,
+            outputCostPerToken: 3e-5,
+            cacheWriteCostPerToken: 6.25e-6,
+            cacheReadCostPerToken: 5e-7,
+            webSearchCostPerRequest: 0.01,
+            fastMultiplier: 1,
+          },
+        },
+      }), 'utf-8')
+
+      await loadPricing()
+
+      // Pre-fix, loadCachedPricing had no version check: it would read this
+      // cache verbatim, and gpt-5.6's missing key would resolve to undefined
+      // (falsy) here instead of the true its LiteLLM entry actually carries.
+      expect(getModelCosts('gpt-5.6')!.cacheWriteCostIsExplicit).toBe(true)
     } finally {
       await rm(cacheRoot, { recursive: true, force: true })
       await loadPricing()
@@ -657,7 +1028,14 @@ describe('provider pricing suffix variants', () => {
 describe('observed provider model aliases', () => {
   const cases: Array<[string, string]> = [
     ['MiMo-V2-Flash', 'xiaomi/mimo-v2-flash'],
+    ['mimo-v2.5-pro', 'xiaomi/mimo-v2.5-pro'],
+    ['MiMo-v2.5-Pro', 'xiaomi/mimo-v2.5-pro'],
+    ['mimo-v2.5', 'xiaomi/mimo-v2.5'],
+    ['MiMo-v2.5', 'xiaomi/mimo-v2.5'],
     ['KAT-Coder-Pro-V1', 'kwaipilot/kat-coder-pro'],
+    // Kimi Code wires report bare `k3` in llm.request.model; it must price
+    // through the kimi-k3 table entry, not fall through to $0.
+    ['k3', 'kimi-k3'],
   ]
 
   for (const [input, expectedModel] of cases) {
@@ -670,6 +1048,43 @@ describe('observed provider model aliases', () => {
       expect(calculateCost(input, 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
     })
   }
+
+  it('k3 shows the Kimi K3 display name', () => {
+    expect(getShortModelName('k3')).toBe('Kimi K3')
+  })
+
+  it('does not recurse on vendor-requalified MiMo aliases', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('MiMo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+  })
+
+  // The `mimo-v2-flash -> xiaomi/mimo-v2-flash` alias shipped before this
+  // change and already cycled: strip the namespace, alias it back, take the
+  // leaf, repeat. Every display surface (overview's model table included)
+  // threw RangeError on a real MiMo v2 Flash session. Pin the shipped ids.
+  it('resolves the already-shipped MiMo v2 Flash alias without blowing the stack', () => {
+    for (const id of ['mimo-v2-flash', 'MiMo-V2-Flash', 'cline-pass/mimo-v2-flash', 'mimo/mimo-v2-flash']) {
+      expect(() => getShortModelName(id)).not.toThrow()
+      expect(getShortModelName(id)).toBe('MiMo v2 Flash')
+      expect(getModelCosts(id)).toEqual(getModelCosts('xiaomi/mimo-v2-flash'))
+    }
+  })
+
+  it('names the base MiMo 2.5 row without swallowing the Pro tier', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getModelCosts('mimo-v2.5')).not.toEqual(getModelCosts('mimo-v2.5-pro'))
+  })
+
+  it('stays unary so Array.map cannot feed the index as cycle state', () => {
+    expect(['mimo-v2.5', 'gpt-4o', 'cline-pass/mimo-v2.5-pro'].map(getShortModelName)).toEqual([
+      'MiMo v2.5',
+      'GPT-4o',
+      'MiMo v2.5 Pro',
+    ])
+  })
 
   it('does not map dated Qwen3 Max to a reseller price without provider context', () => {
     expect(getModelCosts('qwen3-max-2026-01-23')).toBeNull()
@@ -715,6 +1130,7 @@ describe('findUnpricedModels', () => {
     try {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: CACHE_SCHEMA_VERSION,
         timestamp: Date.now(),
         data: {
           'zz-zero-stub-model': {
@@ -780,11 +1196,201 @@ describe('findUnpricedModels', () => {
     expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
   })
 
+  it('skips subscription / flat-rate product SKUs where $0 is correct', () => {
+    const rows = [
+      { model: 'auto-genius', calls: 898, cost: 0, tokens: 35_300_000 },
+      { model: 'cline-pass/auto-genius', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'auto', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'kimi-for-coding-highspeed', calls: 12, cost: 0, tokens: 3_400_000 },
+      { model: 'moonshot/kimi-for-coding-highspeed', calls: 2, cost: 0, tokens: 80_000 },
+      { model: 'grok-composer-2.5-fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Grok Composer 2.5 Fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Warp Auto (efficient)', calls: 3, cost: 0, tokens: 50_000 },
+      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
+      { model: 'Codex Auto Review', calls: 2, cost: 0, tokens: 100 },
+      { model: 'big-pickle', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, cost: 0, tokens: 1200 },
+    ]
+    expect(findUnpricedModels(rows)).toEqual([
+      { model: 'warp', calls: 449, tokens: 17_700_000 },
+      // Note: NOT 'codex-auto-review' — #1056 aliases it to gpt-5.5, so it
+      // now resolves a billable rate and is filtered out here (a $0 row for
+      // it is stale data, not evidence of missing pricing). It still left
+      // the flat-rate list, verified separately in the "Codex activity ids
+      // (#1047)" describe block below.
+      { model: 'big-pickle', calls: 4, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
+      { model: 'Codex Auto Review', calls: 2, tokens: 100 },
+    ])
+  })
+
+  it('skips a user-declared flat-rate model, including path-prefixed siblings', () => {
+    const model = 'zz-my-pass-codename'
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+    setFlatRateModels([model])
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: `vendor/${model}`, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: 'zz-other-unknown', calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+  })
+
+  it('does not treat a priced sibling as expected-free just because a family is flat-rate', () => {
+    // warp-auto-* is a subscription SKU, but main already aliases it onto a
+    // billable row. Coverage must still count those priced calls.
+    expect(isFlatRateModel('warp-auto-efficient')).toBe(true)
+    expect(getModelCosts('warp-auto-efficient')).not.toBeNull()
+    expect(isExpectedFreeModel('warp-auto-efficient')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
+    expect(isExpectedFreeModel('auto')).toBe(true)
+    expect(isExpectedFreeModel('kimi-for-coding-highspeed')).toBe(true)
+    expect(isExpectedFreeModel('warp')).toBe(false)
+    expect(isExpectedFreeModel('codex-auto-review')).toBe(false)
+    expect(isExpectedFreeModel('zz-mystery-paid-model-999')).toBe(false)
+  })
+
+  it('lets --remove opt out of a built-in so a false positive can warn again', () => {
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    setFlatRateRemoved(['auto-genius'])
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(findUnpricedModels([{ model: 'cline-pass/auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'cline-pass/auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(isFlatRateModel('auto')).toBe(true)
+  })
+
   it('sorts by tokens, then calls', () => {
     const unpriced = findUnpricedModels([
       { model: 'zz-small', calls: 9, cost: 0, tokens: 10 },
       { model: 'zz-big', calls: 1, cost: 0, tokens: 9999 },
     ])
     expect(unpriced.map(u => u.model)).toEqual(['zz-big', 'zz-small'])
+  })
+})
+
+describe('parseLiteLLMEntry hardening', () => {
+  it('returns null instead of throwing on a null or non-object entry', () => {
+    // The live LiteLLM map is remote JSON; a null value for a model used to
+    // throw on the field reads and abort the whole pricing load.
+    expect(parseLiteLLMEntry(null as unknown as Parameters<typeof parseLiteLLMEntry>[0])).toBeNull()
+    expect(parseLiteLLMEntry(undefined as unknown as Parameters<typeof parseLiteLLMEntry>[0])).toBeNull()
+    expect(parseLiteLLMEntry(42 as unknown as Parameters<typeof parseLiteLLMEntry>[0])).toBeNull()
+  })
+
+  it('still parses a valid entry', () => {
+    const costs = parseLiteLLMEntry({ input_cost_per_token: 0.000003, output_cost_per_token: 0.000015 } as Parameters<typeof parseLiteLLMEntry>[0])
+    expect(costs).not.toBeNull()
+  })
+})
+
+describe('getModelAliasesConfigHash', () => {
+  it('is empty for no aliases, changes with content, ignores insertion order', () => {
+    setModelAliases({})
+    expect(getModelAliasesConfigHash()).toBe('')
+    setModelAliases({ 'my-model': 'claude-opus-4-6' })
+    const one = getModelAliasesConfigHash()
+    expect(one).not.toBe('')
+    setModelAliases({ 'b-model': 'gpt-5', 'my-model': 'claude-opus-4-6' })
+    const two = getModelAliasesConfigHash()
+    expect(two).not.toBe(one)
+    setModelAliases({ 'my-model': 'claude-opus-4-6', 'b-model': 'gpt-5' })
+    expect(getModelAliasesConfigHash()).toBe(two)
+    setModelAliases({})
+  })
+})
+
+describe('getFlatRateModelsConfigHash', () => {
+  it('is empty for no marks, changes with content, ignores insertion order', () => {
+    setFlatRateModels([])
+    expect(getFlatRateModelsConfigHash()).toBe('')
+    setFlatRateModels(['auto-genius'])
+    const one = getFlatRateModelsConfigHash()
+    expect(one).not.toBe('')
+    setFlatRateModels(['warp', 'auto-genius'])
+    const two = getFlatRateModelsConfigHash()
+    expect(two).not.toBe(one)
+    setFlatRateModels(['auto-genius', 'warp'])
+    expect(getFlatRateModelsConfigHash()).toBe(two)
+    setFlatRateModels([])
+  })
+
+  it('changes when a built-in is opted out', () => {
+    setFlatRateModels([])
+    setFlatRateRemoved([])
+    const baseline = getFlatRateModelsConfigHash()
+    setFlatRateRemoved(['auto-genius'])
+    expect(getFlatRateModelsConfigHash()).not.toBe(baseline)
+    setFlatRateRemoved([])
+    expect(getFlatRateModelsConfigHash()).toBe(baseline)
+  })
+})
+
+describe('pricing snapshot carries flat-rate marks', () => {
+  it('restorePricingState reapplies user flat-rate marks', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateModels(['zz-snapshot-flat'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModels).toEqual(['zz-snapshot-flat'])
+    setFlatRateModels([])
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(false)
+    restorePricingState(snap)
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(true)
+    setFlatRateModels([])
+  })
+
+  it('restorePricingState reapplies built-in opt-outs', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateRemoved(['auto-genius'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModelsRemoved).toEqual(['auto-genius'])
+    setFlatRateRemoved([])
+    expect(isFlatRateModel('auto-genius')).toBe(true)
+    restorePricingState(snap)
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    setFlatRateRemoved([])
+  })
+})
+
+describe('unpricedModelHint', () => {
+  it('never tells the user to alias unconditionally', () => {
+    expect(unpricedModelHint()).toContain('If a model is billed per token')
+    expect(unpricedModelHint()).toContain('model-flat-rate')
+    expect(unpricedModelHint()).not.toContain('Fix: codeburn model-alias')
+  })
+
+  it('names both hatches for a concrete unknown SKU', () => {
+    const hint = unpricedModelHint('zz-new-subscription-pass-sku')
+    expect(hint).toContain('codeburn model-alias "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('codeburn model-flat-rate "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('If a model is billed per token')
+    expect(hint).toContain('If $0 is correct')
+  })
+})
+
+describe('calculateCost verbose unknown-model warning', () => {
+  it('does not present model-alias as the only fix for an unknown SKU', () => {
+    const previous = process.env['CODEBURN_VERBOSE']
+    process.env['CODEBURN_VERBOSE'] = '1'
+    const chunks: string[] = []
+    const originalWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+      return (originalWrite as (chunk: string | Uint8Array, ...rest: unknown[]) => boolean)(chunk, ...args)
+    }) as typeof process.stderr.write
+    try {
+      expect(calculateCost('zz-new-subscription-pass-sku', 10, 10, 0, 0, 0)).toBe(0)
+    } finally {
+      process.stderr.write = originalWrite
+      if (previous === undefined) delete process.env['CODEBURN_VERBOSE']
+      else process.env['CODEBURN_VERBOSE'] = previous
+    }
+    const text = chunks.join('')
+    expect(text).toContain('zz-new-subscription-pass-sku')
+    expect(text).toContain('If a model is billed per token')
+    expect(text).toContain('model-flat-rate')
+    expect(text).toContain('model-alias')
+    expect(text).not.toMatch(/Map it with: codeburn model-alias/)
   })
 })

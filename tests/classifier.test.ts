@@ -79,11 +79,11 @@ describe('classifyTurn — Skill subCategory', () => {
     expect(c.subCategory).toBeUndefined()
   })
 
-  it('does not attach subCategory when category is not general (e.g. Skill alongside Edit promotes to coding)', () => {
+  it('attaches subCategory without changing the category when Skill fires alongside Edit', () => {
     const turn = makeTurn([makeCall({ tools: ['Skill', 'Edit'], skills: ['init'] })])
     const c = classifyTurn(turn)
     expect(c.category).toBe('coding')
-    expect(c.subCategory).toBeUndefined()
+    expect(c.subCategory).toBe('init')
   })
 
   it('does not attach subCategory for non-Skill general turns', () => {
@@ -153,6 +153,28 @@ describe('classifyTurn — feature vs debugging precedence (#196)', () => {
 })
 
 describe('classifyTurn — retry detection via toolSequence', () => {
+  it('does not count a read-shaped shell lookup between edits as a retry (#941)', () => {
+    // edit -> rg -> edit is research, not a failed verification loop.
+    const call = makeCall({ tools: ['Edit', 'Bash'] })
+    call.toolSequence = [[{ tool: 'Edit', file: 'a.ts' }], [{ tool: 'Bash', command: 'rg -n "helper" src/' }], [{ tool: 'Edit', file: 'a.ts' }]]
+    const turn = makeTurn([call], 'fix the build')
+    expect(classifyTurn(turn).retries).toBe(0)
+  })
+
+  it('still counts a verification-shaped shell command between edits as a retry (#941)', () => {
+    const call = makeCall({ tools: ['Edit', 'Bash'] })
+    call.toolSequence = [[{ tool: 'Edit', file: 'a.ts' }], [{ tool: 'Bash', command: 'npm test' }], [{ tool: 'Edit', file: 'a.ts' }]]
+    const turn = makeTurn([call], 'fix the build')
+    expect(classifyTurn(turn).retries).toBe(1)
+  })
+
+  it('keeps counting command-less bash steps as verification (unknown stays conservative)', () => {
+    const call = makeCall({ tools: ['Edit', 'Bash'] })
+    call.toolSequence = [[{ tool: 'Edit', file: 'a.ts' }], [{ tool: 'Bash' }], [{ tool: 'Edit', file: 'a.ts' }]]
+    const turn = makeTurn([call], 'fix the build')
+    expect(classifyTurn(turn).retries).toBe(1)
+  })
+
   it('detects retries from multi-call turns (Claude-style)', () => {
     const turn = makeTurn([
       makeCall({ tools: ['Edit'] }),

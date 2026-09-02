@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -81,6 +82,38 @@ const broadWindow = {
 }
 
 describe('yield repo grouping by canonical repository identity (issue #713)', () => {
+  it('groups path casing variants on case-insensitive filesystems', async () => {
+    const repoDir = await mkdtemp(join(tmpdir(), 'codeburn-yield-path-case-'))
+    try {
+      initRepo(repoDir)
+      await writeFile(join(repoDir, 'file.txt'), 'hello\n')
+      commitAt(repoDir, 'feat: shipped once', '2026-01-01T10:30:00Z')
+
+      const caseAlteredRepoDir = join(repoDir, '..', repoDir.split('/').pop()!.toUpperCase())
+      if (!existsSync(caseAlteredRepoDir)) return
+
+      const sessionOriginal = makeSession({ sessionId: 'case-original', project: 'app', ...tightWindow, totalCostUSD: 5 })
+      const sessionAltered = makeSession({ sessionId: 'case-altered', project: 'app', ...broadWindow, totalCostUSD: 3 })
+
+      parseAllSessionsMock.mockResolvedValue([
+        { project: 'app', projectPath: repoDir, sessions: [sessionOriginal] } as ProjectSummary,
+        { project: 'app', projectPath: caseAlteredRepoDir, sessions: [sessionAltered] } as ProjectSummary,
+      ])
+
+      const summary = await computeYield(range, repoDir)
+
+      const productive = summary.details.filter(d => d.category === 'productive')
+      expect(productive.map(d => d.sessionId)).toEqual(['case-original'])
+      expect(productive[0]!.commitCount).toBe(1)
+
+      const detailAltered = summary.details.find(d => d.sessionId === 'case-altered')!
+      expect(detailAltered.category).toBe('ambiguous')
+      expect(detailAltered.commitCount).toBe(0)
+    } finally {
+      await rm(repoDir, { recursive: true, force: true })
+    }
+  })
+
   it('credits one commit once across two monorepo subdirectory sessions', async () => {
     const repoDir = await mkdtemp(join(tmpdir(), 'codeburn-yield-monorepo-'))
     try {

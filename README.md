@@ -1,6 +1,13 @@
-<p align="center">
-  <a href="https://claude.com/open-source-max"><img src="https://img.shields.io/badge/Claude_for_Open_Source-Recipient-da7756?style=for-the-badge&labelColor=1a1a1a" alt="Claude for Open Source Recipient" /></a>
-</p>
+<table align="center">
+  <tr>
+    <td align="center" valign="middle">
+      <a href="https://claude.com/open-source-max"><img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/open-source-recipient.png" alt="Codex and Claude for Open Source Recipient" width="520" /></a>
+    </td>
+    <td align="center" valign="middle">
+      <a href="https://www.producthunt.com/products/codeburn?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-codeburn-2" target="_blank" rel="noopener noreferrer"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1220451&theme=dark&t=1786459783669" alt="CodeBurn - See where your AI coding spend actually goes | Product Hunt" width="250" height="54" /></a>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/providers.png" alt="CodeBurn" width="420" />
@@ -18,19 +25,19 @@
     <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/sponsor-♥-F97316?logo=github" alt="Sponsor" /></a>
 </p>
 
-<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 36 integrations honest.</p>
+<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 41 integrations honest.</p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
       <strong>Desktop</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/desktop.jpg" alt="CodeBurn Desktop" /><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/CodeBurn-0.9.16-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/CodeBurn-0.9.16.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/CodeBurn-Setup-0.9.16.exe"><img src="https://img.shields.io/badge/Windows-Setup-F97316?logoColor=white" alt="Download for Windows" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/codeburn-desktop_0.9.16_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/codeburn-desktop-0.9.16.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.16/CodeBurn-0.9.16.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
+      <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/codeburn-desktop_0.9.23_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/codeburn-desktop-0.9.23.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
     </td>
     <td align="center" width="50%">
       <strong>Web</strong><br/>
@@ -45,20 +52,28 @@
       <code>npx codeburn</code>
     </td>
     <td align="center" width="50%">
-      <strong>macOS Menubar</strong><br/>
+      <strong>Menubar</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
+      <code>codeburn menubar</code><br/>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <strong>Capacity Dock</strong> <em>&middot; native macOS menubar</em><br/>
+      <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/capacity-dock.jpg" alt="CodeBurn Capacity Dock showing live provider usage rings on the screen edge" width="66%" /><br/>
       <code>codeburn menubar</code>
     </td>
   </tr>
 </table>
 
-<p align="center"><em>Four surfaces, one source of truth: everything reads the session files already on your disk.</em></p>
+<p align="center"><em>One source of truth: every surface reads the session files already on your disk.</em></p>
 
-**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 36 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
+**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 41 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
 
 You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells you the total. It never tells you that half of it went to conversation instead of code, or that an expensive model burned your budget on work a cheaper one would have one-shot.
 
-CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **36 AI tools**.
+CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **41 AI tools**.
 
 Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
 
@@ -84,7 +99,7 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
 npx codeburn
 ```
 
-That opens the interactive dashboard (last 7 days by default). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
+That opens the interactive dashboard (today by default, or the last 7 days when today has no usage yet). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
 
 **Install it** for a permanent `codeburn` command:
 
@@ -100,7 +115,7 @@ Also runs via `bunx codeburn` or `pnpm dlx codeburn`, or `brew install codeburn`
 codeburn menubar
 ```
 
-On Linux, a GNOME Shell extension gives the same panel view; see [Linux (GNOME)](#linux-gnome).
+The same command installs the tray app on Windows; see [Windows](#windows). On Linux, a GNOME Shell extension gives it in the top panel; see [Linux (GNOME)](#linux-gnome).
 
 Requires **Node.js 22.13+** and at least one supported tool with session data on disk. For Cursor and OpenCode, `better-sqlite3` installs automatically.
 
@@ -110,7 +125,8 @@ Requires **Node.js 22.13+** and at least one supported tool with session data on
 codeburn overview                                    # this month, clean tables
 codeburn overview --no-color                         # plain text, ready to paste
 codeburn overview --from 2026-06-01 --to 2026-06-15  # any date range
-codeburn overview -p all                             # all time
+codeburn overview -p all                             # last 6 months
+codeburn overview -p lifetime                        # full history (uncapped)
 codeburn overview --provider claude                  # one tool only
 ```
 
@@ -148,6 +164,14 @@ codeburn optimize --format json         # setup health + findings as JSON
 
 `codeburn optimize` scans your sessions and your `~/.claude/` setup for waste patterns:
 
+For Claude Code, the optimize session count, the per-session findings, coaching,
+and model-default recommendations use user-started (main) sessions. Subagent
+sidechain transcripts are excluded from that population because their delegated
+context and delivery behavior are structurally different, and so is the re-read
+finding, since a subagent starts on a fresh context. Findings about how Claude
+uses tools (junk reads, read:edit ratio) and every spend, MCP, and
+configuration-overhead finding keep counting them.
+
 - Files Claude re-reads across sessions (same content, same context, over and over)
 - Low Read:Edit ratio (editing without reading leads to retries and wasted tokens)
 - Wasted bash output (uncapped `BASH_MAX_OUTPUT_LENGTH`, trailing noise)
@@ -158,6 +182,12 @@ codeburn optimize --format json         # setup health + findings as JSON
 - Context-heavy sessions where effective input/cache tokens swamp output
 - Possibly low-worth expensive sessions with no edit turns or repeated retries
   when no `git`/`gh` delivery command is observed
+
+Findings are grouped into three classes: **Fix now** (CodeBurn can apply it for you), **Habits**
+(you change how you drive the next session), and **FYI** (informational, the cost may be justified).
+Each one says whether its savings number is `measured` from provider-counted usage or `estimated`
+from a model. See [docs/optimize.md](docs/optimize.md) for what is scanned, what `--apply` may write,
+and how to read the health grade.
 
 Each finding shows the estimated token and dollar savings plus a ready-to-paste fix: a `CLAUDE.md` line, an environment variable, or a `mv` command to archive unused items. Findings are ranked by urgency (impact weighted against observed waste) and rolled up into an A to F setup health grade. Repeat runs classify each finding as new, improving, or resolved against a 48-hour recent window.
 
@@ -172,11 +202,12 @@ codeburn optimize --apply --yes       # apply every appliable fix without prompt
 codeburn act list                     # every change CodeBurn has made
 codeburn act undo --last              # roll the most recent change back
 codeburn act report                   # realized vs estimated savings
+codeburn optimize --auto-revert       # undo the applied fixes that measured no reduction
 ```
 
 `codeburn optimize` finds the waste; `--apply` fixes the config-class findings for you: settings values, environment variables, archiving unused agents and skills. Every change is backed up and journaled before it lands. `codeburn act list` shows the history and `codeburn act undo <id>` restores the original files (it refuses if the files changed since being applied, unless you pass `--force`).
 
-The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and later `codeburn optimize` runs show that realized figure in the header. Estimates get checked against reality, not just claimed.
+The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and every later `codeburn optimize` run lists it under `Applied fixes` with a plain verdict — worked, under its estimate, or did not help, with the undo command for that last case. `--auto-revert` undoes the ones that did nothing (never `CLAUDE.md` rules). Estimates get checked against reality, not just claimed.
 
 ## Guard your budget
 
@@ -273,6 +304,8 @@ Pairing is PIN-authorized and stays on your local network. You can also discover
 
 ## Menu bar
 
+### macOS
+
 ```bash
 codeburn menubar
 ```
@@ -305,6 +338,28 @@ defaults write org.agentseal.codeburn-menubar CodeBurnMenubarRefreshSeconds -int
 
 Seconds between refreshes: `60`, `300`, or `900`; `0` is Manual and `-1` is Auto. Takes effect on the next refresh tick, no relaunch needed.
 
+**Preferred terminal** decides where Full Report and Optimize open. Set it in Settings → General → Terminal, or from Terminal:
+
+```bash
+defaults write org.agentseal.codeburn-menubar CodeBurnPreferredTerminal -string iterm2
+```
+
+Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. Anything else falls back to `terminal`. Only terminals that can script a command into a live window are offered; if the chosen app is missing or fails to accept the command, CodeBurn tries Terminal.app and then runs the command in the background, logging each step to Console.app. Takes effect on the next launch of a command, no relaunch needed.
+
+### Windows
+
+Windows gets the same ambient view from the system tray, from the same one command:
+
+```powershell
+codeburn menubar
+```
+
+It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23).
+
+Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
+
+The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`) — it needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)). The `.msi` is unsigned for now, so SmartScreen prompts on first run.
+
 ### Linux (GNOME)
 
 Linux gets the same ambient view through a GNOME Shell extension (GNOME 45+): spend in the top panel, period switcher, compact mode, and daily budget alerts. It lives in [`gnome/`](gnome/):
@@ -315,7 +370,17 @@ git clone https://github.com/getagentseal/codeburn && cd codeburn/gnome
 gnome-extensions enable codeburn@codeburn.dev
 ```
 
-See [gnome/README.md](gnome/README.md) for settings and development notes. On Windows, `codeburn web` is the always-on view for now.
+See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
+
+### Omarchy
+
+Install the [CodeBurn Omarchy plugin](https://omarchyplugins.com/plugin.html?id=codeburn) to add CodeBurn to Omarchy:
+
+Community-maintained by [@erzz](https://github.com/erzz) — issues and feature requests go to [erzz/omarchy-codeburn](https://github.com/erzz/omarchy-codeburn).
+
+```bash
+omarchy plugin add https://github.com/erzz/omarchy-codeburn.git --enable
+```
 
 ## CodeBurn in your agent (MCP)
 
@@ -386,13 +451,13 @@ Adding a new provider is a single file. See `src/providers/codex.ts` for an exam
 <details>
 <summary><strong>All commands and keyboard shortcuts</strong></summary>
 
-Run `codeburn` for the dashboard, or use a subcommand below. Most commands also accept `--provider`, `--project` / `--exclude`, and a period flag (`-p today|week|30days|month|all`).
+Run `codeburn` for the dashboard, or use a subcommand below. Most commands also accept `--provider`, `--project` / `--exclude`, and a period flag (`-p today|week|30days|month|all|lifetime`).
 
 **Dashboard & reports**
 
 | Command | What it does |
 |---------|--------------|
-| `codeburn` | Interactive dashboard, last 7 days (the default view) |
+| `codeburn` | Interactive dashboard, today (falls back to the last 7 days when today is empty) |
 | `codeburn today` | Today's usage |
 | `codeburn month` | This calendar month's usage |
 | `codeburn overview` | Plain-text monthly summary, copy-pasteable (`--no-color`, `--from`/`--to`) |
@@ -400,7 +465,7 @@ Run `codeburn` for the dashboard, or use a subcommand below. Most commands also 
 | `codeburn report -p all` | Every recorded session |
 | `codeburn report --from 2026-04-01 --to 2026-04-10` | An exact date range |
 | `codeburn report --format json` | Full dashboard data as JSON, printed to stdout |
-| `codeburn report --refresh 60` | Auto-refresh every 60s (default 30s; `--refresh 0` disables) |
+| `codeburn report --refresh 60` | Auto-refresh every 60s (the minimum and default; `--refresh 0` disables) |
 
 **Status & export**
 
@@ -468,11 +533,12 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names). Per-token gaps go to `model-alias`; subscription / flat-rate SKUs go to `model-flat-rate`. JSON keeps IDs exact |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |
 
-Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, and 6 Months (use `--from` / `--to` for an exact historical window). The main Daily Activity panel always shows scrollable full history: use up/down to move one day, Page Up/Page Down (or Shift+Space/Space) to page, and `g`/`G` to jump to either end. These keys update the panel in place instead of moving terminal scrollback. Press `q` to quit, `1` `2` `3` `4` `5` as period shortcuts, `c` to open model comparison, or `o` to open optimize. The dashboard auto-refreshes every 30 seconds by default (`--refresh 0` to disable). It also shows average cost per session and the five most expensive sessions across all projects.
+Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, 6 Months, and Lifetime (use `--from` / `--to` for an exact historical window). Up/down scroll the full dashboard one line, Page Up/Page Down move one screen, and Home/End jump to either end. The main Daily Activity panel shows at least 10 dates from scrollable full history: use `j`/`k` to move one day, Shift+Space/Space to page, and `g`/`G` to jump to either end. Panels flow in the same order across three columns at maximum width, two at medium width, and one when narrow. In the three-column layout, all panels widen equally by one character for every three additional terminal columns until the dashboard reaches the lesser of 256 characters or the widest renderable source row. Press `q` to quit, `1` `2` `3` `4` `5` `6` as period shortcuts, `c` to open model comparison, or `o` to open optimize. Today, 7 Days, and concrete-day views refresh in place at most once per minute by default (`--refresh 0` to disable) without changing the active view or scroll position. The heavier aggregate views remain static between deliberate navigation changes. The dashboard also shows average cost per session and the five most expensive sessions across all projects.
 
 </details>
 
@@ -483,7 +549,7 @@ Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, and 6 Months
 
 ### Pricing
 
-Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing.
+Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing. Routing-gateway model ids are priced as the model they wrap: [OrcaRouter](https://www.orcarouter.ai) fusion route ids peel to their current upstream (`openai/gpt-oss-120b`), `orcarouter/auto` stays unpriced until a live probe pins the rotating target, and a nested upstream spelling (`orcarouter/deepseek/deepseek-v4-pro`) prices at that exact row, so a gateway-routed session reports real spend instead of $0.
 
 ### Task Categories
 
@@ -519,14 +585,16 @@ For categories that involve code edits, CodeBurn tracks file-aware retry cycles.
 codeburn plan set claude-max                                  # $200/month
 codeburn plan set claude-pro                                  # $20/month
 codeburn plan set cursor-pro                                  # $20/month
+codeburn plan set copilot-pro                                 # 1500 AI Credits ($15 equivalent)
 codeburn plan set custom --monthly-usd 200 --provider codex   # ChatGPT Pro-style custom plan
+codeburn plan set custom --credits 20000 --provider copilot   # org Copilot allotment
 codeburn plan reset --provider codex                          # remove one provider plan
 codeburn plan set none                                        # disable plan view
 codeburn plan                                                 # show configured plans
 codeburn plan reset                                           # remove plan config
 ```
 
-Subscription tracking for Claude Pro, Claude Max, Cursor Pro, and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. Presets use publicly stated plan prices (as of April 2026); they do not model exact token allowances, because vendors do not publish precise consumer-plan limits.
+Subscription tracking for Claude Pro, Claude Max, Cursor Pro, Copilot (AI credits), and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. USD presets use publicly stated plan prices (as of April 2026). Copilot presets use official individual AI-credit allotments (Pro 1,500 / Pro+ 7,000 / Max 20,000; fetched 2026-08-23) — not the $10 / $39 / $100 sticker prices — and spend is `total_nano_aiu / 1e9`, never token-priced USD.
 
 ### Currency
 
@@ -559,10 +627,11 @@ Aliases are stored in `~/.config/codeburn/config.json` and applied at runtime be
 ```bash
 codeburn price-override my-model --input 0.27 --output 1.10   # USD per 1M tokens
 codeburn model-savings "llama3.1:8b" gpt-4o                   # local model, counted as savings
+codeburn model-flat-rate auto-genius                          # subscription SKU, $0 is correct
 codeburn proxy-path ~/work/copilot-repo                       # subscription-covered project
 ```
 
-`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All three support `--list` and `--remove`.
+`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `model-flat-rate` marks a subscription-billed product SKU so the unpriced warning stays quiet and `model-alias` is not suggested — aliasing those ids invents spend. `--remove` also opts out of a built-in SKU. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All four support `--list` and `--remove`.
 
 ### Filtering
 
@@ -582,7 +651,7 @@ codeburn report --from 2026-04-01                    # this date through today
 codeburn report --to 2026-04-10                      # earliest data through this date
 ```
 
-Either flag alone is valid. Inverted or malformed dates exit with a clear error. In the TUI, the custom range sets the initial load only; pressing `1` through `5` switches back to predefined periods.
+Either flag alone is valid. Inverted or malformed dates exit with a clear error. In the TUI, the custom range sets the initial load only; pressing `1` through `6` switches back to predefined periods.
 
 ### Diagnosing detection
 
@@ -650,7 +719,7 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Claude Code** | `~/.claude/projects/<sanitized-path>/<session-id>.jsonl` | Each assistant entry carries model name, token usage (input, output, cache read, cache write), `tool_use` blocks, and timestamps. |
 | **Claude (multiple config dirs)** | Set via `CLAUDE_CONFIG_DIRS` (e.g. `~/.claude-work:~/.claude-personal`) | Scans every listed directory and merges sessions into one row per project so totals reflect all your Claude usage. Use `:` on POSIX, `;` on Windows; overrides `CLAUDE_CONFIG_DIR`. Missing or unreadable directories are skipped. |
 | **Codex (OpenAI)** | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, `~/.codex/archived_sessions/rollout-*.jsonl` | Reads `token_count` events (per-call and cumulative usage) and `function_call` entries for tool tracking; attributes cost by project working directory. `codeburn report --provider codex` views Codex alone. |
-| **Cursor** | SQLite `state.vscdb` under `globalStorage`: macOS `~/Library/Application Support/Cursor/User/globalStorage/`, Linux `~/.config/Cursor/User/globalStorage/`, Windows `%APPDATA%/Cursor/User/globalStorage/`; results cached at `~/.cache/codeburn/cursor-results.json` | Input tokens come from Cursor's own per-conversation context meter (`composerData.promptTokenBreakdown`), credited once per conversation on a stable anchor; tool calls and shell commands are read from the agent stream (`agentKv`), and Composer house models are priced from Cursor's published rates. Output is a reply-text estimate and cache tokens are server-side only, so figures are marked estimated and undercount the Cursor admin console for long conversations. The cache auto-invalidates when the database changes; the first run on a large database can take a minute. |
+| **Cursor** | SQLite `state.vscdb` under `globalStorage`: macOS `~/Library/Application Support/Cursor/User/globalStorage/`, Linux `~/.config/Cursor/User/globalStorage/`, Windows `%APPDATA%/Cursor/User/globalStorage/`; results cached at `~/.cache/codeburn/cursor-results.v<n>.json` | Input tokens come from Cursor's own per-conversation context meter (`composerData.promptTokenBreakdown`), credited once per conversation on a stable anchor; tool calls and shell commands are read from the agent stream (`agentKv`), and Composer house models are priced from Cursor's published rates. Output is a reply-text estimate and cache tokens are server-side only, so figures are marked estimated and undercount the Cursor admin console for long conversations. The cache auto-invalidates when the database changes; the first run on a large database can take a minute. |
 | **OpenCode** | SQLite `~/.local/share/opencode/opencode*.db` or file-based `~/.local/share/opencode/storage/` (respects `XDG_DATA_HOME`; `OPENCODE_DATA_DIR`/`OPENCODE_DB_PREFIX` for renamed/forked builds) | Queries `session`, `message`, and `part` read-only and recalculates cost via LiteLLM (falling back to OpenCode's own cost field for unpriced models). Subtask sessions (`parent_id IS NOT NULL`) are excluded to avoid double counting; multiple channel databases are supported. |
 | **Gemini CLI** | `~/.gemini/tmp/<project>/chats/session-*.json` | One JSON file per session with real token counts (input, output, cached, thoughts) per message, so no estimation is needed. Input is reported inclusive of cached, so CodeBurn subtracts cached before pricing to avoid double charging. |
 | **Antigravity (CLI & IDE)** | Session files under `.gemini/` folders, plus the running language server | Pulls granular trajectory and pricing from the language server process. For the short-lived CLI, optionally install a status-line hook with `codeburn antigravity-hook install` so usage is captured between menubar refreshes. The IDE is detected via the `--app-data-dir antigravity-ide` flag on Windows. |
@@ -658,13 +727,16 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Kiro** | `.chat` JSON files | Token counts are estimated from content length. The model is not exposed, so sessions are labeled `kiro-auto` and costed at Sonnet rates. |
 | **Mistral Vibe** | `~/.vibe/logs/session/` (or `$VIBE_HOME/logs/session/`); each folder has `meta.json` + `messages.jsonl` | Reads cumulative prompt/completion totals and model pricing from `meta.json`, then the first user prompt and tool calls from `messages.jsonl`. Emits one record per session (source data is cumulative, not per turn); subagent sessions under `agents/` are counted separately. |
 | **OpenClaw** | `~/.openclaw/agents/*.jsonl` (legacy `.clawdbot`, `.moltbot`, `.moldbot`) | Token usage comes from assistant message `usage` blocks; the model from `modelId` or `message.model`. |
+| **OpenClaude** | `~/.openclaude/projects/<slug>/*.jsonl` (or `$CODEBURN_OPENCLAUDE_DIR/projects/`) | Claude Code fork routed to any LLM backend; transcripts are Claude-Code schema. Only usage-bearing assistant lines become calls; no cost field exists, so every call is priced from the shared tables and flagged estimated. Sidechain (subagent) lines are counted as real spend. |
 | **Warp** | `~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable/warp.sqlite` (Preview fallback) | Reads `agent_conversations`, `ai_queries`, and `blocks`, emitting one call per finalized exchange. Exchange token share is estimated from prompt-size weighting normalized to conversation totals; `run_command` blocks attach to the nearest preceding exchange by timestamp. |
 | **Zed** | SQLite `~/Library/Application Support/Zed/threads/threads.db` (Linux `~/.local/share/zed/threads/`) | One row per agent thread; the blob is zstd-compressed JSON with per-request token usage (input, output, cache read, cache write) and the thread's model. Threads are topped up to the exact cumulative counter so totals match the store. Needs Node 22.15+ for built-in zstd. |
 | **Forge** | SQLite `~/.forge/.forge.db` | Queries `conversations` read-only and parses `context.messages`. Assistant usage entries provide prompt, completion, and cached counts; CodeBurn subtracts cached from prompt for input pricing, emits one call per assistant message, and extracts tool calls plus shell commands. |
 | **Pi / OMP** | `~/.pi/agent/sessions/<sanitized-cwd>/*.jsonl` (Pi), `~/.omp/agent/sessions/<sanitized-cwd>/*.jsonl` (OMP) | Each assistant message carries usage (input, output, cacheRead, cacheWrite) plus inline `toolCall` blocks. Tool names normalize to the standard set (`bash` → `Bash`, `dispatch_agent` → `Agent`); bash commands come from `toolCall.arguments.command`. |
 | **Codebuff** (formerly Manicode) | `~/.config/manicode/projects/<project>/chats/<chatId>/chat-messages.json` (honors `CODEBUFF_DATA_DIR`; walks `manicode-dev` / `manicode-staging`) | Bills in credits, so each completed assistant message is costed at the public rate of $0.01/credit via `msg.credits`. When an upstream provider's stashed RunState records token-level usage (`message.metadata.runState.sessionState.mainAgentState.messageHistory[*].providerOptions`), the real tokens and LiteLLM cost take precedence. Native tool names (`read_files`, `str_replace`, `run_terminal_command`, `spawn_agents`) normalize to `Read`, `Edit`, `Bash`, `Agent`. |
-| **Cline / Roo Code / KiloCode** | VS Code `globalStorage`: Cline at `saoudrizwan.claude-dev` and `~/.cline/data`; Roo Code and KiloCode across VS Code, VS Code Insiders, and VSCodium | Cline-family agents. CodeBurn reads `ui_messages.json` from each task directory, extracting token counts from `type: "say"` entries with `say: "api_req_started"`. |
+| **Cline / Roo Code / KiloCode** | VS Code `globalStorage` across VS Code, VS Code Insiders, and VSCodium (Cline at `saoudrizwan.claude-dev`, plus `~/.cline/data`) | Cline-family agents. CodeBurn reads `ui_messages.json` from each task directory, extracting token counts from `type: "say"` entries with `say: "api_req_started"`. |
+| **Cline CLI** | `~/.cline/data/sessions/<session-id>/` (honors `CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR`, `CLINE_DIR`) | The Cline command-line agent, whose layout is unrelated to the VS Code extension's. Reads `<session-id>.json` for session metadata and the rolled-up `usage`, and `<session-id>.messages.json` for the per-message `metrics` block (input, output, cacheRead, cacheWrite, cost) that becomes one call each. |
 | **CodeWhale** | `~/.codewhale/sessions/*.json` plus unmigrated legacy `~/.deepseek/sessions/*.json`; `$CODEWHALE_HOME/sessions` is an exact override | Emits one cumulative record per saved session. CodeWhale exposes only `total_tokens`, so CodeBurn preserves that aggregate in the input column rather than inventing an input/output split. Cost is the exact stored parent-session plus subagent USD total; model pricing is used only when the cost snapshot is absent. Tool blocks, shell commands, skills, and subagent types are retained. |
+| **DeepSeek Harness** (`dsh`) | `~/.dsh/sessions/--<slug>--/<session-id>/session.jsonl.zstd` (or `session.jsonl` when compression is off); `DSH_HOME` relocates the root | DeepSeek's open-source agent harness, unrelated to the CodeWhale desktop app. The `.zstd` log is a concatenation of independent zstd frames (one per write batch), decoded frame by frame; needs Node 22.15+. One call per `(turn, step)`, with usage from the step's `assistant/message` (the streamed `assistant/chunk` sample is a draft of the same call, never a second one). DSH records tokens but no cost, so calls are priced from the shared tables with reasoning billed at the output rate. |
 | **IBM Bob** | `User/globalStorage/ibm.bob-code/tasks/<task-id>/` (GA `IBM Bob` and preview `Bob-IDE` app folders) | Reads `ui_messages.json` for API request token/cost records and `api_conversation_history.json` for the selected model. |
 | **Kimi Code CLI** | `$KIMI_SHARE_DIR/sessions/<workdir-hash>/<session-id>/` or `~/.kimi/sessions/<workdir-hash>/<session-id>/` | Reads `wire.jsonl` `StatusUpdate.token_usage` records, mapping `input_other`, `input_cache_read`, `input_cache_creation`, and `output` into the standard token columns; includes subagents under each session's `subagents/` folder. |
 | **LingTai TUI** | `~/.lingtai/<agent>/logs/token_ledger.jsonl` plus project homes from `~/.lingtai-tui/registry.jsonl` (`<project>/.lingtai/<agent>/logs/token_ledger.jsonl`); honors `LINGTAI_HOME` / `LINGTAI_TUI_HOME` | Reads LingTai's append-only token ledger, mapping `input - cached` to fresh input, `cached` to cache reads, `output` to output, and `thinking` to reasoning. Nested daemon ledgers are skipped because parent ledgers already mirror daemon usage with `source`/`run_id` tags. |
@@ -704,18 +776,29 @@ CodeBurn deduplicates messages (by API message ID for Claude, by cumulative toke
 
 CodeBurn is free, runs entirely on your machine, and exists to cut your AI bill. If it has already saved you more than a sponsorship costs, consider sending a little of that back.
 
-Keeping 36 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
+Keeping 41 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
 
 Where your sponsorship goes:
 
 - **Honest numbers.** New models and price changes are mapped quickly, so your cost is the real cost, not a guess.
-- **More tools.** Every one of the 36 providers started as a single file. Sponsorship funds the next one.
+- **More tools.** Every one of the 41 providers started as a single file. Sponsorship funds the next one.
 - **Fast fixes.** When a vendor breaks something, paid time is what gets it patched now instead of someday.
 
 Sponsoring as a team or company? Your logo lands right here, in front of every developer who opens the repo. The first sponsor gets it to themselves until the next one shows up.
 
 <p align="center">
   <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/Sponsor_CodeBurn-♥-F97316?style=for-the-badge&logo=github&labelColor=1a1a1a" alt="Sponsor CodeBurn" /></a>
+</p>
+
+## Star History
+
+<p align="center">
+<!-- star-history:start -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
+  <img alt="Star history" src="assets/star-history/star-history-light.svg">
+</picture>
+<!-- star-history:end -->
 </p>
 
 ## License
@@ -729,3 +812,7 @@ CodeBurn is an AgentSeal open-source project and is not affiliated with CodeBurn
 Pricing data from [LiteLLM](https://github.com/BerriAI/litellm). Exchange rates from [Frankfurter](https://www.frankfurter.app/).
 
 Built by [AgentSeal](https://agentseal.org).
+
+## Acknowledgements
+
+The macOS Capacity Dock's provider-usage tracking was informed by [CodexBar](https://github.com/steipete/CodexBar) by Peter Steinberger ([@steipete](https://github.com/steipete)) — an MIT-licensed menubar app for AI provider usage. Thanks.

@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { aggregateModelStats, buildCompareJson, computeComparison, computeCategoryComparison, computeWorkingStyle, renderCompareJson, scanSelfCorrections, type ModelStats } from '../src/compare-stats.js'
+import { aggregateModelStats, buildCompareJson, computeComparison, computeCategoryComparison, computeWorkingStyle, findModelStat, renderCompareJson, scanSelfCorrections, type ModelStats } from '../src/compare-stats.js'
 import type { ProjectSummary, SessionSummary, ClassifiedTurn } from '../src/types.js'
 
 function makeTurn(model: string, cost: number, opts: { hasEdits?: boolean; retries?: number; outputTokens?: number; inputTokens?: number; cacheRead?: number; cacheWrite?: number; timestamp?: string; category?: string; hasAgentSpawn?: boolean; hasPlanMode?: boolean; speed?: 'standard' | 'fast'; tools?: string[] } = {}): ClassifiedTurn {
@@ -594,5 +594,90 @@ describe('computeWorkingStyle', () => {
     const result = computeWorkingStyle([project], 'model-a', 'model-b')
     const planning = result.find(r => r.label === 'Planning rate')!
     expect(planning.valueA).toBeCloseTo(50)
+  })
+})
+
+// Issue #767 item 1: `codeburn compare --model-a/--model-b` (both the JSON
+// path and the TUI picker) required the canonical model id (e.g.
+// claude-opus-4-8) with no way to pass the display name shown in the picker
+// itself (e.g. "Opus 4.8"). findModelStat is the shared lookup both surfaces
+// use, reusing getShortModelName (the existing canonical -> display mapping)
+// instead of a new alias table.
+describe('findModelStat', () => {
+  it('matches the exact canonical model id', () => {
+    const project = makeProject([makeTurn('claude-opus-4-6', 0.10)])
+    const stats = aggregateModelStats([project])
+    expect(findModelStat(stats, 'claude-opus-4-6')?.model).toBe('claude-opus-4-6')
+  })
+
+  it('matches the display name, case-insensitively', () => {
+    const project = makeProject([makeTurn('claude-opus-4-6', 0.10)])
+    const stats = aggregateModelStats([project])
+    expect(findModelStat(stats, 'opus 4.6')?.model).toBe('claude-opus-4-6')
+    expect(findModelStat(stats, 'Opus 4.6')?.model).toBe('claude-opus-4-6')
+  })
+
+  it('returns undefined for an unknown model', () => {
+    const project = makeProject([makeTurn('claude-opus-4-6', 0.10)])
+    const stats = aggregateModelStats([project])
+    expect(findModelStat(stats, 'claude-opus-9-9')).toBeUndefined()
+  })
+})
+
+// Copilot serve sets carry supplementary accounting calls (shutdown rollups,
+// residuals, store rows paired with an already-counted per-turn call). They hold
+// real tokens/cost but no behavioral evidence, so the compare report — which is
+// entirely per-call/per-turn ratios — must not weigh them.
+function supplement(turn: ClassifiedTurn, model: string, cost: number): ClassifiedTurn {
+  turn.assistantCalls.unshift({
+    ...turn.assistantCalls[0]!,
+    model,
+    costUSD: cost,
+    supplementaryAccounting: true,
+    deduplicationKey: `supp-${Math.random()}`,
+  })
+  return turn
+}
+
+describe('supplementary accounting weight', () => {
+  it('takes the primary model from the first behavioral call, not a leading supplementary one', () => {
+    const project = makeProject([
+      supplement(makeTurn('opus-4-6', 0.10, { hasEdits: true }), 'rollup-model', 0.01),
+    ])
+    const stats = aggregateModelStats([project])
+
+    expect(stats.find(s => s.model === 'opus-4-6')!.totalTurns).toBe(1)
+    expect(stats.find(s => s.model === 'rollup-model')?.totalTurns ?? 0).toBe(0)
+  })
+
+  it('keeps supplementary cost and tokens but does not count them as calls', () => {
+    const project = makeProject([
+      supplement(makeTurn('opus-4-6', 0.10), 'opus-4-6', 0.04),
+    ])
+    const m = aggregateModelStats([project]).find(s => s.model === 'opus-4-6')!
+
+    expect(m.calls).toBe(1)
+    expect(m.cost).toBeCloseTo(0.14)
+    expect(m.outputTokens).toBe(400)
+  })
+
+  it('excludes an accounting-only turn from every efficiency surface', () => {
+    const accountingOnly = makeTurn('opus-4-6', 0.09, { hasEdits: true, category: 'debugging', speed: 'fast', hasAgentSpawn: true })
+    accountingOnly.assistantCalls[0]!.supplementaryAccounting = true
+    const project = makeProject([
+      makeTurn('opus-4-6', 0.10, { hasEdits: true, category: 'coding' }),
+      accountingOnly,
+    ])
+
+    const m = aggregateModelStats([project]).find(s => s.model === 'opus-4-6')!
+    expect(m.totalTurns).toBe(1)
+    expect(m.editTurns).toBe(1)
+
+    const categories = computeCategoryComparison([project], 'opus-4-6', 'other-model')
+    expect(categories.map(c => c.category)).toEqual(['coding'])
+
+    const style = computeWorkingStyle([project], 'opus-4-6', 'other-model')
+    expect(style.find(r => r.label === 'Delegation rate')!.valueA).toBeCloseTo(0)
+    expect(style.find(r => r.label === 'Fast mode usage')!.valueA).toBeCloseTo(0)
   })
 })

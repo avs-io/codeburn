@@ -4,14 +4,17 @@ import { CliErrorPanel, CliErrorText } from '../components/CliErrorPanel'
 import { EmptyNote } from '../components/EmptyState'
 import { ListRow } from '../components/ListRow'
 import { Panel } from '../components/Panel'
+import { Punchcard } from '../components/Punchcard'
 import { Sankey } from '../components/Sankey'
 import { SectionSkeleton } from '../components/Skeleton'
 import { StackedBars } from '../components/StackedBars'
 import { StaleBanner } from '../components/StaleBanner'
+import { SwitchingBanner } from '../components/SwitchingBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
-import { contiguousDailyWindow, localDateKey } from '../lib/period'
+import { contiguousDailyWindow, dataStartKey, localDateKey } from '../lib/period'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { CliError, DateRange, MenubarPayload, Period, SpendFlow } from '../lib/types'
 
 type Project = MenubarPayload['current']['topProjects'][number]
@@ -31,6 +34,20 @@ function providerLabel(provider: string): string {
     .filter(Boolean)
     .map(part => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ')
+}
+
+function SpendPunchcard({ period, provider, range }: { period: Period; provider: string; range: DateRange | null }) {
+  const payload = usePolled<MenubarPayload>(
+    () => range ? codeburn.getTimeline(period, provider, range) : codeburn.getTimeline(period, provider),
+    [period, provider, range?.from, range?.to],
+  )
+  const timeline = payload.data?.history.timeline
+  if (!timeline) return null
+  return (
+    <Panel title="Spend punchcard" right="hour of day × weekday">
+      <Punchcard timeline={timeline} />
+    </Panel>
+  )
 }
 
 export function Spend({ period, provider, range = null }: { period: Period; provider: string; range?: DateRange | null }) {
@@ -61,7 +78,7 @@ export function SpendContent({
   const flow = usePolled<SpendFlow>(
     () => range ? codeburn.getSpendFlow(period, provider, range) : codeburn.getSpendFlow(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `spendflow|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('spendflow', period, provider, range) },
   )
 
   if (!overview.data) {
@@ -70,12 +87,13 @@ export function SpendContent({
   }
 
   const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`
-  return <SpendPage data={overview.data} flow={flow} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} />
+  return <SpendPage data={overview.data} flow={flow} period={period} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} />
 }
 
 function SpendPage({
   data,
   flow,
+  period,
   provider,
   range,
   staleError,
@@ -83,6 +101,7 @@ function SpendPage({
 }: {
   data: MenubarPayload
   flow: ReturnType<typeof usePolled<SpendFlow>>
+  period: Period
   provider: string
   range: DateRange | null
   staleError: CliError | null
@@ -100,6 +119,7 @@ function SpendPage({
         localDateKey(now),
       )
   const chartHasSpend = chartDaily.some(day => day.cost > 0)
+  const dataStart = dataStartKey(data.history.daily)
   const projects = data.current.topProjects
   const breakdowns = [
     {
@@ -150,10 +170,11 @@ function SpendPage({
 
   return (
     <>
+      {flow.switching && <SwitchingBanner />}
       {staleError && <StaleBanner error={staleError} />}
       <div className="spend-top-row">
         <Panel title="Daily spend by model" className="spend-chart-panel">
-          {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} animateKey={animateKey} /> : <EmptyNote>No model spend in this range yet.</EmptyNote>}
+          {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} animateKey={animateKey} dataStart={dataStart} /> : <EmptyNote>No model spend in this range yet.</EmptyNote>}
         </Panel>
         <ProjectBreakdown projects={projects} />
       </div>
@@ -167,6 +188,8 @@ function SpendPage({
           <EmptyNote>{flow.loading ? 'Loading cost flow…' : 'No model-project flow in this range yet.'}</EmptyNote>
         )}
       </Panel>
+
+      <SpendPunchcard period={period} provider={provider} range={range} />
 
       <div className="spend-breakdowns">
         {breakdowns.length ? (

@@ -22,15 +22,26 @@ import {
   detectLowWorthSessions,
   detectSessionOutliers,
   scanAndDetect,
+  cacheKey,
   computeHealth,
   computeTrend,
   buildOptimizeJsonReport,
+  renderOptimize,
+  findingBasis,
+  optimizeRemediationCopy,
+  optimizePasteHeader,
+  optimizeTuiPasteHeader,
+  optimizeEmptyScanLines,
+  sessionOpenerLabel,
+  askAgentLabel,
+  type FindingId,
   type ToolCall,
   type ApiCallMeta,
   type WasteFinding,
   type OptimizeResult,
 } from '../src/optimize.js'
 import type { ProjectSummary } from '../src/types.js'
+import type { AppliedFix } from '../src/act/types.js'
 
 function call(name: string, input: Record<string, unknown>, sessionId = 's1', project = 'p1'): ToolCall {
   return { name, input, sessionId, project }
@@ -51,6 +62,7 @@ function projectWithSessions(costs: number[], project = 'app'): ProjectSummary {
       totalCostUSD: cost,
       totalInputTokens: tokens,
       totalOutputTokens: tokens,
+      totalReasoningTokens: 0,
       totalCacheReadTokens: 0,
       totalCacheWriteTokens: 0,
       apiCalls: 1,
@@ -104,6 +116,7 @@ function contextSession(
     totalCostUSD: 1,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    totalReasoningTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
     apiCalls: 1,
@@ -233,6 +246,30 @@ describe('detectDuplicateReads', () => {
 })
 
 describe('detectLowReadEditRatio', () => {
+  it('counts read-shaped bash commands as reads (#941)', () => {
+    // 10 edits with 40 rg/cat/git-log lookups through the shell: a healthy
+    // 4:1 workflow that previously read as 0 reads and fired at high impact.
+    const calls = [
+      ...Array.from({ length: 20 }, () => call('Bash', { command: 'rg -n "pattern" src/' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'cat src/parser.ts | head -50' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'git log --oneline -5' })),
+      ...Array.from({ length: 10 }, () => call('Edit', {})),
+    ]
+    expect(detectLowReadEditRatio(calls)).toBeNull()
+  })
+
+  it('does not count mutating or unclassifiable bash as reads (#941)', () => {
+    const calls = [
+      ...Array.from({ length: 20 }, () => call('Bash', { command: 'npm test' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'cat notes.md && sed -i s/a/b/ src/x.ts' })),
+      ...Array.from({ length: 10 }, () => call('Bash', {})),
+      ...Array.from({ length: 10 }, () => call('Edit', {})),
+    ]
+    const finding = detectLowReadEditRatio(calls)
+    expect(finding).not.toBeNull()
+    expect(finding!.explanation).toContain('0 reads')
+  })
+
   it('returns null below minimum edit count', () => {
     const calls = [
       call('Edit', {}),
@@ -334,6 +371,18 @@ describe('detectContextBloat', () => {
       contextSession(0, {
         totalInputTokens: 100_000,
         totalOutputTokens: 5_000,
+      }),
+    ])
+
+    expect(detectContextBloat([project])).toBeNull()
+  })
+
+  it('counts reasoning with output when measuring context pressure', () => {
+    const project = projectWithContextSessions([
+      contextSession(0, {
+        totalInputTokens: 100_000,
+        totalOutputTokens: 3_500,
+        totalReasoningTokens: 2_000,
       }),
     ])
 
@@ -979,6 +1028,29 @@ describe('detectSessionOutliers', () => {
     expect(finding!.tokensSaved).toBeGreaterThan(0)
   })
 
+  it('keeps estimated-cost sessions out of the peer math', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    // The expensive session is priced from modelled tokens, so it is not
+    // comparable against the provider-reported peers and never gets flagged.
+    project.sessions[3]!.totalEstimatedCostUSD = project.sessions[3]!.totalCostUSD
+    expect(detectSessionOutliers([project])).toBeNull()
+  })
+
+  it('falls back to estimated costs when nothing else is priced, and says so', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    for (const s of project.sessions) s.totalEstimatedCostUSD = s.totalCostUSD
+    const finding = detectSessionOutliers([project])
+    expect(finding).not.toBeNull()
+    expect(finding!.basis).toBe('estimated')
+    expect(findingBasis(finding!)).toBe('estimated')
+  })
+
+  it('reports measured basis when every peer cost is provider-reported', () => {
+    const finding = detectSessionOutliers([projectWithSessions([1, 1, 1, 10])])
+    expect(finding!.basis).toBeUndefined()
+    expect(findingBasis(finding!)).toBe('measured')
+  })
+
   it('ignores tiny absolute-cost outliers', () => {
     expect(detectSessionOutliers([projectWithSessions([0.01, 0.01, 0.01, 0.2])])).toBeNull()
   })
@@ -1038,6 +1110,34 @@ describe('detectSessionOutliers', () => {
     const finding = result.findings.find(f => f.id === 'cost-outliers')
     expect(finding).toBeDefined()
     expect(finding!.explanation).toContain('app/s1')
+  })
+})
+
+describe('optimize cacheKey collision resistance', () => {
+  it('does not collide two datasets that share project count and api-call sum', () => {
+    // The old fingerprint was projectCount + sum(api calls) only, so any two
+    // datasets agreeing on those two numbers shared one cached OptimizeResult -
+    // the second scan got the first's findings. Same shape, different spend must
+    // now key differently.
+    const a = projectWithSessions([100, 1, 1, 1]) // 4 calls, cost 103
+    const b = projectWithSessions([1, 1, 1, 1])   // 4 calls, cost 4
+    const range = optimizeDateRange(4)
+    expect(a.totalApiCalls).toBe(b.totalApiCalls)
+    expect(cacheKey([a], range)).not.toBe(cacheKey([b], range))
+  })
+
+  it('is stable for the identical dataset (still caches a genuine repeat)', () => {
+    const a = projectWithSessions([5, 3, 2])
+    const range = optimizeDateRange(3)
+    expect(cacheKey([a], range)).toBe(cacheKey([projectWithSessions([5, 3, 2])], range))
+  })
+
+  it('separates a re-price that leaves call count unchanged', () => {
+    // A dataset re-priced (cost moves, calls do not) must not serve stale findings.
+    const before = projectWithSessions([10, 10])
+    const after = projectWithSessions([25, 10]) // same 2 calls, higher cost
+    const range = optimizeDateRange(2)
+    expect(cacheKey([before], range)).not.toBe(cacheKey([after], range))
   })
 })
 
@@ -1144,9 +1244,9 @@ describe('paste-fix destination tagging (issue #277)', () => {
       if (f.fix.type === 'paste') {
         expect(
           f.fix.destination,
-          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config`
+          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config / manual`
         ).toBeDefined()
-        expect(['claude-md', 'session-opener', 'prompt', 'shell-config'])
+        expect(['claude-md', 'session-opener', 'prompt', 'shell-config', 'manual'])
           .toContain(f.fix.destination)
       }
     }
@@ -1187,6 +1287,7 @@ describe('buildOptimizeJsonReport', () => {
       healthGrade: 'C',
       findings: [
         {
+          id: 'claude-md-too-long',
           title: 'Trim stale context',
           explanation: 'Old instructions are loaded every turn.',
           impact: 'medium',
@@ -1230,16 +1331,255 @@ describe('buildOptimizeJsonReport', () => {
       potentialSavingsPercent: 20,
       costRateUSD: 0.00002,
     })
+    expect(report.summary.measuredSavingsUSD).toBe(0)
+    expect(report.summary.byClass).toEqual({
+      fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+      nudge: { tokensSaved: 50_000, savingsUSD: 1, count: 1 },
+      keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    })
+    const classes = Object.values(report.summary.byClass)
+    expect(classes.reduce((s, c) => s + c.tokensSaved, 0)).toBe(report.summary.potentialSavingsTokens)
+    expect(classes.reduce((s, c) => s + c.savingsUSD, 0)).toBeCloseTo(report.summary.potentialSavingsCostUSD, 10)
+    expect(classes.reduce((s, c) => s + c.count, 0)).toBe(report.summary.findingCount)
+    expect(report.appliedFixes).toEqual([])
     expect(report.findings[0]).toMatchObject({
       title: 'Trim stale context',
       severity: 'medium',
       trend: 'active',
       tokensSaved: 50_000,
       estimatedSavingsUSD: 1,
+      class: 'nudge',
+      basis: 'estimated',
       fix: {
         type: 'paste',
         destination: 'claude-md',
       },
     })
+  })
+})
+
+describe('renderOptimize grouping', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function finding(id: FindingId, title: string): WasteFinding {
+    return {
+      id,
+      title,
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+    }
+  }
+
+  it('groups findings under fix / habits / FYI with continuous numbering and a basis split', () => {
+    const findings = [
+      finding('bash-output-cap', 'Cap bash output'),
+      finding('claude-md-too-long', 'Trim CLAUDE.md'),
+      finding('context-heavy-sessions', 'Context-heavy sessions'),
+    ]
+    const out = plain(renderOptimize(findings, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], []))
+
+    const headers = [
+      'Fix now (apply-able) · ~1.0K tokens (~$0.010) · 1 finding — codeburn optimize --apply',
+      'Habits · ~1.0K tokens (~$0.010) · 1 finding',
+      'FYI · ~1.0K tokens (~$0.010) · 1 finding',
+    ].map(h => out.indexOf(h))
+    expect(headers.every(i => i >= 0)).toBe(true)
+    expect(headers).toEqual([...headers].sort((a, b) => a - b))
+    // Headline is the whole board; the apply-able slice is named separately.
+    expect(out).toContain('Potential savings: ~3.0K tokens (~$0.030, ~0.3% of spend) — apply-able: ~$0.010')
+    expect(out).toContain('1. Cap bash output')
+    expect(out).toContain('2. Trim CLAUDE.md')
+    expect(out).toContain('3. Context-heavy sessions')
+    expect(out).toContain('1 measured · 2 estimated')
+    expect(out).not.toContain('Estimates only.')
+  })
+})
+
+describe('renderOptimize applied-fixes section', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function fixture(over: Partial<AppliedFix>): AppliedFix {
+    return {
+      id: 'abcdef12',
+      kind: 'mcp-remove',
+      findingId: 'unused-mcp',
+      appliedAt: '2026-05-01T00:00:00.000Z',
+      ageDays: 4,
+      verdict: 'worked',
+      estimatedTokens: 300_000,
+      realizedTokens: 280_000,
+      note: '',
+      undoCommand: 'codeburn act undo abcdef12',
+      ...over,
+    }
+  }
+
+  const findings: WasteFinding[] = [{
+    id: 'bash-output-cap',
+    title: 'Cap bash output',
+    explanation: 'why',
+    impact: 'medium',
+    tokensSaved: 1000,
+    fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+  }]
+
+  const render = (appliedFixes: AppliedFix[], f = findings): string =>
+    plain(renderOptimize(f, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], [], undefined, undefined, undefined, appliedFixes))
+
+  it('renders one line per verdict with its own glyph', () => {
+    const out = render([
+      fixture({}),
+      fixture({ id: 'b', findingId: 'mcp-defer-threshold', verdict: 'partial', ageDays: 3, estimatedTokens: 600_000, realizedTokens: 420_000 }),
+      fixture({ id: 'c', findingId: 'bash-output-cap', verdict: 'no-effect', ageDays: 5, estimatedTokens: 41_000, realizedTokens: 0, undoCommand: 'codeburn act undo cccccccc' }),
+      fixture({ id: 'd', findingId: 'mcp-remove-linear', verdict: 'pending', ageDays: 1 }),
+    ])
+
+    expect(out).toContain('Applied fixes')
+    expect(out).toContain('\u2713 unused-mcp (4d ago): est. 300.0K -> measured 280.0K')
+    expect(out).toContain('~ mcp-defer-threshold (3d ago): est. 600.0K -> measured 420.0K (-30% vs estimate)')
+    expect(out).toContain('\u2717 bash-output-cap (5d ago): est. 41.0K -> measured 0 - did not help. Revert: codeburn act undo cccccccc')
+    expect(out).toContain('\u2026 mcp-remove-linear (1d ago): measuring, check back after 3 days')
+  })
+
+  it('shows the section on a clean setup too, and omits it when nothing is applied', () => {
+    expect(render([fixture({})], [])).toContain('Applied fixes')
+    expect(render([])).not.toContain('Applied fixes')
+    expect(render([], [])).not.toContain('Applied fixes')
+  })
+})
+
+describe('provider-scoped remediation copy (#1044)', () => {
+  const strip = (s: string): string => s.replace(/\u001b\[[0-9;]*m/g, '')
+
+  function promptFinding(label: string): WasteFinding {
+    return {
+      id: 'retry-heavy-capabilities',
+      title: 'retry-heavy',
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label, text: 'audit' },
+    }
+  }
+
+  function openerFinding(label: string): WasteFinding {
+    return {
+      id: 'low-worth-sessions',
+      title: 'low-worth',
+      explanation: 'why',
+      impact: 'low',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'session-opener', label, text: 'open' },
+    }
+  }
+
+  it('keeps the exact shipped Claude / CLAUDE.md strings', () => {
+    for (const provider of [undefined, 'all', 'claude'] as const) {
+      const copy = optimizeRemediationCopy(provider)
+      expect(copy).toEqual({ agent: 'Claude', instructionFile: 'CLAUDE.md' })
+      expect(optimizePasteHeader('prompt', copy)).toBe('Ask Claude in the current session')
+      expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to CLAUDE.md)')
+      expect(sessionOpenerLabel(copy)).toBe('Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):')
+      expect(askAgentLabel(copy, 'audit the retry-heavy capability before changing config'))
+        .toBe('Ask Claude to audit the retry-heavy capability before changing config:')
+      expect(optimizeEmptyScanLines(provider)).toEqual([
+        'CodeBurn optimize scans your Claude Code sessions and config for',
+        'token waste: junk directory reads, duplicate file reads, unused',
+        'agents/skills/MCP servers, bloated CLAUDE.md, and more.',
+      ])
+      expect(optimizeTuiPasteHeader('session-opener', provider))
+        .toBe('── One-time session opener (do not add to CLAUDE.md) '.padEnd(64, '─'))
+      expect(optimizeTuiPasteHeader('prompt', provider))
+        .toBe('── Ask Claude in the current session '.padEnd(64, '─'))
+    }
+    const empty = strip(renderOptimize([], 0, 'lifetime', 0, 0, 0, 100, 'A', [], []))
+    expect(empty).toContain('CodeBurn optimize scans your Claude Code sessions and config for')
+    expect(empty).toContain('bloated CLAUDE.md')
+    expect(empty).not.toContain('Claude sessions')
+  })
+
+  it('uses Codex / AGENTS.md for --provider codex', () => {
+    const copy = optimizeRemediationCopy('codex')
+    expect(copy).toEqual({ agent: 'Codex', instructionFile: 'AGENTS.md' })
+    expect(optimizePasteHeader('prompt', copy)).toBe('Ask Codex in the current session')
+    expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to AGENTS.md)')
+    expect(sessionOpenerLabel(copy)).toContain('AGENTS.md')
+    expect(sessionOpenerLabel(copy)).not.toContain('CLAUDE.md')
+    expect(optimizeEmptyScanLines('codex')[0]).toBe('Session-scan detectors do not cover Codex yet.')
+    expect(optimizeEmptyScanLines('codex')[2]).toContain('currently scan Claude Code only')
+    expect(optimizeEmptyScanLines('codex').join(' ')).not.toContain('scans your Codex')
+    expect(optimizeEmptyScanLines('codex').join(' ')).not.toContain('bloated AGENTS.md')
+    expect(optimizeTuiPasteHeader('prompt', 'codex')).toContain('Ask Codex in the current session')
+    expect(optimizeTuiPasteHeader('session-opener', 'codex')).toContain('do NOT add to AGENTS.md')
+    expect(optimizeTuiPasteHeader('session-opener', 'codex')).not.toContain('CLAUDE.md')
+  })
+
+  it('uses the canonical Provider.displayName, not a title-cased id', () => {
+    expect(optimizeRemediationCopy('hermes').agent).toBe('Hermes Agent')
+    expect(optimizeRemediationCopy('cursor').agent).toBe('Cursor')
+    expect(optimizeRemediationCopy('cursor').instructionFile).toBe('project instructions')
+    expect(optimizePasteHeader('session-opener', optimizeRemediationCopy('cursor')))
+      .toBe('One-time session opener (do NOT add to project instructions)')
+  })
+
+  it('scopes every cross-provider detector label, including JSON', () => {
+    const lowWorth = detectLowWorthSessions([
+      projectWithLowWorthSessions([lowWorthSession(4, 0, { turns: [lowWorthTurn({ hasEdits: false })] })]),
+    ], 'codex')
+    const context = detectContextBloat([
+      projectWithContextSessions([contextSession(0, {
+        totalInputTokens: 90_000,
+        totalCacheReadTokens: 30_000,
+        totalOutputTokens: 2_000,
+      })]),
+    ], undefined, 'codex')
+    const outliers = detectSessionOutliers([projectWithSessions([1, 1, 1, 10])], undefined, 'codex')
+    const turns = Array.from({ length: 5 }, (_, i) => reliabilityTurn(i, {
+      retries: i < 3 ? 1 : 0,
+      call: { tools: ['Edit', 'Skill'], skills: ['reviewer'] },
+    }))
+    const retry = detectCapabilityReliability([projectWithReliabilityTurns(turns)], 'codex')
+
+    const findings = [lowWorth, context, outliers, retry]
+    expect(findings.every(Boolean)).toBe(true)
+    for (const finding of findings) {
+      expect(finding!.fix.label).not.toContain('Claude')
+      expect(finding!.fix.label).not.toContain('CLAUDE.md')
+    }
+    expect(lowWorth!.fix.label).toContain('AGENTS.md')
+    expect(context!.fix.label).toContain('AGENTS.md')
+    expect(outliers!.fix.label).toContain('AGENTS.md')
+    expect(retry!.fix.label).toBe('Ask Codex to audit the retry-heavy capability before changing config:')
+
+    const json = buildOptimizeJsonReport(
+      [projectWithSessions([1])],
+      'lifetime',
+      { findings: findings as WasteFinding[], costRate: 0.00001, healthScore: 80, healthGrade: 'B', modelRecommendations: [] },
+    )
+    expect(json.findings).toHaveLength(4)
+    for (const row of json.findings) {
+      expect(row.fix.label).not.toContain('Claude')
+      expect(row.fix.label).not.toContain('CLAUDE.md')
+    }
+  })
+
+  it('renders destination headers from the selected provider, not the finding text', () => {
+    const out = strip(renderOptimize(
+      [promptFinding('Ask Claude to audit the retry-heavy capability before changing config:')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(out).toContain('Ask Codex in the current session')
+    expect(out).not.toContain('Ask Claude in the current session')
+
+    const opener = strip(renderOptimize(
+      [openerFinding('Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(opener).toContain('do NOT add to AGENTS.md')
+    expect(opener).not.toContain('do NOT add to CLAUDE.md')
   })
 })

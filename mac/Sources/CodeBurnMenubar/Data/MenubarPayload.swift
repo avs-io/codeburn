@@ -4,6 +4,11 @@ import Foundation
 /// `current` is scoped to the requested period; the whole payload reflects that slice.
 struct MenubarPayload: Codable, Sendable {
     let generated: String
+    /// Present and `true` only when this payload was assembled from a
+    /// read-only stale serve. Absent — never `false` — on a fresh payload;
+    /// absence must be read as "assume fresh," including for payloads from
+    /// a CLI version that predates this field.
+    let stale: Bool?
     let current: CurrentBlock
     let optimize: OptimizeBlock
     let history: HistoryBlock
@@ -15,8 +20,10 @@ struct MenubarPayload: Codable, Sendable {
          optimize: OptimizeBlock,
          history: HistoryBlock,
          combined: CombinedUsage?,
-         claudeConfigs: ClaudeConfigSelector? = nil) {
+         claudeConfigs: ClaudeConfigSelector? = nil,
+         stale: Bool? = nil) {
         self.generated = generated
+        self.stale = stale
         self.current = current
         self.optimize = optimize
         self.history = history
@@ -25,12 +32,13 @@ struct MenubarPayload: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case generated, current, optimize, history, combined, claudeConfigs
+        case generated, stale, current, optimize, history, combined, claudeConfigs
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         generated = try c.decode(String.self, forKey: .generated)
+        stale = try c.decodeIfPresent(Bool.self, forKey: .stale)
         current = try c.decode(CurrentBlock.self, forKey: .current)
         optimize = try c.decode(OptimizeBlock.self, forKey: .optimize)
         history = try c.decode(HistoryBlock.self, forKey: .history)
@@ -178,6 +186,24 @@ struct RoutingWaste: Codable, Sendable {
     let byModel: [RoutingWasteModelEntry]
 }
 
+/// Workflow-intelligence rollup for the period. `correctionRate` and
+/// `medianTimeToFirstEditMs` are null when not computable (no user turns / no
+/// session ever edited), so both are optional.
+struct WorkflowBlock: Codable, Sendable {
+    let corrections: Int
+    let correctionRate: Double?
+    let medianTimeToFirstEditMs: Double?
+}
+
+/// One entry of `topReworkedFiles`. `path` is basename-only (the CLI trims it
+/// for privacy before the payload can leave the machine); `sessions` is the
+/// distinct-session count and `edits` the total edit-family calls.
+struct ReworkedFileEntry: Codable, Sendable {
+    let path: String
+    let sessions: Int
+    let edits: Int
+}
+
 struct CurrentBlock: Codable, Sendable {
     let label: String
     let cost: Double
@@ -193,6 +219,8 @@ struct CurrentBlock: Codable, Sendable {
     let topModels: [ModelEntry]
     let localModelSavings: LocalModelSavings
     let providers: [String: Double]
+    /// Stable provider identity plus period activity. Empty for older CLI payloads.
+    var providerDetails: [ProviderDetail] = []
     let topProjects: [ProjectEntry]
     let modelEfficiency: [ModelEfficiencyEntry]
     let topSessions: [TopSessionEntry]
@@ -202,14 +230,37 @@ struct CurrentBlock: Codable, Sendable {
     let skills: [SkillEntry]
     let subagents: [SubagentEntry]
     let mcpServers: [McpServerEntry]
+    /// Workflow-intelligence rollup. Optional so payloads from older CLIs
+    /// (which never emit it) still decode; absent -> the Workflow strip hides.
+    /// Declared last with a default so the memberwise initializer stays
+    /// backward-compatible for existing construction sites.
+    var workflow: WorkflowBlock? = nil
+    /// Files most reworked by edit-family calls. Empty on older CLIs.
+    var topReworkedFiles: [ReworkedFileEntry] = []
+    /// Attributed pull-request spend for the period (all-provider payloads
+    /// only). Optional so payloads from older CLIs still decode; absent or
+    /// empty -> the Pull requests section hides.
+    var pullRequests: PullRequestsBlock? = nil
+}
+
+struct PullRequestsBlock: Codable, Sendable {
+    let rows: [PullRequestRow]
+}
+
+struct PullRequestRow: Codable, Sendable {
+    let url: String
+    let label: String
+    let cost: Double
+    let sessions: Int
 }
 
 extension CurrentBlock {
     enum CodingKeys: String, CodingKey {
         case label, cost, calls, sessions, oneShotRate, inputTokens, outputTokens,
-             cacheHitPercent, codexCredits, topActivities, topModels, localModelSavings, providers, topProjects,
+             cacheHitPercent, codexCredits, topActivities, topModels, localModelSavings, providers, providerDetails, topProjects,
              modelEfficiency, topSessions, retryTax, routingWaste,
-             tools, skills, subagents, mcpServers
+             tools, skills, subagents, mcpServers,
+             workflow, topReworkedFiles, pullRequests
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -226,6 +277,7 @@ extension CurrentBlock {
         topModels = try c.decodeIfPresent([ModelEntry].self, forKey: .topModels) ?? []
         localModelSavings = try c.decodeIfPresent(LocalModelSavings.self, forKey: .localModelSavings) ?? LocalModelSavings(totalUSD: 0, calls: 0, byModel: [], byProvider: [])
         providers = try c.decodeIfPresent([String: Double].self, forKey: .providers) ?? [:]
+        providerDetails = try c.decodeIfPresent([ProviderDetail].self, forKey: .providerDetails) ?? []
         topProjects = try c.decodeIfPresent([ProjectEntry].self, forKey: .topProjects) ?? []
         modelEfficiency = try c.decodeIfPresent([ModelEfficiencyEntry].self, forKey: .modelEfficiency) ?? []
         topSessions = try c.decodeIfPresent([TopSessionEntry].self, forKey: .topSessions) ?? []
@@ -235,6 +287,62 @@ extension CurrentBlock {
         skills = try c.decodeIfPresent([SkillEntry].self, forKey: .skills) ?? []
         subagents = try c.decodeIfPresent([SubagentEntry].self, forKey: .subagents) ?? []
         mcpServers = try c.decodeIfPresent([McpServerEntry].self, forKey: .mcpServers) ?? []
+        workflow = try c.decodeIfPresent(WorkflowBlock.self, forKey: .workflow)
+        topReworkedFiles = try c.decodeIfPresent([ReworkedFileEntry].self, forKey: .topReworkedFiles) ?? []
+        pullRequests = try c.decodeIfPresent(PullRequestsBlock.self, forKey: .pullRequests)
+    }
+}
+
+struct ProviderDetail: Codable, Sendable {
+    let id: String
+    let label: String
+    let cost: Double
+    let calls: Int
+    let hasUsage: Bool
+
+    init(id: String, label: String, cost: Double, calls: Int, hasUsage: Bool) {
+        self.id = id
+        self.label = label
+        self.cost = cost
+        self.calls = calls
+        self.hasUsage = hasUsage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, cost, calls, hasUsage
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        label = try c.decode(String.self, forKey: .label)
+        cost = try c.decode(Double.self, forKey: .cost)
+        // Older CLIs emitted providerDetails without calls/hasUsage. When calls
+        // exists, derive activity from calls/cost; with neither signal, keep the
+        // detected provider visible rather than hiding valid $0 subscriptions.
+        let decodedCalls = try c.decodeIfPresent(Int.self, forKey: .calls)
+        calls = decodedCalls ?? 0
+        if let decodedUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) {
+            hasUsage = decodedUsage
+        } else if decodedCalls != nil {
+            hasUsage = cost > 0 || calls > 0
+        } else {
+            hasUsage = true
+        }
+    }
+}
+
+enum ProviderVisibility {
+    static func activeKeys(
+        providerDetails: [ProviderDetail],
+        legacyProviders: [String: Double]
+    ) -> Set<String> {
+        if !providerDetails.isEmpty {
+            return Set(providerDetails
+                .filter(\.hasUsage)
+                .flatMap { [$0.id.lowercased(), $0.label.lowercased()] })
+        }
+        return Set(legacyProviders.keys.map { $0.lowercased() })
     }
 }
 

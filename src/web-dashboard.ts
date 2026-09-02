@@ -90,6 +90,15 @@ function openBrowser(url: string): void {
   }
 }
 
+export function injectDashboardBootstrap(html: string, payload: unknown): string {
+  const json = JSON.stringify(payload)
+  if (json === undefined) throw new TypeError('dashboard bootstrap payload is not serializable')
+  // Keep the JSON safe at the boundary where it enters an HTML script. This is
+  // deliberately inside the helper so callers cannot forget the escape.
+  const safeJson = json.replace(/</g, String.fromCharCode(92) + 'u003c')
+  return html.replace('<script type="module"', () => `<script>window.__CODEBURN_BOOTSTRAP__=${safeJson}</script>\n    <script type="module"`)
+}
+
 export async function runWebDashboard(opts: {
   period: string
   provider: string
@@ -116,10 +125,7 @@ export async function runWebDashboard(opts: {
   // process cannot). Store the promise before any await so concurrent identical
   // requests collapse into one parse instead of racing.
   const localPayloadCache = new Map<string, { at: number; payload: Promise<MenubarPayload> }>()
-  const getLocalPayload = (period: string, provider: string, from?: string, to?: string): Promise<MenubarPayload> => {
-    const key = `${period}|${provider}|${from ?? ''}|${to ?? ''}`
-    const hit = localPayloadCache.get(key)
-    if (hit && Date.now() - hit.at < LOCAL_PAYLOAD_TTL_MS) return hit.payload
+  const rebuildPayload = (key: string, period: string, provider: string, from?: string, to?: string): Promise<MenubarPayload> => {
     const periodInfo = periodInfoFromQuery({ period, from, to }, opts.period)
     const payload = buildMenubarPayloadForRange(periodInfo, { provider, project: opts.project, exclude: opts.exclude, optimize: false })
     const now = Date.now()
@@ -128,6 +134,30 @@ export async function runWebDashboard(opts: {
     void payload.catch(() => localPayloadCache.delete(key))
     return payload
   }
+  const getLocalPayload = (period: string, provider: string, from?: string, to?: string): Promise<MenubarPayload> => {
+    const key = `${period}|${provider}|${from ?? ''}|${to ?? ''}`
+    const hit = localPayloadCache.get(key)
+    if (hit && Date.now() - hit.at < LOCAL_PAYLOAD_TTL_MS) {
+      // Stale-while-revalidate: past 75% of the TTL, hand back the cached
+      // payload instantly and rebuild behind it, so the TTL expiry never
+      // lands its multi-second parse on a user's click.
+      if (Date.now() - hit.at > LOCAL_PAYLOAD_TTL_MS * 0.75) void rebuildPayload(key, period, provider, from, to).catch(() => {})
+      return hit.payload
+    }
+    return rebuildPayload(key, period, provider, from, to)
+  }
+
+  // Warm every period tab shortly after startup, sequentially, so the first
+  // click on 7d/30d/Month answers from the payload cache instead of paying a
+  // full parse. Lifetime is deliberately last-and-optional: it is the rarest
+  // tab and the costliest parse. Failures are ignored - a prefetch is never
+  // load-bearing.
+  const prefetchPeriods = async (): Promise<void> => {
+    for (const period of ['today', 'week', '30days', 'month', 'all', 'lifetime']) {
+      try { await getLocalPayload(period, opts.provider, opts.from, opts.to) } catch { /* not load-bearing */ }
+    }
+  }
+  setTimeout(() => { void prefetchPeriods() }, 500)
 
   // Context trees re-read a whole transcript (up to 100MB), so cache each by
   // file version. Keyed on mtime: an active session invalidates itself.
@@ -159,9 +189,7 @@ export async function runWebDashboard(opts: {
     const html = await readFile(filePath, 'utf8')
     const payload = await getLocalPayload(opts.period, opts.provider, opts.from, opts.to)
     const devices = [{ id: 'local', name: hostname(), local: true, payload }]
-    // Escape every '<' so a device/model/project name can't close the <script>.
-    const json = JSON.stringify({ devices }).replace(/</g, String.fromCharCode(92) + 'u003c')
-    const injected = html.replace('<script type="module"', `<script>window.__CODEBURN_BOOTSTRAP__=${json}</script>\n    <script type="module"`)
+    const injected = injectDashboardBootstrap(html, { devices })
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
     res.end(injected)
   }
@@ -322,8 +350,12 @@ export async function runWebDashboard(opts: {
           writeJsonError(res, 400, 'provider (claude|codex) and id are required')
           return
         }
+        // findClaudeSession/findCodexSession resolve an id prefix the same way
+        // `codeburn context <session>` does (see context-tree.ts's resolveSession) -
+        // trust that match instead of re-requiring the full id here, so a prefix
+        // that works on the CLI works through the API too.
         const ref = provider === 'claude' ? await findClaudeSession(id) : await findCodexSession(id)
-        if (!ref || ref.sessionId !== id) {
+        if (!ref) {
           writeJsonError(res, 404, `no ${provider} session ${id}`)
           return
         }

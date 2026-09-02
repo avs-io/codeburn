@@ -1,6 +1,8 @@
-import type { DailyEntry } from './daily-cache.js'
+import type { DailyEntry, ProjectDayStats, ProviderDaySlice } from './daily-cache.js'
 import type { PeriodData } from './menubar-json.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
+import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
+import { billableOutputTokens } from './models.js'
 
 function emptyEntry(date: string): DailyEntry {
   return {
@@ -26,34 +28,102 @@ export function dateKey(iso: string): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntry[] {
+/// Bucket an ISO timestamp under an explicit IANA timezone instead of the
+/// machine's local one. `en-CA` emits the ISO-ish YYYY-MM-DD layout directly,
+/// so formatToParts under the given `timeZone` yields exactly that shape. Used
+/// to re-aggregate the same parse under a cache's OLD tzKey when a timezone
+/// change forces a full re-derive (issue #770): comparing that bucketing to the
+/// fresh one shows exactly which turns re-bucketed across local midnight.
+export function dateKeyInTz(iso: string, tz: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(iso))
+  let year = '', month = '', day = ''
+  for (const p of parts) {
+    if (p.type === 'year') year = p.value
+    else if (p.type === 'month') month = p.value
+    else if (p.type === 'day') day = p.value
+  }
+  return `${year}-${month}-${day}`
+}
+
+function emptySlice(): ProviderDaySlice {
+  return {
+    calls: 0, cost: 0, savingsUSD: 0,
+    sessions: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    editTurns: 0, oneShotTurns: 0, models: {}, categories: {},
+  }
+}
+
+export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn: (iso: string) => string = dateKey): DailyEntry[] {
   const byDate = new Map<string, DailyEntry>()
   const ensure = (date: string): DailyEntry => {
     let d = byDate.get(date)
     if (!d) { d = emptyEntry(date); byDate.set(date, d) }
     return d
   }
+  const ensureSlice = (day: DailyEntry, provider: string): ProviderDaySlice => {
+    let s = day.providers[provider]
+    if (!s) { s = emptySlice(); day.providers[provider] = s }
+    return s
+  }
+  const ensureProject = (holder: { projects?: Record<string, ProjectDayStats> }, project: string, path?: string): ProjectDayStats => {
+    const projects = (holder.projects ??= {})
+    // defineProperty so a project directory named "__proto__" becomes an own
+    // key instead of mutating the prototype link.
+    let p = Object.hasOwn(projects, project) ? projects[project] : undefined
+    if (!p) {
+      p = { cost: 0, calls: 0, savingsUSD: 0, sessions: 0 }
+      Object.defineProperty(projects, project, { value: p, enumerable: true, writable: true, configurable: true })
+    }
+    if (!p.path && path) p.path = path
+    return p
+  }
 
   for (const project of projects) {
     for (const session of project.sessions) {
-      const sessionDate = dateKey(session.firstTimestamp)
-      ensure(sessionDate).sessions += 1
+      const sessionDate = dateKeyFn(session.firstTimestamp)
+      const sessionDay = ensure(sessionDate)
+      sessionDay.sessions += 1
+      ensureProject(sessionDay, session.project, project.projectPath).sessions += 1
+      // A session belongs to exactly one provider; its calls all carry it.
+      const sessionProvider = session.turns.flatMap(t => t.assistantCalls)[0]?.provider
+      if (sessionProvider) {
+        const slice = ensureSlice(sessionDay, sessionProvider)
+        slice.sessions! += 1
+        ensureProject(slice, session.project, project.projectPath).sessions += 1
+      }
 
       for (const turn of session.turns) {
         if (turn.assistantCalls.length === 0) continue
-        // Turn-anchored bucketing: attribute the WHOLE turn — every one of its
-        // calls — to the day of the turn's user-message timestamp, matching the
-        // live headline/report rollup (main.ts daily). Falls back to the first
-        // assistant-call timestamp when the user line is missing (continuation
-        // sessions that begin mid-conversation). Previously the calls were
-        // bucketed per-call by each call's own timestamp, so a midnight-
-        // straddling turn split across two days and history.daily / the provider
-        // breakdown never reconciled to current.cost (a constant offset).
-        const turnDate = dateKey(turn.timestamp || turn.assistantCalls[0]!.timestamp)
+        // Two bucketing rules, deliberately different per level:
+        // - Turn-level judgments (category, editTurns, oneShotTurns) stay
+        //   anchored to the turn's day (its timestamp — the user-message time,
+        //   or the re-anchored first surviving call when the parser sliced
+        //   the turn to a range, and falling back to the first assistant call
+        //   when the user line is missing). They describe the whole exchange,
+        //   not a per-call sum, so a sliced straddling turn reports them on
+        //   each side's anchor day — summed across days they inflate, which
+        //   is the accepted, documented semantics (see review on #852).
+        // - Call-derived values (cost/savings/calls/tokens and the model,
+        //   project, and provider-slice rollups built from them) bucket under
+        //   EACH CALL's own local day (the per-call loop below). The parser
+        //   slices straddling turns per range (issue #852), so every parse
+        //   only holds in-range calls and per-call bucketing keeps day-N +
+        //   day-N+1 equal to the whole range — and history.daily reconciled
+        //   to the headline built from the same days. (Before the parser
+        //   sliced per call, per-call bucketing here was what caused the
+        //   constant offset against the whole-turn headline; the slice is
+        //   what makes it exact now.)
+        const turnDate = dateKeyFn(turn.timestamp || turn.assistantCalls[0]!.timestamp)
         const turnDay = ensure(turnDate)
 
-        const editTurns = turn.hasEdits ? 1 : 0
-        const oneShotTurns = turn.hasEdits && turn.retries === 0 ? 1 : 0
+        // A turn whose calls are all supplementary accounting (copilot rollup
+        // / paired store rows) is not a behavioral exchange: its cost still
+        // lands in the category, but it must add no turn/edit weight here or
+        // sealed daily history diverges from the live session summaries
+        // (which apply the same rule in buildSessionSummary).
+        const behavioralTurn = isBehavioralTurn(turn)
+        const editTurns = behavioralTurn && turn.hasEdits ? 1 : 0
+        const oneShotTurns = behavioralTurn && turn.hasEdits && turn.retries === 0 ? 1 : 0
         const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
         const turnSavings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
 
@@ -61,43 +131,121 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
         turnDay.oneShotTurns += oneShotTurns
 
         const cat = turnDay.categories[turn.category] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
-        cat.turns += 1
+        if (behavioralTurn) cat.turns += 1
         cat.cost += turnCost
         cat.savingsUSD += turnSavings
         cat.editTurns += editTurns
         cat.oneShotTurns += oneShotTurns
         turnDay.categories[turn.category] = cat
 
+        // Cost stays attributed to every provider actually present in the turn,
+        // but turn counts belong to exactly one slice. Otherwise carrying one
+        // missing provider later re-adds a turn already present in the fresh
+        // provider's slice. Highest call count wins; when the first call's
+        // provider is tied for highest, replacing only on a strict increase
+        // leaves that provider selected.
+        const providersInTurn = new Map<string, { calls: number; cost: number; savingsUSD: number }>()
+        for (const call of turn.assistantCalls) {
+          const acc = providersInTurn.get(call.provider) ?? { calls: 0, cost: 0, savingsUSD: 0 }
+          acc.calls += 1
+          acc.cost += call.costUSD
+          acc.savingsUSD += call.savingsUSD ?? 0
+          providersInTurn.set(call.provider, acc)
+        }
+        let primaryProvider = turn.assistantCalls[0]!.provider
+        let primaryCalls = providersInTurn.get(primaryProvider)!.calls
+        for (const [provider, totals] of providersInTurn) {
+          if (totals.calls > primaryCalls) {
+            primaryProvider = provider
+            primaryCalls = totals.calls
+          }
+        }
+        for (const [prov, totals] of providersInTurn) {
+          const turnSlice = ensureSlice(turnDay, prov)
+          const ownsTurn = prov === primaryProvider
+          turnSlice.editTurns! += ownsTurn ? editTurns : 0
+          turnSlice.oneShotTurns! += ownsTurn ? oneShotTurns : 0
+          const sliceCat = turnSlice.categories![turn.category] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
+          sliceCat.turns += ownsTurn && behavioralTurn ? 1 : 0
+          sliceCat.cost += totals.cost
+          sliceCat.savingsUSD += totals.savingsUSD
+          sliceCat.editTurns += ownsTurn ? editTurns : 0
+          sliceCat.oneShotTurns += ownsTurn ? oneShotTurns : 0
+          turnSlice.categories![turn.category] = sliceCat
+        }
+
         for (const call of turn.assistantCalls) {
           const callSavings = call.savingsUSD ?? 0
+          // Same weight rule as buildSessionSummary: a supplementary
+          // accounting call contributes cost/tokens but is not a distinct
+          // request, so it must not increment any `calls` counter the daily
+          // cache seals (day, project, model, provider slice).
+          const callWeight = isBehavioralCall(call) ? 1 : 0
+          // Call-derived values bucket under the call's OWN day (see the
+          // two-rule comment above). An unparseable call timestamp falls back
+          // to the turn's anchor day rather than producing a garbage date key.
+          const callDate = Number.isNaN(new Date(call.timestamp).getTime()) ? turnDate : dateKeyFn(call.timestamp)
+          const callDay = ensure(callDate)
 
-          turnDay.cost += call.costUSD
-          turnDay.savingsUSD += callSavings
-          turnDay.calls += 1
-          turnDay.inputTokens += call.usage.inputTokens
-          turnDay.outputTokens += call.usage.outputTokens
-          turnDay.cacheReadTokens += call.usage.cacheReadInputTokens
-          turnDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
+          callDay.cost += call.costUSD
+          callDay.savingsUSD += callSavings
+          callDay.calls += callWeight
+          const billableOut = billableOutputTokens(
+            call.provider,
+            call.usage.outputTokens,
+            call.usage.reasoningTokens,
+          )
+          callDay.inputTokens += call.usage.inputTokens
+          callDay.outputTokens += billableOut
+          callDay.cacheReadTokens += call.usage.cacheReadInputTokens
+          callDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
 
-          const model = turnDay.models[call.model] ?? {
+          const dayProject = ensureProject(callDay, session.project, project.projectPath)
+          dayProject.cost += call.costUSD
+          dayProject.calls += callWeight
+          dayProject.savingsUSD += callSavings
+
+          const model = callDay.models[call.model] ?? {
             calls: 0, cost: 0, savingsUSD: 0,
             inputTokens: 0, outputTokens: 0,
             cacheReadTokens: 0, cacheWriteTokens: 0,
           }
-          model.calls += 1
+          model.calls += callWeight
           model.cost += call.costUSD
           model.savingsUSD += callSavings
           model.inputTokens += call.usage.inputTokens
-          model.outputTokens += call.usage.outputTokens
+          model.outputTokens += billableOut
           model.cacheReadTokens += call.usage.cacheReadInputTokens
           model.cacheWriteTokens += call.usage.cacheCreationInputTokens
-          turnDay.models[call.model] = model
+          callDay.models[call.model] = model
 
-          const provider = turnDay.providers[call.provider] ?? { calls: 0, cost: 0, savingsUSD: 0 }
-          provider.calls += 1
-          provider.cost += call.costUSD
-          provider.savingsUSD += callSavings
-          turnDay.providers[call.provider] = provider
+          const slice = ensureSlice(callDay, call.provider)
+          slice.calls += callWeight
+          slice.cost += call.costUSD
+          slice.savingsUSD += callSavings
+          slice.inputTokens! += call.usage.inputTokens
+          slice.outputTokens! += billableOut
+          slice.cacheReadTokens! += call.usage.cacheReadInputTokens
+          slice.cacheWriteTokens! += call.usage.cacheCreationInputTokens
+
+          const sliceProject = ensureProject(slice, session.project, project.projectPath)
+          sliceProject.cost += call.costUSD
+          sliceProject.calls += callWeight
+          sliceProject.savingsUSD += callSavings
+
+          const sliceModel = slice.models![call.model] ?? {
+            calls: 0, cost: 0, savingsUSD: 0,
+            inputTokens: 0, outputTokens: 0,
+            cacheReadTokens: 0, cacheWriteTokens: 0,
+          }
+          sliceModel.calls += callWeight
+          sliceModel.cost += call.costUSD
+          sliceModel.savingsUSD += callSavings
+          sliceModel.inputTokens += call.usage.inputTokens
+          sliceModel.outputTokens += billableOut
+          sliceModel.cacheReadTokens += call.usage.cacheReadInputTokens
+          sliceModel.cacheWriteTokens += call.usage.cacheCreationInputTokens
+          slice.models![call.model] = sliceModel
         }
       }
     }

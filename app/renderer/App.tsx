@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { isColdHydrating } from './components/CliErrorPanel'
 import { EmptyNote } from './components/EmptyState'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { Hint } from './components/Hint'
@@ -8,25 +9,32 @@ import { Panel } from './components/Panel'
 import { Sidebar, type Section } from './components/Sidebar'
 import { Splash } from './components/Splash'
 import { ToastHost } from './components/ToastHost'
+import { SwitchingBanner } from './components/SwitchingBanner'
 import { UpdateBanner } from './components/UpdateBanner'
 import { rangeLabel, TopBar } from './components/TopBar'
 import { Window } from './components/Window'
-import { clearPolledMemo, hasPolledMemo, primePolledMemo, setPolledMemoMax, usePolled } from './hooks/usePolled'
+import { clearPolledMemo, hasPolledMemo, polledMemoTimestamp, primePolledMemo, usePolled } from './hooks/usePolled'
 import { readDailyBudget } from './lib/budget'
 import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
 import { motionClass } from './lib/motion'
+import { clearOverviewHeadlines, readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import { codeburn } from './lib/ipc'
-import { localDateKey } from './lib/period'
+import { isModifierChord, shortcutLabel } from './lib/platform'
+import { localDateKey, PERIOD_LABELS } from './lib/period'
+import { readDisabledProviders } from './lib/providers'
+import { reportMemoKey } from './lib/reportMemoKey'
 import { persistRefreshValue, readRefreshValue, refreshValueToMs, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
 import { OverviewContent } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
 import { Models } from './sections/Models'
 import { Sessions } from './sections/Sessions'
+import { PullRequestsContent } from './sections/PullRequests'
 import { Compare } from './sections/Compare'
 import { Plans } from './sections/Plans'
 import { Settings, type SettingsPane } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
-import type { DateRange, MenubarPayload, ModelReportRow, Period, TelemetryStatus } from './lib/types'
+import { PluginsSection } from './sections/Plugins'
+import type { DateRange, MenubarPayload, ModelReportRow, Period, Scope, TelemetryStatus } from './lib/types'
 
 // Bucket raw dollar amounts before they leave the machine: telemetry carries
 // coarse ranges, never exact spend.
@@ -78,6 +86,12 @@ export function usageSnapshotProps(payload: MenubarPayload, modelCategories?: Ma
       if (topCategory) entry.topCategory = topCategory
       return entry
     }),
+    // Per-provider spend, same cost-bucketing as models. `providers` maps lowercased
+    // display name -> cost USD; sort by cost so the top spenders survive the cap.
+    providers: Object.entries(payload.current.providers ?? {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([name, cost]) => ({ name, costBucket: costBucket(cost) })),
     // Aggregate task categories (the "purpose" dimension across all models).
     categories: (payload.current.topActivities ?? []).slice(0, 12).map(activity => ({
       name: activity.name,
@@ -100,53 +114,84 @@ export function usageSnapshotProps(payload: MenubarPayload, modelCategories?: Ma
 const SECTION_TITLES: Record<Section, string> = {
   overview: 'Overview',
   sessions: 'Sessions',
+  pullRequests: 'Pull requests',
   spend: 'Spend',
   optimize: 'Optimize',
   models: 'Models',
   compare: 'Compare',
   plans: 'Plans',
   settings: 'Settings',
+  plugins: 'Plugins',
 }
 
-const PERIOD_LABELS: Record<Period, string> = {
-  today: 'Today',
-  week: 'Last 7 days',
-  month: 'This month',
-  '30days': 'Last 30 days',
-  all: 'All time',
-}
-
-const STANDARD_PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all']
+const STANDARD_PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all', 'lifetime']
 
 // Instant-switch memo key for an overview result. Shared by the overview poll
 // and the provider prefetcher so the two never drift out of sync. Exported so
 // the prefetch-storm test can assert warmed keys survive between polls.
-export function overviewMemoKey(provider: string, period: Period, range: DateRange | null, configSource: string | null): string {
-  return `overview|${provider}|${period}|${range?.from ?? ''}-${range?.to ?? ''}|${configSource ?? ''}`
+export function overviewMemoKey(provider: string, period: Period, range: DateRange | null, configSource: string | null, scope: Scope = 'local', now = new Date()): string {
+  const boundary = period === 'today'
+    ? localDateKey(now)
+    : period === 'month'
+      ? `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+      : ''
+  return `overview|${provider}|${period}|${range?.from ?? ''}-${range?.to ?? ''}|${configSource ?? ''}|${scope}|${boundary}`
+}
+
+/** Exact report identities that make a top-level destination complete enough
+ * for its footer to claim a refresh time. Composite destinations use the oldest
+ * constituent timestamp; a missing constituent remains "not refreshed yet". */
+export function selectedReportMemoKeys(
+  section: Section,
+  period: Period,
+  provider: string,
+  range: DateRange | null,
+  activeOverviewKey: string,
+  disabledProviders: Iterable<string> = readDisabledProviders(),
+): string[] {
+  if (section === 'overview' || section === 'pullRequests') return [activeOverviewKey]
+  if (section === 'sessions') return [reportMemoKey('sessions', period, provider, range)]
+  if (section === 'spend') return [activeOverviewKey, reportMemoKey('spendflow', period, provider, range)]
+  if (section === 'optimize') return [
+    activeOverviewKey,
+    reportMemoKey('optimize', period, provider, range),
+    reportMemoKey('yield', period, provider, range),
+  ]
+  if (section === 'models') return [reportMemoKey('models', period, provider, range, 'false')]
+  if (section === 'compare') return [reportMemoKey('comparemodels', period, provider, range)]
+  if (section === 'plans') return [
+    `quota|${[...disabledProviders].sort().join(',')}`,
+    reportMemoKey('plans', period),
+  ]
+  return []
 }
 
 // Prefetch pacing: wait a short idle after the first paint, then warm one
 // provider at a time at low priority so the background scan never competes with
 // the interaction the user is actually having.
 const PREFETCH_START_DELAY_MS = 1500
-const PREFETCH_STAGGER_MS = 400
-// Base instant-switch memo keys live during overview polling besides the per-
-// provider prefetch entries: `overview|all`, `overview-act`, `overview-yield`,
-// plus one slot of headroom for section navigation. The memo cap is sized to
-// (detected providers + this) so warmed entries — and the base overview key —
-// never LRU-evict between polls (which would blank the overview and re-arm the
-// prefetch every cycle).
-const BASE_MEMO_KEYS = 4
-
+// A warm spawn takes seconds, so a 400ms stagger let the loop fire the whole set
+// almost at once; pace it wide enough that each warm genuinely trails the last.
+const PREFETCH_STAGGER_MS = 2000
+// Heavy-corpus report reads can briefly use more than a gigabyte while the CLI
+// materializes a view. Leave a real cooling window between them: the queue still
+// finishes comfortably while an app is left open, without keeping a laptop at
+// sustained high CPU simply to make every possible future click instant.
+const REPORT_PREFETCH_STAGGER_MS = 5000
 function isPeriod(value: string): value is Period {
   return (STANDARD_PERIODS as string[]).includes(value)
 }
 
-/** Boot period = the persisted "Default period" Settings writes, else 30 days. */
-function initialPeriod(): Period {
+/** The persisted "Default period" Settings writes, when there is one. */
+function savedPeriod(): Period | null {
   let saved: string | null = null
   try { saved = globalThis.localStorage?.getItem('codeburn.defaultPeriod') ?? null } catch { /* storage can be unavailable */ }
-  return saved && isPeriod(saved) ? saved : '30days'
+  return saved && isPeriod(saved) ? saved : null
+}
+
+/** Boot period = the persisted "Default period" Settings writes, else today. */
+function initialPeriod(): Period {
+  return savedPeriod() ?? 'today'
 }
 
 /** Persisted Claude config override (empty/absent = aggregate all configs). */
@@ -161,6 +206,15 @@ function persistConfigSource(id: string | null): void {
   } catch { /* storage can be unavailable */ }
 }
 
+/** Boot scope = the persisted dashboard Scope setting, else local. */
+function initialScope(): Scope {
+  try { return globalThis.localStorage?.getItem('codeburn.scope') === 'combined' ? 'combined' : 'local' } catch { return 'local' }
+}
+
+function persistScope(scope: Scope): void {
+  try { globalThis.localStorage?.setItem('codeburn.scope', scope) } catch { /* storage can be unavailable */ }
+}
+
 function providerName(provider: string): string {
   if (provider === 'all') return 'All providers'
   return provider
@@ -170,14 +224,17 @@ function providerName(provider: string): string {
     .join(' ')
 }
 
-function refreshedLabel(lastSuccessAt: number | null, loading: boolean, now: number): string {
+export function refreshedLabel(lastSuccessAt: number | null, loading: boolean, now: number): string {
   if (loading && lastSuccessAt === null) return 'refreshing…'
   if (lastSuccessAt === null) return 'not refreshed yet'
   const seconds = Math.max(0, Math.floor((now - lastSuccessAt) / 1000))
   if (seconds < 1) return 'refreshed just now'
   if (seconds < 60) return `refreshed ${seconds}s ago`
   const minutes = Math.floor(seconds / 60)
-  return `refreshed ${minutes}m ago`
+  if (minutes < 60) return `refreshed ${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `refreshed ${hours}h ago`
+  return `refreshed ${Math.floor(hours / 24)}d ago`
 }
 
 /** Provides the app-wide refresh cadence (read persisted at boot, applied live)
@@ -207,22 +264,53 @@ function AppMain() {
   const [detectedProviders, setDetectedProviders] = useState<Array<{ id: string; label: string }>>([])
   const [customRange, setCustomRange] = useState<DateRange | null>(null)
   const [claudeConfigSource, setClaudeConfigSource] = useState<string | null>(initialConfigSource)
+  const [scope, setScopeState] = useState<Scope>(initialScope)
   const [refreshToken, setRefreshToken] = useState(0)
   const [now, setNow] = useState(() => Date.now())
   const [, setCurrencyTick] = useState(0)
+  const [snapshotRevision, setSnapshotRevision] = useState(0)
+  const configGenerationRef = useRef(0)
 
   // Preserve the 2/3-arg call shapes when no config is scoped so the CLI argv
   // stays flag-free; only add --claude-config-source once a config is picked.
+  // Combined scope aggregates paired-device usage; the CLI rejects it alongside
+  // a provider/config filter, so onScopeChange forces provider='all' and clears
+  // the config scope before this poll runs. Passing scope='local' produces the
+  // same flag-free argv as before, so local users are unaffected.
+  const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope, new Date(now))
   const overview = usePolled<MenubarPayload>(
-    () => claudeConfigSource
+    () => scope === 'combined'
+      ? codeburn.getOverview(period, 'all', customRange ?? undefined, undefined, undefined, 'combined')
+      : claudeConfigSource
       ? codeburn.getOverview(period, provider, customRange ?? undefined, claudeConfigSource)
       : customRange
       ? codeburn.getOverview(period, provider, customRange)
       : codeburn.getOverview(period, provider),
-    [period, provider, customRange?.from, customRange?.to, claudeConfigSource],
-    { memoKey: overviewMemoKey(provider, period, customRange, claudeConfigSource) },
+    [period, provider, customRange?.from, customRange?.to, claudeConfigSource, scope],
+    { memoKey: activeOverviewKey },
   )
   const refreshOverview = overview.refresh
+  // A compact, privacy-minimized last exact headline makes a returning launch or
+  // an as-yet-unwarmed period useful immediately. It is never presented as the
+  // current answer: the full authoritative fetch starts normally behind it.
+  const headlineSnapshot = useMemo(
+    () => customRange || scope !== 'local' ? null : readOverviewHeadline(activeOverviewKey),
+    [activeOverviewKey, customRange, scope, snapshotRevision],
+  )
+
+  useEffect(() => {
+    // React renders once with the previous hook result before the dependency-
+    // change effect clears or swaps it. Never persist that previous payload
+    // beneath the newly selected period/provider key.
+    if (!overview.data || overview.dataKey !== activeOverviewKey || customRange || scope !== 'local') return
+    writeOverviewHeadline(activeOverviewKey, overview.data, overview.lastSuccessAt ?? Date.now())
+  }, [activeOverviewKey, customRange, overview.data, overview.dataKey, overview.lastSuccessAt, scope])
+
+  useEffect(() => {
+    if (overview.data || !headlineSnapshot?.currency) return
+    setActiveCurrency(headlineSnapshot.currency)
+    setCurrencyTick(tick => tick + 1)
+  }, [headlineSnapshot?.currency, overview.data])
 
   // Boot readiness: the overview poll is the single cold-cache warmer (long
   // timeout + progress). Other sections gate their first CLI spawn on this so a
@@ -230,10 +318,26 @@ function AppMain() {
   // full-history parse per section. Flips true the moment overview first has data
   // OR a (resolved) error; LATCHED, so a later uncached switch (which clears
   // overview.data to paint a skeleton) can never re-gate the sections.
+  // A cold-hydration failure is NOT a resolution: flipping ready on it released
+  // every section to spawn its own read behind the still-running parse, and each
+  // one then died on its own timeout. Stay gated (and keep the splash) until the
+  // hydration actually settles.
+  // #1111: with no persisted default the app opens on Today and falls back to 7
+  // days once, when the first payload shows today has no sessions yet. Disarmed
+  // by the period picker, so it can never move a period the user chose.
+  const autoPeriod = useRef(savedPeriod() === null)
+  useEffect(() => {
+    const sessions = overview.data?.current.sessions
+    if (!autoPeriod.current || sessions === undefined) return
+    autoPeriod.current = false
+    if (period === 'today' && sessions === 0) setPeriod('week')
+  }, [overview.data, period])
+
+  const overviewCold = isColdHydrating(overview.error)
   const [ready, setReady] = useState(false)
   useEffect(() => {
-    if (overview.data != null || overview.error != null) setReady(true)
-  }, [overview.data, overview.error])
+    if (overview.data != null || (overview.error != null && !overviewCold)) setReady(true)
+  }, [overview.data, overview.error, overviewCold])
 
   // First-launch onboarding: shown until the telemetry consent screen has been
   // completed once. All telemetry bridge calls are typeof-guarded so an older
@@ -262,7 +366,7 @@ function AppMain() {
   // fails we still emit the snapshot, just without the model x category cross.
   const snapshotDayRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!overview.data || provider !== 'all' || customRange || claudeConfigSource) return
+    if (!overview.data || provider !== 'all' || customRange || claudeConfigSource || scope !== 'local') return
     const today = localDateKey(new Date())
     if (snapshotDayRef.current === today) return
     snapshotDayRef.current = today
@@ -274,7 +378,7 @@ function AppMain() {
       } catch { /* degrade: emit the snapshot without per-model topCategory */ }
       trackEvent('usage_snapshot', usageSnapshotProps(payload, modelCategories))
     })()
-  }, [overview.data, provider, customRange, claudeConfigSource, period, trackEvent])
+  }, [overview.data, provider, customRange, claudeConfigSource, scope, period, trackEvent])
 
   useEffect(() => {
     let saved: string | null = null
@@ -322,43 +426,130 @@ function AppMain() {
     setCurrencyTick(tick => tick + 1)
   }, [overview.data?.currency?.code, overview.data?.currency?.rate, overview.data?.currency?.symbol, overview.switching])
 
-  // Size the instant-switch memo to hold every prefetched provider overview plus
-  // the base keys, so warmed entries survive between polls instead of evicting.
-  useEffect(() => {
-    setPolledMemoMax(detectedProviders.length + BASE_MEMO_KEYS)
-  }, [detectedProviders.length])
-
   // Prefetch for millisecond switches: once the first overview has resolved,
-  // quietly warm the instant-switch memo for every OTHER detected provider at the
-  // current period, so a picker switch to one paints from memory instead of
-  // waiting on a fresh 2-3s CLI spawn. One provider at a time, lowest priority,
-  // and only for the plain view (no custom range / no config scope) the picker
-  // actually toggles between. The CLI's own read-cache + in-flight coalescing keep
-  // this from double-spawning against a live user fetch; hasPolledMemo skips any
-  // provider already warm (including one warmed by a real visit).
+  // quietly warm every standard time horizon for the active provider in product
+  // priority order (Today -> 7D -> 30D -> Month -> 6M -> Life). After each
+  // headline, warm that horizon's first-click reports before moving farther back
+  // in history. Preserve the reviewed current-period provider warm after those
+  // horizons: the universal provider-summary prototype is still held, but a
+  // user's first provider switch must not silently regress to a cold parse. The
+  // CLI's own read-cache + in-flight
+  // coalescing keep it from double-spawning against a live user fetch;
+  // hasPolledMemo skips any result already warm (including one warmed by a real
+  // visit).
   //
   // `warmedKeys` is a session-lifetime once-per-key guard: each (provider,period)
   // memo key is marked BEFORE its spawn, so an effect re-run — e.g. an overview
-  // poll that momentarily blanked `overview.data` — can never re-spawn a provider
-  // already warmed. New keys (a new provider id, or a period switch) still warm
-  // exactly once. Without this the prefetch re-fired every poll: 12 redundant
-  // full-history CLI parses every 30s, forever.
+  // poll that momentarily blanked `overview.data` — can never re-spawn work already
+  // warmed. New keys (a new provider id, or a period switch) still warm exactly
+  // once. Without this the prefetch re-fired every poll: redundant full-history
+  // CLI parses every 30s, forever.
+  // Mirror the visible overview's fetch state into a ref so the prefetch can hold
+  // for a user-triggered fetch without re-arming the whole loop on each toggle.
+  const overviewBusyRef = useRef(false)
+  overviewBusyRef.current = overview.loading
   const warmedKeys = useRef<Set<string>>(new Set())
   useEffect(() => {
-    if (!ready || overview.data == null || customRange || claudeConfigSource) return
-    const targets = detectedProviders.map(entry => entry.id).filter(id => id !== provider)
-    if (targets.length === 0) return
+    // Keep this first slice local-only; combined scope has its own remote-data
+    // lifecycle and must not inherit local-corpus assumptions by accident.
+    if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
     let cancelled = false
     const warm = async () => {
-      for (const id of targets) {
-        if (cancelled) return
-        const key = overviewMemoKey(id, period, null, null)
+      for (const targetPeriod of STANDARD_PERIODS) {
+        if (cancelled) break
+
+        const overviewKey = overviewMemoKey(provider, targetPeriod, null, null)
+        if (!warmedKeys.current.has(overviewKey) && !hasPolledMemo(overviewKey)) {
+          // Only warm while the visible overview is idle: a user fetch in flight
+          // takes priority, so hold this horizon rather than racing it.
+          while (!cancelled && overviewBusyRef.current) {
+            await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+          }
+          try {
+            const configGeneration = configGenerationRef.current
+            // Background priority (5th arg) lets an interactive click jump ahead.
+            const value = await codeburn.getOverview(targetPeriod, provider, undefined, undefined, true)
+            if (!cancelled
+              && configGeneration === configGenerationRef.current
+              && value.hydration?.complete !== false) {
+              primePolledMemo(overviewKey, value)
+              writeOverviewHeadline(overviewKey, value)
+              warmedKeys.current.add(overviewKey)
+            }
+          } catch { /* best-effort warm; a real switch will retry and surface the error */ }
+          if (!cancelled) await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+        }
+
+        // Warm the reports for this horizon before moving farther back in time.
+        // The queue is deliberately serial and every request is background-
+        // priority. Results use the exact section memo keys, then persist through
+        // usePolled so tomorrow's launch paints them before revalidation.
+        const reportTargets: Array<{ key: string; load: () => Promise<unknown> }> = [
+          {
+            key: reportMemoKey('sessions', targetPeriod, provider),
+            load: () => codeburn.getSessions(targetPeriod, provider, undefined, true),
+          },
+          {
+            key: reportMemoKey('spendflow', targetPeriod, provider),
+            load: () => codeburn.getSpendFlow(targetPeriod, provider, undefined, true),
+          },
+          {
+            key: reportMemoKey('models', targetPeriod, provider, null, 'false'),
+            load: () => codeburn.getModels(targetPeriod, provider, false, undefined, true),
+          },
+          {
+            key: reportMemoKey('comparemodels', targetPeriod, provider),
+            load: () => codeburn.getCompareModels(targetPeriod, provider, true),
+          },
+          {
+            key: reportMemoKey('optimize', targetPeriod, provider),
+            load: () => codeburn.getOptimizeReport(targetPeriod, provider, undefined, true),
+          },
+          {
+            key: reportMemoKey('yield', targetPeriod, provider),
+            load: () => codeburn.getYield(targetPeriod, provider, undefined, true),
+          },
+          {
+            key: reportMemoKey('plans', targetPeriod),
+            load: () => codeburn.getPlans(targetPeriod, true),
+          },
+        ]
+        for (const target of reportTargets) {
+          if (cancelled) break
+          if (!hasPolledMemo(target.key)) {
+            try {
+              const configGeneration = configGenerationRef.current
+              const value = await target.load()
+              if (!cancelled && configGeneration === configGenerationRef.current) {
+                primePolledMemo(target.key, value)
+              }
+            } catch { /* on-demand visit will retry and surface the error */ }
+            if (!cancelled) await new Promise(resolve => setTimeout(resolve, REPORT_PREFETCH_STAGGER_MS))
+          }
+        }
+      }
+
+      // Keep the current-main provider-switch contract while the shared Core
+      // provider snapshot work is still held: warm the visible period for each
+      // detected provider only after the higher-value period/report queue.
+      for (const targetProvider of detectedProviders.map(entry => entry.id)) {
+        if (cancelled || targetProvider === provider) continue
+        const key = overviewMemoKey(targetProvider, period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
-        warmedKeys.current.add(key)
+        while (!cancelled && overviewBusyRef.current) {
+          await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+        }
         try {
-          const value = await codeburn.getOverview(period, id)
-          if (!cancelled) primePolledMemo(key, value)
-        } catch { /* best-effort warm; a real switch will fetch and surface any error */ }
+          const configGeneration = configGenerationRef.current
+          const value = await codeburn.getOverview(period, targetProvider, undefined, undefined, true)
+          if (!cancelled
+            && configGeneration === configGenerationRef.current
+            && value.hydration?.complete !== false) {
+            primePolledMemo(key, value)
+            writeOverviewHeadline(key, value)
+            warmedKeys.current.add(key)
+          }
+        } catch { /* a real provider switch will retry and surface the error */ }
         if (!cancelled) await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
       }
     }
@@ -367,7 +558,7 @@ function AppMain() {
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, customRange, claudeConfigSource, detectedProviders, overview.data == null])
+  }, [ready, period, provider, detectedProviders, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -386,7 +577,11 @@ function AppMain() {
   // Purge the memo, then force-refresh the active view so the new values land in a
   // couple seconds (quick like the menubar) instead of at the next poll.
   const onConfigMutated = useCallback(() => {
+    configGenerationRef.current++
+    warmedKeys.current.clear()
     clearPolledMemo()
+    clearOverviewHeadlines()
+    setSnapshotRevision(revision => revision + 1)
     refreshVisible()
   }, [refreshVisible])
 
@@ -398,15 +593,16 @@ function AppMain() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey) return
+      if (!isModifierChord(event)) return
       const key = event.key.toLowerCase()
       if (key === '1') navigate('overview')
       else if (key === '2') navigate('sessions')
-      else if (key === '3') navigate('spend')
-      else if (key === '4') navigate('optimize')
-      else if (key === '5') navigate('models')
-      else if (key === '6') navigate('compare')
-      else if (key === '7') navigate('plans')
+      else if (key === '3') navigate('pullRequests')
+      else if (key === '4') navigate('spend')
+      else if (key === '5') navigate('optimize')
+      else if (key === '6') navigate('models')
+      else if (key === '7') navigate('compare')
+      else if (key === '8') navigate('plans')
       else if (key === ',') navigate('settings')
       else if (key === 'r') refreshVisible()
       else return
@@ -419,6 +615,7 @@ function AppMain() {
 
   const onPeriodChange = (value: string) => {
     if (isPeriod(value)) {
+      autoPeriod.current = false
       setCustomRange(null)
       setPeriod(value)
     }
@@ -426,22 +623,40 @@ function AppMain() {
 
   // A Claude config scopes Claude usage only, so a non-Claude provider filter
   // would make the CLI reject the flag: reset it to 'all' first (a 'claude'
-  // filter is already compatible and is left alone).
+  // filter is already compatible and is left alone). Picking a config also
+  // implies a device-specific view, so drop combined scope back to local.
   const onConfigSelect = (id: string) => {
     const next = id || null
     if (next && provider !== 'all' && provider !== 'claude') setProvider('all')
+    if (next && scope === 'combined') { setScopeState('local'); persistScope('local') }
     setClaudeConfigSource(next)
     persistConfigSource(next)
   }
 
   // Symmetric direction: picking a non-Claude provider while a config is
-  // scoped would hit the same CLI rejection, so drop the config scope.
+  // scoped would hit the same CLI rejection, so drop the config scope. A
+  // specific provider filter is a device-specific view, so it also drops
+  // combined scope back to local (combined reports unfiltered usage).
   const onProviderSelect = (value: string) => {
+    if (value !== 'all' && scope === 'combined') { setScopeState('local'); persistScope('local') }
     if (claudeConfigSource && value !== 'all' && value !== 'claude') {
       setClaudeConfigSource(null)
       persistConfigSource(null)
     }
     setProvider(value)
+  }
+
+  // Combined scope reports unfiltered, all-provider usage across paired devices,
+  // so switching to it resets the provider filter and Claude-config scope (which
+  // the CLI would otherwise reject), mirroring the menubar's setMenubarScope.
+  const onScopeChange = (value: string) => {
+    const next: Scope = value === 'combined' ? 'combined' : 'local'
+    if (next === 'combined') {
+      if (provider !== 'all') setProvider('all')
+      if (claudeConfigSource) { setClaudeConfigSource(null); persistConfigSource(null) }
+    }
+    setScopeState(next)
+    persistScope(next)
   }
 
   const claudeConfigs = overview.data?.claudeConfigs
@@ -453,28 +668,41 @@ function AppMain() {
   const activeConfigLabel = claudeConfigSource
     ? claudeConfigs?.options.find(option => option.id === claudeConfigSource)?.label ?? null
     : null
-  const scope = `${customRange ? rangeLabel(customRange) : PERIOD_LABELS[period]} · ${providerLabel}${activeConfigLabel ? ` · ${activeConfigLabel}` : ''}`
+  // Combined scope reports unfiltered all-device usage, so the caption reads
+  // "Combined" in place of the (forced-'all') provider label.
+  const scopeCaption = scope === 'combined'
+    ? `${customRange ? rangeLabel(customRange) : PERIOD_LABELS[period]} · Combined`
+    : `${customRange ? rangeLabel(customRange) : PERIOD_LABELS[period]} · ${providerLabel}${activeConfigLabel ? ` · ${activeConfigLabel}` : ''}`
+  const selectedReportKeys = selectedReportMemoKeys(section, period, provider, customRange, activeOverviewKey)
+  const selectedReportTimestamps = selectedReportKeys.map(polledMemoTimestamp)
+  const selectedLastSuccessAt = selectedReportKeys.length > 0 && selectedReportTimestamps.every((value): value is number => value != null)
+    ? Math.min(...selectedReportTimestamps)
+    : null
 
   return (
     <Window>
-      <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} />} />
+      <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} snapshot={headlineSnapshot} />} />
       <ToastHost />
-      <Splash hasData={overview.data != null} hasError={overview.error != null} />
+      <Splash hasData={overview.data != null || headlineSnapshot != null} hasError={overview.error != null && !overviewCold} />
       {onboardingStatus && <Onboarding defaultEnabled={onboardingStatus.defaultEnabled} onDone={finishOnboarding} />}
-      <div className="ct">
-        <div className={overview.switching ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
+      <div className="ct" aria-busy={overview.switching || (!!headlineSnapshot && overview.loading)}>
+        <div className={overview.switching || (!!headlineSnapshot && overview.loading) ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
+        {(overview.switching || (!!headlineSnapshot && overview.loading)) && <SwitchingBanner />}
         <UpdateBanner />
+        <IndexingBanner payload={overview.data ?? null} />
         <DailyBudgetBanner payload={overview.data ?? null} provider={provider} />
         <ErrorBoundary key={section}>
         {section === 'plans' ? (
           <Plans period={period} refreshToken={refreshToken} onNavigate={navigate} ready={ready} />
         ) : section === 'settings' ? (
-          <Settings period={period} refreshToken={refreshToken} onNavigate={navigate} initialPane={settingsPane} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} />
+          <Settings period={period} refreshToken={refreshToken} onNavigate={navigate} initialPane={settingsPane} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} />
+        ) : section === 'plugins' ? (
+          <PluginsSection />
         ) : (
           <>
             <TopBar
               title={SECTION_TITLES[section]}
-              scope={scope}
+              scope={scopeCaption}
               period={period}
               onPeriodChange={onPeriodChange}
               customRange={customRange}
@@ -489,9 +717,11 @@ function AppMain() {
             />
             <div className={motionClass('body', 'section-fade')}>
               {section === 'overview' ? (
-                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} />
+                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
                 <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={detectedProviders} onProviderChange={onProviderSelect} ready={ready} />
+              ) : section === 'pullRequests' ? (
+                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} />
               ) : section === 'spend' ? (
                 <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
               ) : section === 'optimize' ? (
@@ -510,11 +740,11 @@ function AppMain() {
         {section !== 'settings' && (
           <Hint
             items={[
-              { k: '⌘1-7', label: 'Navigate' },
-              { k: '⌘,', label: 'Settings' },
-              { k: '⌘R', label: 'Refresh' },
+              { k: shortcutLabel('1-8'), label: 'Navigate' },
+              { k: shortcutLabel(','), label: 'Settings' },
+              { k: shortcutLabel('R'), label: 'Refresh' },
             ]}
-            right={refreshedLabel(overview.lastSuccessAt, overview.loading, now)}
+            right={refreshedLabel(selectedLastSuccessAt, false, now)}
           />
         )}
       </div>
@@ -522,7 +752,7 @@ function AppMain() {
   )
 }
 
-function StatusLine({ polled }: { polled: ReturnType<typeof usePolled<MenubarPayload>> }) {
+function StatusLine({ polled, snapshot }: { polled: ReturnType<typeof usePolled<MenubarPayload>>; snapshot?: ReturnType<typeof readOverviewHeadline> }) {
   if (polled.data) {
     return (
       <>
@@ -530,6 +760,7 @@ function StatusLine({ polled }: { polled: ReturnType<typeof usePolled<MenubarPay
       </>
     )
   }
+  if (snapshot) return <>{snapshot.label} <b>{formatUsd(snapshot.cost)}</b> · updating</>
   if (polled.error?.kind === 'not-found') return <>CLI not found</>
   if (polled.loading) return <>scanning…</>
   return <>—</>
@@ -540,6 +771,27 @@ function SectionPlaceholder({ title }: { title: string }) {
     <Panel title={title}>
       <EmptyNote>{title} lands in a later task. The shell, data bridge, and design system are in place.</EmptyNote>
     </Panel>
+  )
+}
+
+/** Honest partiality (#1110): on a cold cache the resident serve child answers
+ * from the files the selected period can show and indexes the rest behind it.
+ * Wording mirrors the TUI banner. Absent `hydration` means a full parse (a
+ * one-shot spawn, or a CLI predating the field), so nothing is shown. */
+function IndexingBanner({ payload }: { payload: MenubarPayload | null }) {
+  const hydration = payload?.hydration
+  if (payload?.stale) {
+    return (
+      <div role="status" className="stale-banner">
+        Some sources could not be refreshed. Showing indexed data; recent activity may be missing.
+      </div>
+    )
+  }
+  if (!hydration || hydration.complete || hydration.indexedFiles >= hydration.totalFiles) return null
+  return (
+    <div role="status" className="stale-banner">
+      Indexing history · {Math.min(hydration.indexedFiles, hydration.totalFiles)}/{hydration.totalFiles} files · You can keep using CodeBurn; totals update as indexing completes.
+    </div>
   )
 }
 

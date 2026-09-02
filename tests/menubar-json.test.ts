@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildMenubarPayload, type CombinedUsage, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
+import { buildMenubarPayload, type CombinedUsage, type LocalModelSavings, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
 import type { OptimizeResult } from '../src/optimize.js'
 
 function emptyPeriod(label: string): PeriodData {
@@ -38,9 +38,31 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.label).toBe('7 Days')
     expect(payload.current.cost).toBe(1248.01)
     expect(payload.current.calls).toBe(11231)
+    // An absent pricingCoverage is UNKNOWN and must render as null, never as
+    // a fabricated 100% coverage (post-#756 review finding).
+    expect(payload.current.pricingCoverage).toBeNull()
     expect(payload.current.sessions).toBe(97)
     expect(payload.current.inputTokens).toBe(19100)
     expect(payload.current.outputTokens).toBe(675600)
+  })
+
+  it('passes the pull-requests payload (models, categories, cap remainder) through verbatim', () => {
+    const period: PeriodData = {
+      ...emptyPeriod('7 Days'),
+      pullRequests: {
+        rows: [
+          { url: 'https://github.com/o/r/pull/1', label: 'o/r#1', cost: 40, savingsUSD: 0, sessions: 1, calls: 12, firstStarted: '2026-07-20T10:00:00Z', lastEnded: '2026-07-20T11:00:00Z', approx: false, models: ['fable', 'opus'], categories: [{ name: 'Coding', cost: 30 }, { name: 'Debugging', cost: 10 }] },
+        ],
+        distinctCost: 45,
+        distinctSessions: 1,
+        attributedCost: 40,
+        unattributedCost: 5,
+      },
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    expect(payload.current.pullRequests).toEqual(period.pullRequests)
+    expect(payload.current.pullRequests!.rows[0]!.models).toEqual(['fable', 'opus'])
+    expect(payload.current.pullRequests!.rows[0]!.categories).toEqual([{ name: 'Coding', cost: 30 }, { name: 'Debugging', cost: 10 }])
   })
 
   it('exposes period-scoped cache tokens on current, decoupled from the 365-day history backfill (#583)', () => {
@@ -137,6 +159,31 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.topModels[0].name).toBe('Model0')
   })
 
+  it('resolves raw model ids to display names in topModels and merges rows that collapse', () => {
+    // Day entries key models by the raw wire id (day-aggregator); the menubar
+    // must show friendly names and merge ids that share one (k3 + kimi-k3).
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'k3', cost: 2.5, calls: 78 },
+        { name: 'kimi-k3', cost: 0.5, calls: 2 },
+        { name: 'kimi-for-coding', cost: 0.06, calls: 13 },
+        { name: 'k3-agent', cost: 1.2, calls: 40 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const kimiK3 = payload.current.topModels.find(m => m.name === 'Kimi K3')!
+    expect(kimiK3.cost).toBeCloseTo(2.5 + 0.5 + 1.2)
+    expect(kimiK3.calls).toBe(78 + 2 + 40)
+    const k2 = payload.current.topModels.find(m => m.name === 'Kimi K2 Thinking')!
+    expect(k2.cost).toBeCloseTo(0.06)
+    expect(payload.current.topModels.find(m => m.name === 'k3')).toBeUndefined()
+    expect(payload.current.topModels.find(m => m.name === 'k3-agent')).toBeUndefined()
+  })
+
   it('caps topActivities at 20 so all task categories can surface', () => {
     const period: PeriodData = {
       label: 'Today',
@@ -215,14 +262,40 @@ describe('buildMenubarPayload', () => {
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     // providerDetails carries the internal id (round-trips as --provider) + label.
     expect(payload.current.providerDetails).toEqual([
-      { id: 'grok', label: 'Grok Build', cost: 12.5 },
-      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4 },
+      { id: 'grok', label: 'Grok Build', cost: 12.5, calls: 0, hasUsage: true },
+      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4, calls: 0, hasUsage: true },
     ])
     // ... while the existing providers map keys stay the lowercased display names.
     expect(payload.current.providers).toEqual({ 'grok build': 12.5, 'cursor agent': 3.4 })
   })
 
-  it('keeps zero-cost providers in the dict so installed-but-unused providers still render as tabs', () => {
+  it('preserves zero-cost provider usage counts for menubar provider visibility', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 7 },
+      { name: 'claude', displayName: 'Claude', cost: 0, calls: 0 },
+    ] satisfies Array<ProviderCost & { calls: number }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 7, hasUsage: true },
+      { id: 'claude', label: 'Claude', cost: 0, calls: 0, hasUsage: false },
+    ])
+  })
+
+  it('preserves token-only provider activity even when cost and behavioral calls are zero', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ] satisfies Array<ProviderCost & { calls: number; hasUsage: boolean }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ])
+  })
+
+  it('keeps zero-cost detected providers in the legacy dict for compatibility', () => {
     const providers: ProviderCost[] = [
       { name: 'claude', displayName: 'Claude', cost: 76.45 },
       { name: 'codex', displayName: 'Codex', cost: 0 },
@@ -302,7 +375,7 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45 })
-    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45 }])
+    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true }])
   })
 
   it('omits combined usage by default and accepts the documented combined shape when attached', () => {
@@ -365,5 +438,38 @@ describe('buildMenubarPayload', () => {
         { id: 'claude-config:b', label: 'claude-personal', path: '/tmp/claude-personal' },
       ],
     })
+  })
+
+  it('sets stale:true when the caller reports an incomplete hydration', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null, undefined, undefined, undefined, undefined, undefined, undefined, true)
+    expect(payload.stale).toBe(true)
+  })
+
+  it('omits stale on a normal fresh build', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null)
+    expect(payload.stale).toBeUndefined()
+  })
+
+  it('passes localModelSavings.byModel.outputTokens through as billable output', () => {
+    // usage-aggregator writes billableOutputTokens into this field while the
+    // provider is still known. Exclusive 10+3 → 13; inclusive 10+3 → 10.
+    const localModelSavings: LocalModelSavings = {
+      totalUSD: 2,
+      calls: 2,
+      byModel: [
+        { name: 'Grok 4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 13 },
+        { name: 'GPT-5.4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 10 },
+      ],
+      byProvider: [
+        { name: 'grok', calls: 1, savingsUSD: 1 },
+        { name: 'codex', calls: 1, savingsUSD: 1 },
+      ],
+    }
+    const period: PeriodData = { ...emptyPeriod('Today'), outputTokens: 23 }
+    const payload = buildMenubarPayload(period, [], null, undefined, undefined, undefined, { localModelSavings })
+    expect(payload.current.outputTokens).toBe(23)
+    expect(payload.current.localModelSavings.byModel).toEqual(localModelSavings.byModel)
+    expect(payload.current.localModelSavings.byModel[0]!.outputTokens).toBe(13)
+    expect(payload.current.localModelSavings.byModel[1]!.outputTokens).toBe(10)
   })
 })

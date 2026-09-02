@@ -56,13 +56,14 @@ struct HeatmapSection: View {
     }
 
     private var visibleModes: [InsightMode] {
-        // Plan sources from a provider's OAuth usage endpoint. Currently
-        // implemented for Claude (Anthropic) and Codex (ChatGPT). Hidden on
-        // All / Cursor / Droid / Gemini / Copilot until those providers ship
-        // their own quota data sources.
+        // Plan sources from a provider's live quota endpoint. Currently
+        // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code,
+        // Gemini (Google Code Assist), Copilot (GitHub), and Antigravity
+        // (local language server on 127.0.0.1). Hidden on All / Cursor /
+        // Droid, which have no quota source of their own.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini || store.selectedProvider == .copilot || store.selectedProvider == .antigravity
             }
             return true
         }
@@ -80,6 +81,14 @@ struct HeatmapSection: View {
         case .plan:
             if store.selectedProvider == .codex {
                 CodexPlanInsight()
+            } else if store.selectedProvider == .kimiCode {
+                KimiPlanInsight()
+            } else if store.selectedProvider == .gemini {
+                GeminiPlanInsight()
+            } else if store.selectedProvider == .copilot {
+                CopilotPlanInsight()
+            } else if store.selectedProvider == .antigravity {
+                AntigravityPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -135,7 +144,7 @@ private struct TrendInsight: View {
         case .today, .sevenDays: return 19
         case .thirtyDays: return 30
         case .month: return 31
-        case .all: return min(days.count, 90)
+        case .all, .lifetime: return min(days.count, 90)
         }
     }
 
@@ -1731,7 +1740,7 @@ private struct PlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying."
+                        error: store.subscriptionError ?? "Anthropic temporarily unreachable. Retrying."
                     ) { refreshSubscriptionThroughAppDelegate() }
                 }
             case let .terminalFailure(reason):
@@ -2038,7 +2047,7 @@ private struct CodexPlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.codexError ?? "ChatGPT temporarily unreachable — retrying."
+                        error: store.codexError ?? "ChatGPT temporarily unreachable. Retrying."
                     ) { Task { await store.refreshCodex() } }
                 }
             case let .terminalFailure(reason):
@@ -2065,7 +2074,7 @@ private struct CodexPlanInsight: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
-                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt {
+                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt ?? usage.creditLimit?.resetsAt {
                     Text("Resets \(relativeReset(resetsAt))")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
@@ -2076,7 +2085,7 @@ private struct CodexPlanInsight: View {
                     label: "\(primary.windowLabel) window",
                     percent: primary.usedPercent,
                     resetsAt: primary.resetsAt,
-                    projection: nil
+                    projection: pace(for: primary)
                 )
             }
             if let secondary = usage.secondary {
@@ -2084,7 +2093,7 @@ private struct CodexPlanInsight: View {
                     label: "\(secondary.windowLabel) window",
                     percent: secondary.usedPercent,
                     resetsAt: secondary.resetsAt,
-                    projection: nil
+                    projection: pace(for: secondary)
                 )
             }
             // Surface non-zero per-model rate limits (Codex Spark, etc.) so
@@ -2095,7 +2104,7 @@ private struct CodexPlanInsight: View {
                         label: "\(limit.name) · \(p.windowLabel)",
                         percent: p.usedPercent,
                         resetsAt: p.resetsAt,
-                        projection: nil
+                        projection: pace(for: p)
                     )
                 }
                 if let s = limit.secondary, s.usedPercent > 0 {
@@ -2103,8 +2112,28 @@ private struct CodexPlanInsight: View {
                         label: "\(limit.name) · \(s.windowLabel)",
                         percent: s.usedPercent,
                         resetsAt: s.resetsAt,
-                        projection: nil
+                        projection: pace(for: s)
                     )
+                }
+            }
+            // No rate windows here, so without this row the card is empty.
+            if let credits = usage.creditLimit {
+                UtilizationRow(
+                    label: credits.displayLabel,
+                    percent: credits.usedPercent,
+                    resetsAt: credits.resetsAt,
+                    projection: pace(for: credits)
+                )
+            } else if usage.creditsUnlimited {
+                // Uncapped on purpose, not a failed fetch.
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Credits")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Unlimited")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
                 }
             }
             // Limit-reset credits the account is holding. Hidden at zero so
@@ -2126,6 +2155,44 @@ private struct CodexPlanInsight: View {
         .padding(.bottom, 8)
     }
 
+    /// Codex has no snapshot history yet, so this is the linear phase-1 pace
+    /// (#726): deficit/reserve everywhere, projection and ETA only where the
+    /// window is long enough for a whole-window rate to be defensible.
+    private func pace(for window: CodexUsage.Window) -> WindowProjection? {
+        guard let result = QuotaPace.evaluate(
+            usedPercent: window.usedPercent,
+            resetsAt: window.resetsAt,
+            windowSeconds: window.limitWindowSeconds
+        ) else { return nil }
+        return WindowProjection(
+            percent: result.projectedPercent,
+            willOverflow: result.willOverflow,
+            hitsLimitAt: result.hitsLimitAt,
+            source: .linear,
+            deltaPercent: result.deltaPercent,
+            compact: TimeInterval(window.limitWindowSeconds) <= QuotaPace.etaSuppressionMaxSeconds
+        )
+    }
+
+    /// Rate-window pace math over the spend control's calendar month.
+    private func pace(for credits: CodexUsage.CreditLimit) -> WindowProjection? {
+        guard let windowSeconds = credits.windowSeconds,
+              let result = QuotaPace.evaluate(
+                  usedPercent: credits.usedPercent,
+                  resetsAt: credits.resetsAt,
+                  windowSeconds: windowSeconds
+              )
+        else { return nil }
+        return WindowProjection(
+            percent: result.projectedPercent,
+            willOverflow: result.willOverflow,
+            hitsLimitAt: result.hitsLimitAt,
+            source: .linear,
+            deltaPercent: result.deltaPercent,
+            compact: TimeInterval(windowSeconds) <= QuotaPace.etaSuppressionMaxSeconds
+        )
+    }
+
     private func resetCreditsLabel(_ resets: CodexUsage.ResetCredits) -> String {
         let count = "\(resets.availableCount) available"
         guard let next = resets.nextExpiresAt else { return count }
@@ -2139,12 +2206,395 @@ private struct CodexPlanInsight: View {
     }
 }
 
+/// Plan tab for Kimi Code. Reads the CLI credential file (no keychain, no
+/// OAuth refresh — tokens are short-lived and only the CLI renews them), so
+/// terminal failure means "run the CLI once to refresh your login".
+private struct KimiPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch KimiQuotaPresentation.planContent(loadState: store.kimiLoadState, hasUsage: store.kimiUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Kimi Code credentials found",
+                    message: "Sign in with the Kimi CLI first. Then click Try Again."
+                ) { Task { await store.bootstrapKimi() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Kimi Code credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.kimiError
+                ) { Task { await store.refreshKimi() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.kimiError ?? "Kimi temporarily unreachable. Retrying."
+                ) { Task { await store.refreshKimi() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Kimi Code login",
+                    reason: reason,
+                    fallback: "Kimi Code tokens are short-lived. Run the Kimi CLI once to refresh your login, then click Reconnect."
+                ) { Task { await store.bootstrapKimi() } }
+            case let .usage(idle):
+                if let usage = store.kimiUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Kimi Code credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: KimiUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Kimi Code")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let primary = usage.primary {
+                UtilizationRow(
+                    label: "\(primary.label) window",
+                    percent: primary.usedPercent,
+                    resetsAt: primary.resetsAt,
+                    projection: nil
+                )
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: "\(window.label) window",
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if let parallel = usage.parallelLimit, parallel > 0 {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Parallel sessions")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(parallel)")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if idle {
+                Text("Login idle. Run the Kimi CLI to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if KimiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Gemini. Reads the CLI credential file read-only (no keychain,
+/// tokens stay in memory; refresh only via the CLI's env overrides), so
+/// terminal failure means "run the Gemini CLI once to refresh your login".
+private struct GeminiPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch GeminiQuotaPresentation.planContent(loadState: store.geminiLoadState, hasUsage: store.geminiUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Gemini credentials found",
+                    message: "Sign in with the Gemini CLI first. Then click Try Again."
+                ) { Task { await store.bootstrapGemini() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Gemini credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.geminiError
+                ) { Task { await store.refreshGemini() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.geminiError ?? "Gemini temporarily unreachable. Retrying."
+                ) { Task { await store.refreshGemini() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Gemini login",
+                    reason: reason,
+                    fallback: "Your Gemini login has expired. Run the Gemini CLI once to refresh it, then click Reconnect."
+                ) { Task { await store.bootstrapGemini() } }
+            case let .usage(idle):
+                if let usage = store.geminiUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Gemini credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: GeminiUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Gemini")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Run the Gemini CLI to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if GeminiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Copilot. Reads the editor plugins' credential files read-only
+/// (no keychain, no refresh path), so terminal failure means "sign in via an
+/// editor's Copilot plugin again".
+private struct CopilotPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch CopilotQuotaPresentation.planContent(loadState: store.copilotLoadState, hasUsage: store.copilotUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Copilot credentials found",
+                    message: "Sign in via an editor's Copilot plugin first. Then click Try Again."
+                ) { Task { await store.bootstrapCopilot() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Copilot credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.copilotError
+                ) { Task { await store.refreshCopilot() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.copilotError ?? "GitHub temporarily unreachable. Retrying."
+                ) { Task { await store.refreshCopilot() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Copilot login",
+                    reason: reason,
+                    fallback: "Your Copilot sign-in has expired. Sign in via an editor's Copilot plugin again, then click Reconnect."
+                ) { Task { await store.bootstrapCopilot() } }
+            case let .usage(idle):
+                if let usage = store.copilotUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Copilot credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: CopilotUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Copilot")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Sign in via an editor's Copilot plugin to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if CopilotQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Antigravity. Quota comes from the Antigravity app's local
+/// language server (127.0.0.1 only, self-signed TLS) — there are no
+/// credentials to read, so the no-data state means "start the Antigravity
+/// app, then reconnect".
+private struct AntigravityPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch AntigravityQuotaPresentation.planContent(loadState: store.antigravityLoadState, hasUsage: store.antigravityUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No local Antigravity server found",
+                    message: "Start the Antigravity app, then click Try Again."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case .loading:
+                PlanLoadingView(message: "Probing the local Antigravity server...")
+            case .failed:
+                PlanFailedView(
+                    error: store.antigravityError
+                ) { Task { await store.refreshAntigravity() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.antigravityError ?? "Local Antigravity server unreachable. Retrying."
+                ) { Task { await store.refreshAntigravity() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Reconnect Antigravity",
+                    reason: reason,
+                    fallback: "Start the Antigravity app, then click Reconnect."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case let .usage(idle):
+                if let usage = store.antigravityUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Probing the local Antigravity server...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: AntigravityUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Antigravity")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Server disconnected. Start the Antigravity app to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if AntigravityQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
 private struct WindowProjection {
     enum Source { case linear, historicalBaseline }
     let percent: Double
     let willOverflow: Bool
     let hitsLimitAt: Date?
     let source: Source
+    /// used% − expected%; set by pace-aware callers (#726) to get the
+    /// deficit/reserve caption. Nil keeps the original caption wording.
+    var deltaPercent: Double? = nil
+    /// Stage-only caption: deficit/reserve without projection or ETA. Used on
+    /// short windows where a linear extrapolation isn't defensible.
+    var compact: Bool = false
 }
 
 private struct UtilizationRow: View {
@@ -2211,6 +2661,21 @@ private struct ProjectionCaption: View {
 
     private var captionText: String {
         let projected = String(format: "%.0f%%", projection.percent)
+        // Deficit-first wording (#726): pace state up front, projection or
+        // ETA after it, and neither on windows flagged compact.
+        if let delta = projection.deltaPercent {
+            if abs(delta) <= 2 {
+                return projection.compact ? "On pace" : "On pace: \(projected) at reset"
+            }
+            let stage = delta > 0
+                ? String(format: "%.0f%% in deficit", delta)
+                : String(format: "%.0f%% in reserve", -delta)
+            if projection.compact { return stage }
+            if projection.willOverflow, let hit = projection.hitsLimitAt {
+                return "\(stage) · hits 100% \(relativeReset(hit))"
+            }
+            return "\(stage) · \(projected) at reset"
+        }
         switch projection.source {
         case .linear:
             if projection.willOverflow, let hit = projection.hitsLimitAt {

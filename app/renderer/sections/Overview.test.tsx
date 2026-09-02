@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Polled } from '../hooks/usePolled'
 import { setActiveCurrency } from '../lib/format'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 import type { ActReportJson, DailyHistoryEntry, MenubarPayload, YieldJsonReport } from '../lib/types'
 import { Overview, OverviewContent, deriveSignals, localDateKey } from './Overview'
 
@@ -277,6 +278,149 @@ describe('Overview', () => {
     expect(screen.queryByText('Nearest limit')).not.toBeInTheDocument()
   })
 
+  it('keeps six-month and lifetime chart dates legible by capping and spreading axis ticks', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.current.label = 'Lifetime'
+    payload.history.daily = consecutiveDays(now, 365, index => index + 1)
+    getOverview.mockResolvedValue(payload)
+
+    const { container } = render(<Overview period="lifetime" provider="all" />)
+
+    expect(await screen.findByText('Lifetime')).toBeInTheDocument()
+    const ticks = [...container.querySelectorAll('.ov-xax span')]
+    expect(ticks).toHaveLength(6)
+    expect(ticks[0]).toHaveTextContent(new Date(
+      now.getFullYear(), now.getMonth(), now.getDate() - 364,
+    ).toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+    expect(ticks.at(-1)).toHaveTextContent(now.toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+  })
+
+  it('opens the activity heatmap at the newest dates without pinning later manual scrolling', async () => {
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(520)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(320)
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('waits for the compact heatmap slot to reach its final width before aligning newest dates', async () => {
+    let measuredScrollWidth = 320
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    const disconnect = vi.fn()
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback
+      }
+      observe = vi.fn()
+      disconnect = disconnect
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(0)
+
+      measuredScrollWidth = 520
+      measuredClientWidth = 320
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(200)
+      expect(disconnect).not.toHaveBeenCalled()
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('keeps following the newest dates across later resizes until the user scrolls away', async () => {
+    let measuredScrollWidth = 520
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resizeCallback = callback }
+      observe = vi.fn()
+      disconnect = vi.fn()
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+      const { container } = render(<Overview period="30days" provider="all" />)
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      measuredClientWidth = 240
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(280)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      measuredClientWidth = 200
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('keeps weekday labels fixed while month context scrolls with the activity cells', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(makePayload(now))
+
+    render(<Overview period="30days" provider="all" />)
+
+    expect(await screen.findByText('$312.40')).toBeInTheDocument()
+    const timeline = screen.getByRole('region', { name: 'Scrollable daily activity timeline' })
+    const weekdayLabels = screen.getByLabelText('Weekday labels')
+
+    expect(within(weekdayLabels).getByText('Mon')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Wed')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Fri')).toBeInTheDocument()
+    expect(within(timeline).queryByText('Mon')).not.toBeInTheDocument()
+    expect(within(timeline).getByText(now.toLocaleString('en-US', { month: 'short' }))).toBeInTheDocument()
+  })
+
   it('renders efficiency, cost-per-outcome, and the weekday-spike risk signal', async () => {
     const now = new Date()
     const payload = makePayload(now)
@@ -327,6 +471,27 @@ describe('Overview', () => {
     // The five real days keep their cost at the end; the leading 25 days are zeros.
     expect([...bars].slice(-5).map(bar => bar.getAttribute('data-cost'))).toEqual(['5', '5', '5', '5', '6.2'])
     expect([...bars].slice(0, 25).every(bar => bar.getAttribute('data-cost') === '0')).toBe(true)
+  })
+
+  it('renders days before recorded history as no data, not a $0.00 bar', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.history.daily = payload.history.daily.slice(-5)
+    getOverview.mockResolvedValue(payload)
+
+    const { container } = render(<Overview period="week" provider="all" />)
+
+    expect(await screen.findByText('parser-service')).toBeInTheDocument()
+    const bars = container.querySelectorAll('.chart .col')
+    expect(bars).toHaveLength(30)
+    // The 25 leading days predate the first recorded day: no data, not zero spend.
+    expect([...bars].slice(0, 25).every(bar => bar.classList.contains('nodata'))).toBe(true)
+    expect(bars[0].getAttribute('aria-label')).toContain('no data recorded')
+    // The five recorded days stay real (idle or spend), never marked no data.
+    expect([...bars].slice(-5).some(bar => bar.classList.contains('nodata'))).toBe(false)
+
+    fireEvent.mouseEnter(bars[0], { clientX: 100, clientY: 80 })
+    expect(screen.getByText('No data recorded')).toBeInTheDocument()
   })
 
   it('computes month-to-date, projection, and previous-month pace', async () => {
@@ -497,6 +662,49 @@ describe('Overview', () => {
     expect(screen.getByText('Saved via local models')).toBeInTheDocument()
     expect(screen.getByText('$42.50')).toBeInTheDocument()
     expect(screen.queryByText('Saved to date')).not.toBeInTheDocument()
+  })
+
+  it('shows paired-device aggregate totals in the hero under combined scope', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    // Local device: $312.40 / 4200 calls / 88 sessions (from makePayload).
+    // Combined swaps the hero to the cross-device aggregate and lists devices.
+    payload.combined = {
+      perDevice: [
+        { id: 'local', name: 'laptop', local: true, cost: 312.4, calls: 4200, sessions: 88, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0 },
+        { id: 'fp-workstation', name: 'workstation', local: false, cost: 187.6, calls: 2100, sessions: 40, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0 },
+      ],
+      combined: { cost: 500, calls: 6300, sessions: 128, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0, deviceCount: 2, reachableCount: 2 },
+    }
+
+    const { container } = render(<OverviewContent period="30days" provider="all" overview={polled(payload)} scope="combined" />)
+
+    const kpis = container.querySelector('.ov-hero-main') as HTMLElement
+    // Hero cost is the combined $500, not the local $312.40.
+    expect(within(kpis).getByText('$500.00')).toBeInTheDocument()
+    expect(within(kpis).getByText(/6,300 calls · 128 sessions/)).toBeInTheDocument()
+    expect(within(kpis).getByText('Combined · Last 30 days')).toBeInTheDocument()
+    expect(within(kpis).getByText('2 of 2 devices')).toBeInTheDocument()
+    expect(within(kpis).getByText('workstation')).toBeInTheDocument()
+    expect(within(kpis).getByText('laptop · this device')).toBeInTheDocument()
+    // Combined mode hides the local savings lines (they are device-specific).
+    expect(within(kpis).queryByText('Saved via local models')).not.toBeInTheDocument()
+  })
+
+  it('keeps local hero totals when scope is local even if a combined payload is present', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.combined = {
+      perDevice: [],
+      combined: { cost: 999, calls: 1, sessions: 1, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0, deviceCount: 2, reachableCount: 2 },
+    }
+
+    const { container } = render(<OverviewContent period="30days" provider="all" overview={polled(payload)} scope="local" />)
+
+    const kpis = container.querySelector('.ov-hero-main') as HTMLElement
+    expect(within(kpis).getByText('$312.40')).toBeInTheDocument()
+    expect(within(kpis).queryByText('$999.00')).not.toBeInTheDocument()
+    expect(within(kpis).queryByText(/devices/)).not.toBeInTheDocument()
   })
 
   it('shows a stale banner when last-good data is present but the latest poll failed', async () => {
@@ -677,5 +885,185 @@ describe('Overview', () => {
     const outcome = (await screen.findByText('Cost per outcome')).closest('.ov-panel') as HTMLElement
     expect(within(outcome).getByText('€22.50')).toBeInTheDocument()
     expect(within(outcome).getByText('€36.00')).toBeInTheDocument()
+  })
+
+  it('formats a persisted headline in its own currency on first paint and dates older snapshots', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 7, 28, 10, 0, 0))
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    const captured = new Date(2026, 7, 26, 14, 30, 0)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: captured.getTime(),
+      generated: captured.toISOString(),
+      label: 'Last 30 days',
+      cost: 100,
+      calls: 12,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'EUR', symbol: '€', rate: 0.9 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+
+    render(<OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />)
+
+    expect(screen.getByText('€90.00')).toBeInTheDocument()
+    expect(screen.getByText('exact Aug 26 at 2:30 PM')).toBeInTheDocument()
+  })
+
+  it('suppresses only the persisted-headline handoff, not later filter animations', () => {
+    const now = new Date(2026, 7, 28, 10, 0, 0)
+    const payload = makePayload(now)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: now.getTime(),
+      generated: now.toISOString(),
+      label: 'Last 30 days',
+      cost: payload.current.cost,
+      calls: payload.current.calls,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'USD', symbol: '$', rate: 1 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+    const { container, rerender } = render(
+      <OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />,
+    )
+
+    rerender(<OverviewContent period="30days" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'suppressed')
+
+    rerender(<OverviewContent period="week" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'enabled')
+  })
+})
+
+type WorkflowOverrides = {
+  workflow?: MenubarPayload['current']['workflow']
+  topReworkedFiles?: MenubarPayload['current']['topReworkedFiles']
+  pricingCoverage?: MenubarPayload['current']['pricingCoverage']
+}
+
+function workflowPayload(now: Date, over: WorkflowOverrides): MenubarPayload {
+  const base = makePayload(now)
+  return { ...base, current: { ...base.current, ...over } }
+}
+
+describe('Overview workflow card', () => {
+  beforeEach(() => {
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    getOverview.mockReset()
+    getActReport.mockReset()
+    getYield.mockReset()
+    getActReport.mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
+    getYield.mockResolvedValue(makeYieldReport())
+  })
+  afterEach(() => vi.useRealTimers())
+
+  function workflowRegion(): HTMLElement {
+    return screen.getByRole('heading', { name: 'Workflow' }).closest('.ov-workflow-widget') as HTMLElement
+  }
+
+  it('renders correction rate, time to first edit, top rework, coverage chip, and a coaching note', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 7, correctionRate: 0.2, medianTimeToFirstEditMs: 45_000 },
+      topReworkedFiles: [{ path: 'parser.ts', sessions: 4, edits: 12 }],
+      pricingCoverage: 0.92,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    expect(within(card).getByText('Correction rate')).toBeInTheDocument()
+    expect(within(card).getByText('20%')).toBeInTheDocument()
+    expect(within(card).getByText('7 corrections')).toBeInTheDocument()
+    expect(within(card).getByText('Time to first edit')).toBeInTheDocument()
+    // Under 60s renders as seconds, not minutes.
+    expect(within(card).getByText('45s')).toBeInTheDocument()
+    expect(within(card).getByText(/Top rework:/)).toHaveTextContent('Top rework: parser.ts · 4 sessions · 12 edits')
+    // pricingCoverage 0.92 → a "92% priced" caveat chip.
+    expect(within(card).getByText('92% priced')).toBeInTheDocument()
+    // Corrections clears its bar first, so its coaching line wins.
+    expect(within(card).getByText(/You corrected the assistant on 20% of prompts \(7 times\)/)).toBeInTheDocument()
+  })
+
+  it('does not render at all when the payload carries no workflow signal', async () => {
+    const now = new Date()
+    // makePayload omits workflow/topReworkedFiles/pricingCoverage entirely.
+    getOverview.mockResolvedValue(makePayload(now))
+
+    render(<Overview period="30days" provider="all" />)
+
+    await screen.findByText('$312.40')
+    expect(screen.queryByRole('heading', { name: 'Workflow' })).not.toBeInTheDocument()
+  })
+
+  it('stays hidden when workflow exists but every metric is empty', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 0, correctionRate: null, medianTimeToFirstEditMs: null },
+      topReworkedFiles: [],
+      pricingCoverage: 1,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    await screen.findByText('$312.40')
+    expect(screen.queryByRole('heading', { name: 'Workflow' })).not.toBeInTheDocument()
+  })
+
+  it('picks the churn note and formats minutes when corrections are below the bar', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 1, correctionRate: 0.05, medianTimeToFirstEditMs: 8 * 60 * 1000 },
+      topReworkedFiles: [{ path: 'router.ts', sessions: 5, edits: 30 }],
+      pricingCoverage: null,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    // >= 60s renders as whole minutes.
+    expect(within(card).getByText('8m')).toBeInTheDocument()
+    // Corrections (5%) is below 0.15, so the churn note wins over TTFE.
+    expect(within(card).getByText(/router\.ts was reworked across 5 sessions \(30 edits\)/)).toBeInTheDocument()
+    // pricingCoverage null → no chip.
+    expect(within(card).queryByText(/priced/)).not.toBeInTheDocument()
+  })
+
+  it('falls back to a neutral caption and hides the chip at full coverage when no note fires', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 1, correctionRate: 0.05, medianTimeToFirstEditMs: 30_000 },
+      topReworkedFiles: [{ path: 'small.ts', sessions: 1, edits: 2 }],
+      pricingCoverage: 1,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    expect(within(card).getByText('Corrections, first-edit latency, and file churn across your sessions.')).toBeInTheDocument()
+    expect(within(card).queryByText(/priced/)).not.toBeInTheDocument()
   })
 })

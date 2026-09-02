@@ -2,16 +2,22 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache } from './parser.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
+import { getProvider } from './providers/index.js'
+import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
-import { toDateString } from './daily-cache.js'
+import { DAILY_CACHE_VERSION, toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
+import { sessionModelBillableOutputTokens } from './session-output.js'
+import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
+import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { buildPeriodData, buildMenubarPayloadForRange } from './usage-aggregator.js'
+import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
+import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
 import { renderDashboard } from './dashboard.js'
 import { renderOverview } from './overview.js'
 import { runWebDashboard } from './web-dashboard.js'
@@ -30,6 +36,7 @@ import { runOptimize } from './optimize.js'
 import { registerActCommands } from './act/cli.js'
 import { registerGuardCommands } from './guard/cli.js'
 import { registerSyncCommands } from './sync/cli.js'
+import { registerPluginCommands, registerLoadedPluginCommands } from './plugins/cli.js'
 import { runContextCommand } from './context-tree.js'
 import { renderCompare } from './compare.js'
 import { computeBudgetStatus, daysInMonth, diffCalendarDays, type BudgetStatus, type BudgetTier } from './budget.js'
@@ -39,13 +46,19 @@ import {
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
 import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
-import { clampResetDay, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
+import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
+// Bump when the menubar payload's rendering semantics change without a package
+// release or daily-cache version change. The envelope version in session-cache
+// protects record shape; this protects the meaning of an otherwise valid one.
+const STATUS_SNAPSHOT_RENDER_VERSION = 2
+const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
+import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
 
 // A downstream reader that closes the pipe early (`| head`, quitting `less`, or
 // a missing command) makes stdout writes fail with EPIPE. Exit cleanly rather
@@ -66,6 +79,22 @@ function parseNumber(value: string): number {
 
 function parseInteger(value: string): number {
   return parseInt(value, 10)
+}
+
+function parseCodexTpsLimit(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > 10000) {
+    throw new Error('limit must be an integer from 1 to 10000')
+  }
+  return parsed
+}
+
+function parseCodexTpsWatch(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || (parsed > 0 && parsed < 1) || parsed > 3600) {
+    throw new Error('watch must be 0 or at least 1 second (up to 3600 seconds)')
+  }
+  return parsed
 }
 
 type PriceOverrideConfig = NonNullable<CodeburnConfig['priceOverrides']>[string]
@@ -124,10 +153,20 @@ type JsonPlanSummary = {
   daysUntilReset: number
   periodStart: string
   periodEnd: string
+  monthlyCredits?: number
+  spentCredits?: number
+  budgetCredits?: number
+  creditsIncomplete?: boolean
+  estimatedCredits?: number
+  creditRatedCalls?: number
+  creditUnratedCalls?: number
+  creditsNote?: string
+  monthlyUsd?: number
+  spentApiEquivalentUsd?: number
 }
 
 function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
-  return {
+  const summary: JsonPlanSummary = {
     id: planUsage.plan.id,
     provider: planUsage.plan.provider,
     budget: convertCost(planUsage.budgetUsd),
@@ -139,6 +178,19 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     periodStart: planUsage.periodStart.toISOString(),
     periodEnd: planUsage.periodEnd.toISOString(),
   }
+  if (planUsage.plan.provider === 'copilot') {
+    summary.monthlyCredits = planUsage.plan.monthlyCredits
+    summary.spentCredits = planUsage.spentCredits
+    summary.budgetCredits = planUsage.budgetCredits
+    summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.estimatedCredits = planUsage.estimatedCredits
+    summary.creditRatedCalls = planUsage.creditRatedCalls
+    summary.creditUnratedCalls = planUsage.creditUnratedCalls
+    summary.creditsNote = copilotCreditsNote(planUsage.creditRatedCalls ?? 0, planUsage.creditUnratedCalls ?? 0)
+    summary.monthlyUsd = planUsage.plan.monthlyUsd
+    summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
+  }
+  return summary
 }
 
 type JsonPlanSummaryMap = Partial<Record<PlanProvider, JsonPlanSummary>>
@@ -363,6 +415,7 @@ function toPlanDisplay(plan: Plan) {
   return {
     id: plan.id,
     monthlyUsd: plan.monthlyUsd,
+    ...(plan.monthlyCredits != null ? { monthlyCredits: plan.monthlyCredits } : {}),
     provider: plan.provider,
     resetDay: clampResetDay(plan.resetDay),
     setAt: plan.setAt || null,
@@ -410,11 +463,17 @@ function assertScope(value: string, allowed: readonly string[], command: string)
   }
 }
 
+// Wrapped in a factory because commander option state is sticky across
+// parses: `codeburn serve` executes many requests in one process and must
+// build a FRESH program per request or one request's --period would leak
+// into the next one's defaults. The normal CLI path builds it exactly once.
+function buildProgram(): Command {
+
 async function runJsonReport(period: Period, provider: string, project: string[], exclude: string[]): Promise<void> {
   await loadPricing()
   const { range, label } = getDateRange(period)
-  const projects = filterProjectsByName(await parseAllSessions(range, provider), project, exclude)
-  const report: ReturnType<typeof buildJsonReport> & { plan?: JsonPlanSummary; plans?: JsonPlanSummaryMap } = await attachPlanSummaries(buildJsonReport(projects, label, period))
+  const durable = await buildDurablePeriod({ range, label }, { provider, project, exclude })
+  const report: ReturnType<typeof buildJsonReport> & { plan?: JsonPlanSummary; plans?: JsonPlanSummaryMap } = await attachPlanSummaries(buildJsonReport(durable.liveProjects, label, period, durable))
   console.log(JSON.stringify(report, null, 2))
 }
 
@@ -440,6 +499,8 @@ program.hook('preAction', async (thisCommand) => {
   setModelAliases(config.modelAliases ?? {})
   setPriceOverrides(config.priceOverrides ?? {})
   setLocalModelSavings(config.localModelSavings ?? {})
+  setFlatRateModels(config.flatRateModels ?? [])
+  setFlatRateRemoved(config.flatRateModelsRemoved ?? [])
   setProxyPaths(config.proxyPaths ?? [])
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
@@ -447,73 +508,50 @@ program.hook('preAction', async (thisCommand) => {
   await loadCurrency()
 })
 
-function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string) {
+function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable: DurablePeriod) {
   const sessions = projects.flatMap(p => p.sessions)
   const { code } = getCurrency()
 
-  const totalCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
-  const totalSavingsUSD = projects.reduce((s, p) => s + p.totalSavingsUSD, 0)
-  const totalEstimatedUSD = projects.reduce((s, p) => s + (p.totalEstimatedCostUSD ?? 0), 0)
+  // Headline totals come from the durable daily cache (carry-forward days whose
+  // session files have expired still count), matching the menubar exactly. The
+  // proxied/net split is a surviving-session concept (subscription attribution
+  // isn't stored per day), so it stays live; net is taken off the durable total.
+  const totalCostUSD = durable.data.cost
+  const totalSavingsUSD = durable.data.savingsUSD
+  const totalEstimatedUSD = durable.data.estimatedCostUSD ?? 0
   // Subscription-covered (proxied) portion of totalCostUSD, and the resulting
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
-  const totalCalls = projects.reduce((s, p) => s + p.totalApiCalls, 0)
-  const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
-  const totalInput = sessions.reduce((s, sess) => s + sess.totalInputTokens, 0)
-  const totalOutput = sessions.reduce((s, sess) => s + sess.totalOutputTokens, 0)
-  const totalCacheRead = sessions.reduce((s, sess) => s + sess.totalCacheReadTokens, 0)
-  const totalCacheWrite = sessions.reduce((s, sess) => s + sess.totalCacheWriteTokens, 0)
+  const totalCalls = durable.data.calls
+  const totalSessions = durable.data.sessions
+  const totalInput = durable.data.inputTokens
+  const totalOutput = durable.data.outputTokens
+  const totalCacheRead = durable.data.cacheReadTokens
+  const totalCacheWrite = durable.data.cacheWriteTokens
   // Match src/menubar-json.ts:cacheHitPercent: reads over reads+fresh-input. cache_write
   // counts tokens being stored, not served, so it doesn't belong in the denominator.
   const cacheHitDenom = totalInput + totalCacheRead
   const cacheHitPercent = cacheHitDenom > 0 ? Math.round((totalCacheRead / cacheHitDenom) * 1000) / 10 : 0
 
-  // Per-day rollup. Mirrors parser.ts categoryBreakdown semantics so a
-  // consumer summing daily[].editTurns over a period gets the same total as
-  // sum(activities[].editTurns) for that period: every turn counts once for
-  // `turns`, edit turns count for `editTurns`, edit turns with zero retries
-  // count for `oneShotTurns`. Issue #279 — daily-resolution efficiency
-  // dashboards need this without re-deriving from activity-level rollups.
-  const dailyMap: Record<string, { cost: number; savings: number; calls: number; turns: number; editTurns: number; oneShotTurns: number }> = {}
-  for (const sess of sessions) {
-    for (const turn of sess.turns) {
-      // Prefer the user-message timestamp on the turn; fall back to the first
-      // assistant-call timestamp when the user line is missing (continuation
-      // sessions where the JSONL begins mid-conversation). Previously these
-      // turns dropped from daily but stayed in activities, breaking the
-      // sum(daily[].editTurns) === sum(activities[].editTurns) invariant.
-      const ts = turn.timestamp || turn.assistantCalls[0]?.timestamp
-      if (!ts) { continue }
-      const day = dateKey(ts)
-      if (!dailyMap[day]) { dailyMap[day] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-      dailyMap[day].turns += 1
-      if (turn.hasEdits) {
-        dailyMap[day].editTurns += 1
-        if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
-      }
-      for (const call of turn.assistantCalls) {
-        dailyMap[day].cost += call.costUSD
-        dailyMap[day].savings += call.savingsUSD ?? 0
-        dailyMap[day].calls += 1
-      }
-    }
-  }
-  const daily = Object.entries(dailyMap).sort().map(([date, d]) => ({
-    date,
-    cost: convertCost(d.cost),
-    savings: convertCost(d.savings),
-    calls: d.calls,
-    turns: d.turns,
-    editTurns: d.editTurns,
-    oneShotTurns: d.oneShotTurns,
-    // Pre-computed convenience for dashboards that don't want to do the math.
-    // null when there are no edit turns (the rate is undefined, not zero —
-    // a day where the user only had Q&A turns shouldn't read as 0% one-shot).
-    oneShotRate: d.editTurns > 0
-      ? Math.round((d.oneShotTurns / d.editTurns) * 1000) / 10
-      : null,
-  }))
+  // Daily rows come from the same durable day set as the headline so they sum
+  // to it, carried days included. Both JSON call sites always pass durable
+  // (#1067); the live dailyMap fallback was unreachable and is gone.
+  const daily = durable.days.map(d => {
+        const turns = Object.values(d.categories).reduce((s, c) => s + c.turns, 0)
+        return {
+          date: d.date,
+          cost: convertCost(d.cost),
+          savings: convertCost(d.savingsUSD),
+          calls: d.calls,
+          turns,
+          editTurns: d.editTurns,
+          oneShotTurns: d.oneShotTurns,
+          oneShotRate: d.editTurns > 0
+            ? Math.round((d.oneShotTurns / d.editTurns) * 1000) / 10
+            : null,
+        }
+      })
 
   const projectList = projects.map(p => ({
     name: p.project,
@@ -537,9 +575,16 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       modelMap[model].savings += d.savingsUSD
       modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
       modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].outputTokens += d.tokens.outputTokens
       modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
       modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
+    }
+    // Output must be billed per call while provider identity is still known.
+    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
+      if (!modelMap[model]) {
+        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+      }
+      modelMap[model].outputTokens += output
     }
   }
   // Pull the active baseline model name out of the savings config so the
@@ -715,7 +760,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 program
   .command('report', { isDefault: true })
   .description('Interactive usage dashboard')
-  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all', 'week')
+  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime (interactive default: today, or week when today is empty)', 'week')
   .option('--day <date>', 'Single day to review (YYYY-MM-DD, today, or yesterday). Overrides --period when set')
   .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
@@ -723,8 +768,8 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
-  .action(async (opts) => {
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
+  .action(async (opts, command) => {
     assertFormat(opts.format, ['tui', 'json'], 'report')
     assertProvider(opts.provider, 'report')
     let customRange: DateRange | null = null
@@ -748,19 +793,20 @@ program
         const range = daySelection?.range ?? customRange!
         const label = daySelection?.label ?? formatDateRangeLabel(opts.from, opts.to)
         const periodKey = daySelection ? 'day' : 'custom'
-        const projects = filterProjectsByName(
-          await parseAllSessions(range, opts.provider),
-          opts.project,
-          opts.exclude,
-        )
-        console.log(JSON.stringify(await attachPlanSummaries(buildJsonReport(projects, label, periodKey)), null, 2))
+        const durable = await buildDurablePeriod({ range, label }, { provider: opts.provider, project: opts.project, exclude: opts.exclude })
+        console.log(JSON.stringify(await attachPlanSummaries(buildJsonReport(durable.liveProjects, label, periodKey, durable)), null, 2))
       } else {
         await runJsonReport(period, opts.provider, opts.project, opts.exclude)
       }
       return
     }
     const customRangeLabel = customRange ? formatDateRangeLabel(opts.from, opts.to) : undefined
-    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day)
+    // #1111: no explicit period of any kind means the interactive dashboard
+    // picks its own — Today, or 7 days when today is still empty. Any source
+    // other than the option default (a flag, an env value) is the user's
+    // choice and is honored as given.
+    const autoPeriod = command.getOptionValueSource('period') === 'default' && !daySelection && !customRange
+    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day, autoPeriod)
   })
 
 program
@@ -797,7 +843,7 @@ program
   .command('devices [action] [target]')
   .description('Combined usage across your devices. Actions: scan | add (find nearby & pair) | add <host> --pin <pin> (manual) | rm <name>. Supports --format json for read-only output and scan.')
   .option('--pin <pin>', 'Pairing PIN shown on the device you are adding')
-  .option('-p, --period <period>', 'Period: today, week, 30days, month, all', 'month')
+  .option('-p, --period <period>', 'Period: today, week, 30days, month, all, lifetime', 'month')
   .option('--port <number>', 'Default port when adding a device', parseInteger, 7777)
   .option('--format <format>', 'Output format: text, json', 'text')
   .action(async (action: string | undefined, target: string | undefined, opts) => {
@@ -905,7 +951,7 @@ program
 program
   .command('overview')
   .description('Plain-text usage overview, copy-pasteable (defaults to this month)')
-  .option('-p, --period <period>', 'Period: today, week, 30days, month, all', 'month')
+  .option('-p, --period <period>', 'Period: today, week, 30days, month, all, lifetime', 'month')
   .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, copilot)', 'all')
@@ -926,12 +972,30 @@ program
     const { range, label } = customRange
       ? { range: customRange, label: formatDateRangeLabel(opts.from, opts.to) }
       : getDateRange(period!)
-    const projects = filterProjectsByName(await parseAllSessions(range, opts.provider), opts.project, opts.exclude)
+    const durable = await buildDurablePeriod({ range, label }, { provider: opts.provider, project: opts.project, exclude: opts.exclude })
+    const projects = durable.liveProjects
     const config = await readConfig()
     const budget = isOverviewBudgetFilterActive(opts)
       ? undefined
       : buildOverviewBudget(projects, config.budget, budgetTierForOverview(period, customRange), range)
-    process.stdout.write(renderOverview(projects, { label, color: opts.color, budget }))
+    process.stdout.write(renderOverview(projects, {
+      label,
+      color: opts.color,
+      budget,
+      durable: {
+        cost: durable.data.cost,
+        savingsUSD: durable.data.savingsUSD,
+        calls: durable.data.calls,
+        sessions: durable.data.sessions,
+        inputTokens: durable.data.inputTokens,
+        outputTokens: durable.data.outputTokens,
+        cacheReadTokens: durable.data.cacheReadTokens,
+        cacheWriteTokens: durable.data.cacheWriteTokens,
+        days: durable.days,
+        carriedCostUSD: durable.carriedCostUSD,
+        unattributedCostUSD: durable.unattributedCostUSD,
+      },
+    }))
   })
 
 program
@@ -975,7 +1039,7 @@ program
 program
   .command('web')
   .description('Open the local web dashboard in your browser')
-  .option('-p, --period <period>', 'Initial period: today, week, 30days, month, all', 'today')
+  .option('-p, --period <period>', 'Initial period: today, week, 30days, month, all, lifetime', 'today')
   .option('--from <date>', 'Start date (YYYY-MM-DD)')
   .option('--to <date>', 'End date (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, copilot)', 'all')
@@ -1005,7 +1069,7 @@ program
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--period <period>', 'Primary period for menubar-json: today, week, 30days, month, all', 'today')
+  .option('--period <period>', 'Primary period for menubar-json: today, week, 30days, month, all, lifetime', 'today')
   .option('--day <date>', 'Single day for menubar-json (YYYY-MM-DD, today, or yesterday). Overrides --period when set')
   .option('--from <date>', 'Start date (YYYY-MM-DD) for custom range')
   .option('--to <date>', 'End date (YYYY-MM-DD) for custom range')
@@ -1056,15 +1120,106 @@ program
         : customRange
         ? { range: customRange, label: formatDateRangeLabel(opts.from, opts.to) }
         : daySelection ?? getDateRange(opts.period)
-      const payload = await buildMenubarPayloadForRange(periodInfo, {
+      // Fast path: the menubar app spawns this exact command fresh on every
+      // poll tick, so nothing in-process (parser.ts's TTL/burst caches,
+      // session-cache.ts's cacheMemo) ever survives between polls. A cheap
+      // stat-only pass (no session-cache.json parse, no transcript content
+      // read) over the discoverable corpus tells us whether anything changed
+      // since the last identical query; when it hasn't — or the only thing
+      // that changed is still within loadStatusSnapshot's settle window and
+      // may still be mid-write — skip the full parse + aggregation pipeline
+      // entirely and serve the persisted snapshot instead.
+      // Single source of truth for the fields that define the query scope,
+      // shared between the cache key below and the payload builder options
+      // — a field added to only one of the two would otherwise silently
+      // desync the cache from what it's supposed to be keying on.
+      const queryScope = {
         provider: pf,
         project: opts.project,
         exclude: opts.exclude,
-        daysSelection,
         optimize: opts.optimize !== false,
         timeline: opts.timeline !== false,
-        claudeConfigSourceId: opts.claudeConfigSource,
+        claudeConfigSourceId: opts.claudeConfigSource ?? null,
+      }
+      // The selector renders source labels/options derived from ordered Claude
+      // roots, including idle sources. Config order can change those labels
+      // without moving any transcript file, so it belongs to the query key
+      // (not the debounced corpus mismatch path).
+      const claudeSourceTopology = {
+        configDirs: await getClaudeConfigDirs(),
+        desktopSessionDirs: getDesktopSessionsDirs(),
+      }
+      const queryKey = JSON.stringify({
+        start: periodInfo.range.start.toISOString(),
+        end: periodInfo.range.end.toISOString(),
+        label: periodInfo.label,
+        ...queryScope,
+        days: daysSelection ? [...daysSelection.days].sort() : undefined,
+        claudeSourceTopology,
+        // Mirrors parser.ts's cacheKey: pricing-affecting config must
+        // invalidate this snapshot the same way it invalidates the
+        // parse-level memo, or an edited alias/override/savings config keeps
+        // serving costs priced under the old config until something
+        // unrelated moves the corpus fingerprint.
+        proxyPathsConfigHash: getProxyPathsConfigHash(),
+        modelAliasesConfigHash: getModelAliasesConfigHash(),
+        priceOverridesConfigHash: getPriceOverridesConfigHash(),
+        localModelSavingsConfigHash: getLocalModelSavingsConfigHash(),
+        flatRateModelsConfigHash: getFlatRateModelsConfigHash(),
+        // Same reasoning, different config: the rendered payload's costs are
+        // in the ACTIVE display currency (see `getCurrency`/`loadCurrency`,
+        // refreshed fresh from config.json by the `preAction` hook ahead of
+        // this handler), which the corpus fingerprint and the config hashes
+        // above never touch. Without this, switching currencies keeps
+        // serving the old currency's numbers until a session file happens to
+        // change too.
+        currency: getCurrency(),
+        // Upstream/bundled pricing DATA and CODE version, as opposed to the
+        // hashes above (user-editable pricing CONFIG): the live LiteLLM
+        // cache's freshness, the bundled snapshot's own content, and the
+        // parser/pricing logic's semantic version. None of these move the
+        // corpus fingerprint or any config hash, so without this a repricing
+        // fetch or a pricing-logic fix can keep serving old rendered costs
+        // indefinitely against an unchanged session corpus.
+        pricingGenerationKey: getPricingGenerationKey(),
       })
+      // Optimize findings (the default; see --no-optimize) depend on mutable
+      // project/config/prompt/hook state: ~/.claude and project-level
+      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config.
+      // computeCorpusFingerprint and queryKey never observe those inputs, and
+      // they have no single enumerable fingerprint. Persisting THAT class of
+      // output would leave an agent edit with no session change serving stale
+      // findings indefinitely. Caching only the base payload and re-deriving
+      // the findings on each hit (#1135 part 2) was tried on this branch and
+      // reverted in post-build review: scanAndDetect needs the parsed corpus,
+      // so the re-derivation pays the full parse the snapshot exists to avoid
+      // on exactly the cold processes the snapshot is for, and the resident
+      // serve child gains nothing either because its in-memory output memo
+      // already dedupes a repeated argv. Simplest correct stance: the
+      // optimize path never reads or writes the disk snapshot at all, it
+      // always recomputes fresh. One-shot and serve-child behavior are
+      // identical for both optimize values.
+      const useSnapshot = !queryScope.optimize
+      const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
+      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
+      const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
+        ...queryScope,
+        daysSelection,
+      })) as Awaited<ReturnType<typeof buildMenubarPayloadForRange>>
+      // A read-only parse that had to serve stale/skip real files
+      // (isSessionHydrationComplete() === false) is a knowingly-degraded
+      // result. Persisting it under the CURRENT (already-advanced) corpus
+      // fingerprint would make that degraded answer look authoritative to
+      // every future poll that matches this fingerprint — never checkpoint a
+      // partial hydration as if it were a real, complete parse. Gate on the
+      // payload's own markers, captured at the one safe read point inside
+      // buildMenubarPayloadForRange: the hydration global is reassigned by
+      // every later parse (this function's own history re-parse included),
+      // so re-reading it here can bless a payload whose stale flag says
+      // degraded and pin its under-reported totals until the corpus changes.
+      if (useSnapshot && corpus && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
+        await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
+      }
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take
@@ -1091,12 +1246,13 @@ program
     }
 
     if (opts.format === 'json') {
-      const todayProjects = fp(await parseAllSessions(getDateRange('today').range, pf))
-      const todayData = buildPeriodData('today', todayProjects)
-      clearSessionCache()
-      const monthProjects = fp(await parseAllSessions(getDateRange('month').range, pf))
-      const monthData = buildPeriodData('month', monthProjects)
-      clearSessionCache()
+      // Durable totals so the compact status matches the menubar / report.
+      const todayDurable = await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude })
+      const todayData = todayDurable.data
+      const todayProjects = todayDurable.liveProjects
+      const monthDurable = await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude })
+      const monthData = monthDurable.data
+      const monthProjects = monthDurable.liveProjects
       const { code, rate } = getCurrency()
       const payload: {
         currency: string
@@ -1110,8 +1266,11 @@ program
         today: { cost: Math.round(todayData.cost * rate * 100) / 100, savings: Math.round(todayData.savingsUSD * rate * 100) / 100, calls: todayData.calls },
         month: { cost: Math.round(monthData.cost * rate * 100) / 100, savings: Math.round(monthData.savingsUSD * rate * 100) / 100, calls: monthData.calls },
       }
-      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
-      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
+      // Savings DOLLARS keep every call, but these are request COUNTS: a
+      // supplementary accounting call (copilot rollup / paired store row) can
+      // carry configured model-savings too and must not count as a request.
+      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
+      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
       if (todayData.savingsUSD > 0 || monthData.savingsUSD > 0) {
         payload.localModelSavings = {
           today: payload.today.savings,
@@ -1124,9 +1283,12 @@ program
       return
     }
 
-    const monthProjects2 = fp(await parseAllSessions(getDateRange('month').range, pf))
-    clearSessionCache()
-    console.log(renderStatusBar(monthProjects2))
+    const todayDurable = await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude })
+    const monthDurable = await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude })
+    console.log(renderStatusBar([], {
+      today: { cost: todayDurable.data.cost, calls: todayDurable.data.calls },
+      month: { cost: monthDurable.data.cost, calls: monthDurable.data.calls },
+    }))
   })
 
 program
@@ -1136,7 +1298,7 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
   .action(async (opts) => {
     assertFormat(opts.format, ['tui', 'json'], 'today')
     assertProvider(opts.provider, 'today')
@@ -1154,7 +1316,7 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
   .action(async (opts) => {
     assertFormat(opts.format, ['tui', 'json'], 'month')
     assertProvider(opts.provider, 'month')
@@ -1237,12 +1399,13 @@ program
 
 program
   .command('menubar')
-  .description('Install and launch the macOS menubar app (one command, no clone)')
-  .option('--force', 'Reinstall even if an older copy is already in ~/Applications')
+  .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
+  .option('--force', 'Reinstall even if a copy is already installed')
   .action(async (opts: { force?: boolean }) => {
     try {
       const result = await installMenubarApp({ force: opts.force, cliVersion: version })
-      console.log(`\n  Ready. ${result.installedPath}\n`)
+      // A cancelled Windows installer leaves nothing to point at.
+      if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`\n  Menubar install failed: ${message}\n`)
@@ -1504,6 +1667,87 @@ program
   })
 
 program
+  .command('model-flat-rate [model]')
+  .description('Mark a model as subscription / flat-rate billed. $0 is the correct cost and the unpriced warning is silenced. Do not use model-alias for these — that maps them onto another model\'s per-token rate and invents spend (e.g. codeburn model-flat-rate auto-genius).')
+  .option('--remove <model>', 'Remove a flat-rate mark, including a built-in SKU')
+  .option('--list', 'List configured flat-rate models and built-in opt-outs')
+  .action(async (model?: string, opts?: { remove?: string; list?: boolean }) => {
+    const config = await readConfig()
+    const marked = [...(config.flatRateModels ?? [])]
+    const removed = [...(config.flatRateModelsRemoved ?? [])]
+
+    if (opts?.list || (!model && !opts?.remove)) {
+      if (marked.length === 0 && removed.length === 0) {
+        console.log('\n  No flat-rate models configured.')
+        console.log(`  Config: ${getConfigFilePath()}`)
+        console.log('  Add one with: codeburn model-flat-rate <model>\n')
+      } else {
+        if (marked.length > 0) {
+          console.log('\n  Flat-rate / subscription models:')
+          for (const name of marked) {
+            console.log(`    ${name}`)
+          }
+        }
+        if (removed.length > 0) {
+          console.log('\n  Built-in flat-rate opt-outs (unpriced warning fires again):')
+          for (const name of removed) {
+            console.log(`    ${name}`)
+          }
+        }
+        console.log(`  Config: ${getConfigFilePath()}\n`)
+      }
+      return
+    }
+
+    if (opts?.remove) {
+      const target = opts.remove
+      const idx = marked.indexOf(target)
+      const builtIn = isBuiltInFlatRateModel(target)
+      const alreadyOptedOut = removed.some(id => isSameFlatRateModel(id, target))
+      if (idx < 0 && (!builtIn || alreadyOptedOut)) {
+        console.error(`\n  No flat-rate mark found for: ${target}\n`)
+        process.exitCode = 1
+        return
+      }
+      if (idx >= 0) {
+        marked.splice(idx, 1)
+        config.flatRateModels = marked.length > 0 ? marked : undefined
+      }
+      if (builtIn && !alreadyOptedOut) {
+        removed.push(target)
+        config.flatRateModelsRemoved = removed
+      }
+      await saveConfig(config)
+      console.log(`\n  Removed flat-rate mark: ${target}`)
+      if (builtIn) {
+        console.log('  Built-in SKU opted out; the unpriced warning will fire again until you re-add it.')
+      }
+      console.log()
+      return
+    }
+
+    if (!model) {
+      console.error('\n  Usage: codeburn model-flat-rate <model>\n')
+      process.exitCode = 1
+      return
+    }
+
+    if (!marked.includes(model)) marked.push(model)
+    config.flatRateModels = marked
+    const remainingOptOuts = removed.filter(id => !isSameFlatRateModel(id, model))
+    config.flatRateModelsRemoved = remainingOptOuts.length > 0 ? remainingOptOuts : undefined
+    await saveConfig(config)
+
+    if (config.modelAliases && Object.hasOwn(config.modelAliases, model)) {
+      console.log(`\n  Note: ${model} is also in modelAliases (-> ${config.modelAliases[model]}).`)
+      console.log('  The alias still invents per-token spend. Remove it if $0 is the correct cost.')
+    }
+
+    console.log(`\n  Flat-rate mark saved: ${model}`)
+    console.log(`  Config: ${getConfigFilePath()}\n`)
+  })
+
+program
   .command('proxy-path [path]')
   .description('Mark a project directory as routed through a subscription-backed LLM proxy (e.g. Claude Code over GitHub Copilot). Sessions whose canonical path is under it keep their full API-rate cost as the "would-be" figure, but that amount is reported as subscription-covered so the report can show net out-of-pocket (e.g. codeburn proxy-path ~/work/copilot-repo). Actual API-key sessions elsewhere are untouched.')
   .option('--remove <path>', 'Remove a configured proxy path')
@@ -1582,14 +1826,15 @@ program
   .description('Show or configure a subscription plan for overage tracking')
   .option('--format <format>', 'Output format: text or json', 'text')
   .option('--monthly-usd <n>', 'Monthly plan price in USD (for custom)', parseNumber)
-  .option('--provider <name>', 'Provider scope: all, claude, codex, cursor')
+  .option('--credits <n>', 'Monthly AI credits (copilot custom plans)', parseNumber)
+  .option('--provider <name>', `Provider scope: ${PLAN_PROVIDERS.join(', ')}`)
   .option('--reset-day <n>', 'Day of month plan resets (1-28)', parseInteger, 1)
-  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; provider?: string; resetDay?: number }) => {
+  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; credits?: number; provider?: string; resetDay?: number }) => {
     assertFormat(opts?.format ?? 'text', ['text', 'json'], 'plan')
     const mode = action ?? 'show'
     const providerOption = opts?.provider
     if (providerOption !== undefined && !isPlanProvider(providerOption)) {
-      console.error(`\n  --provider must be one of: all, claude, codex, cursor; got "${providerOption}".\n`)
+      console.error(`\n  --provider must be one of: ${PLAN_PROVIDERS.join(', ')}; got "${providerOption}".\n`)
       process.exitCode = 1
       return
     }
@@ -1618,7 +1863,7 @@ program
       console.log(`\n  Plans: ${plans.length}`)
       for (const plan of plans) {
         console.log(`  ${plan.provider}: ${planLabel(plan)} (${plan.id})`)
-        console.log(`    Budget: $${plan.monthlyUsd}/month`)
+        console.log(`    Budget: ${plan.provider === 'copilot' && plan.monthlyCredits != null ? `${plan.monthlyCredits} AI Credits` : `$${plan.monthlyUsd}/month`}`)
         console.log(`    Reset day: ${clampResetDay(plan.resetDay)}`)
         if (plan.setAt) console.log(`    Set at: ${plan.setAt}`)
       }
@@ -1666,18 +1911,56 @@ program
     }
 
     if (id === 'custom') {
-      if (opts?.monthlyUsd === undefined) {
+      const credits = opts?.credits
+      const monthlyUsdOpt = opts?.monthlyUsd
+      const provider = providerOption ?? 'all'
+
+      if (credits !== undefined && provider !== 'copilot') {
+        console.error('\n  --credits is only valid with --provider copilot.\n')
+        process.exitCode = 1
+        return
+      }
+
+      if (provider === 'copilot') {
+        if (monthlyUsdOpt !== undefined) {
+          console.error('\n  Copilot custom plans take --credits, not --monthly-usd (units mixed).\n')
+          process.exitCode = 1
+          return
+        }
+        if (credits === undefined) {
+          console.error('\n  Custom copilot plans require --credits <positive number>.\n')
+          process.exitCode = 1
+          return
+        }
+        if (!Number.isFinite(credits) || credits <= 0) {
+          console.error(`\n  --credits must be a positive finite number; got ${credits}.\n`)
+          process.exitCode = 1
+          return
+        }
+        await savePlan({
+          id: 'custom',
+          monthlyCredits: credits,
+          monthlyUsd: credits * 0.01,
+          provider: 'copilot',
+          resetDay,
+          setAt: new Date().toISOString(),
+        })
+        console.log(`\n  Plan set to custom (${credits} AI Credits, copilot, reset day ${resetDay}).`)
+        console.log(`  Config saved to ${getConfigFilePath()}\n`)
+        return
+      }
+
+      if (monthlyUsdOpt === undefined) {
         console.error('\n  Custom plans require --monthly-usd <positive number>.\n')
         process.exitCode = 1
         return
       }
-      const monthlyUsd = opts.monthlyUsd
+      const monthlyUsd = monthlyUsdOpt
       if (!Number.isFinite(monthlyUsd) || monthlyUsd <= 0) {
-        console.error(`\n  --monthly-usd must be a positive number; got ${opts.monthlyUsd}.\n`)
+        console.error(`\n  --monthly-usd must be a positive number; got ${monthlyUsdOpt}.\n`)
         process.exitCode = 1
         return
       }
-      const provider = providerOption ?? 'all'
       await savePlan({
         id: 'custom',
         monthlyUsd,
@@ -1723,7 +2006,7 @@ program
 program
   .command('optimize')
   .description('Find token waste and get exact fixes')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', '30days')
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
@@ -1733,6 +2016,7 @@ program
   .option('--yes', 'With --apply: apply every appliable fix without prompting')
   .option('--dry-run', 'With --apply: print the plan and exit without changing anything')
   .option('--only <ids>', 'With --apply: restrict to a comma-separated list of finding ids')
+  .option('--auto-revert', 'Undo applied fixes that measured no reduction (never CLAUDE.md rules)')
   .action(async (opts) => {
     assertProvider(opts.provider, 'optimize')
     const format = opts.json ? 'json' : opts.format
@@ -1758,28 +2042,35 @@ program
     const projects = await parseAllSessions(range, opts.provider)
     if (opts.apply) {
       const { runOptimizeApply } = await import('./act/optimize-apply.js')
-      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only })
+      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only, provider: opts.provider })
       return
     }
     assertFormat(format, ['text', 'json'], 'optimize')
-    if (format === 'text') {
-      // Surface realized savings from applied actions. Best effort: optimize
-      // must never fail because of journal contents, so any error just drops
-      // the header. computeActReport returns fast without scanning when the
-      // journal has no eligible applied actions, so users who never opted in
-      // see identical output.
-      let appliedHeader: string | undefined
-      let previouslyApplied: Record<string, string> | undefined
-      try {
-        const { computeActReport, buildOptimizeAppliedHeader } = await import('./act/report.js')
-        const applied = await computeActReport()
-        appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
-        previouslyApplied = applied.appliedByFinding
-      } catch { /* the header is optional; never block the findings */ }
-      await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied })
-    } else {
-      await runOptimize(projects, label, range, { format })
-    }
+    // Surface realized savings from applied actions, and re-measure every one
+    // of them. Best effort: optimize must never fail because of journal
+    // contents, so any error just drops the extras. computeActReport returns
+    // fast without scanning when the journal has no applied actions, so users
+    // who never opted in see identical output.
+    let appliedHeader: string | undefined
+    let previouslyApplied: Record<string, string> | undefined
+    let appliedFixes: AppliedFix[] | undefined
+    try {
+      const { computeActReport, buildOptimizeAppliedHeader, autoRevertNoEffect } = await import('./act/report.js')
+      const applied = await computeActReport()
+      appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
+      previouslyApplied = applied.appliedByFinding
+      appliedFixes = applied.appliedFixes
+      if (opts.autoRevert) {
+        const { lines, revertedIds } = await autoRevertNoEffect(appliedFixes)
+        appliedFixes = appliedFixes.filter(f => !revertedIds.has(f.id))
+        // JSON output must stay parseable, so the revert log goes to stderr there.
+        for (const line of lines) {
+          if (format === 'json') process.stderr.write(`  ${line}\n`)
+          else console.log(`  ${line}`)
+        }
+      }
+    } catch { /* the applied section is optional; never block the findings */ }
+    await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied, appliedFixes, provider: opts.provider })
   })
 
 program
@@ -1804,9 +2095,97 @@ program
   })
 
 program
+  .command('codex-tps [session]')
+  .description('Retrospective Codex generated-tokens/sec estimate from rollout checkpoints (not live decode speed)')
+  .option('--json', 'JSON output')
+  .option('--limit <n>', 'Number of recent checkpoints to scan', parseCodexTpsLimit, 10)
+  .option('--watch <seconds>', 'Refresh continuously while Codex writes checkpoints', parseCodexTpsWatch, 0)
+  .action(async (session: string | undefined, opts: { json?: boolean; limit: number; watch: number }) => {
+    const intervalMs = Math.max(0, opts.watch) * 1000
+    if (opts.json && intervalMs > 0) {
+      process.stderr.write('codeburn codex-tps: --json cannot be combined with --watch; use text watch output or one-shot JSON.\n')
+      process.exitCode = 2
+      return
+    }
+    const provider = await getProvider('codex')
+    if (!provider) {
+      process.stderr.write('codeburn codex-tps: Codex provider is unavailable.\n')
+      process.exitCode = 1
+      return
+    }
+    let cachedPath: string | undefined = session
+    let throughputReader: CodexThroughputReader | undefined
+    let lastFileState: { size: number; mtimeMs: number } | undefined
+    let lastDiscoveryMs = 0
+    let refreshInFlight = false
+    const render = async (): Promise<void> => {
+      if (refreshInFlight) return
+      refreshInFlight = true
+      try {
+        let filePath = session ?? cachedPath
+        // Keep an idle watcher on its chosen rollout. A full active+archive
+        // discovery can be hundreds of milliseconds on large histories, so
+        // only re-scan slowly to notice rotation; disappearance still triggers
+        // an immediate discovery on the next tick.
+        if (!session && (!filePath || Date.now() - lastDiscoveryMs >= 60_000)) {
+          lastDiscoveryMs = Date.now()
+          filePath = await newestCodexSession(await provider.discoverSessions())
+        }
+        if (!filePath) {
+          process.stderr.write('codeburn codex-tps: no Codex rollout sessions found.\n')
+          if (intervalMs === 0) process.exitCode = 1
+          return
+        }
+        const previousPath = cachedPath
+        cachedPath = filePath
+        if (previousPath !== filePath || !throughputReader) throughputReader = new CodexThroughputReader()
+        const fileInfo = await import('node:fs/promises').then(fs => fs.stat(filePath)).catch(() => null)
+        if (!fileInfo) {
+          process.stderr.write(`codeburn codex-tps: session file not found: ${filePath}\n`)
+          if (intervalMs === 0) process.exitCode = 1
+          if (!session) cachedPath = undefined
+          return
+        }
+        if (intervalMs > 0 && lastFileState && fileInfo.size === lastFileState.size && fileInfo.mtimeMs === lastFileState.mtimeMs) return
+        lastFileState = { size: fileInfo.size, mtimeMs: fileInfo.mtimeMs }
+        const points = await throughputReader!.update(filePath, opts.limit, intervalMs === 0)
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({ session: filePath, points, live: intervalMs > 0 }, null, 2) + '\n')
+        } else {
+          if (intervalMs > 0) process.stdout.write('\x1b[2J\x1b[H')
+          process.stdout.write(renderCodexThroughput(points, filePath) + (intervalMs > 0 ? '\nWatching for new Codex checkpoints... (Ctrl-C to stop)\n' : '\n'))
+        }
+      } finally {
+        refreshInFlight = false
+      }
+    }
+    try {
+      await render()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+      if (intervalMs === 0) {
+        process.exitCode = 1
+        return
+      }
+    }
+    if (intervalMs > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setInterval(() => {
+          void render().catch(error => {
+            const message = error instanceof Error ? error.message : String(error)
+            process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+          })
+        }, intervalMs)
+        process.once('SIGINT', () => { clearInterval(timer); resolve() })
+      })
+    }
+  })
+
+program
   .command('compare')
   .description('Compare two AI models side-by-side')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', 'all')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', 'all')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--model-a <model>', 'First model to compare')
@@ -1817,7 +2196,7 @@ program
     await loadPricing()
     const { range, label } = getDateRange(opts.period)
     if (opts.format === 'json') {
-      const { aggregateModelStats, buildCompareJson, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
+      const { aggregateModelStats, buildCompareJson, findModelStat, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
       const projects = await parseAllSessions(range, opts.provider)
       const models = aggregateModelStats(projects)
 
@@ -1840,8 +2219,8 @@ program
         process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
         process.exit(1)
       }
-      const modelA = models.find(model => model.model === opts.modelA)
-      const modelB = models.find(model => model.model === opts.modelB)
+      const modelA = findModelStat(models, opts.modelA)
+      const modelB = findModelStat(models, opts.modelB)
       if (!modelA) {
         process.stderr.write(`codeburn compare: model not found: "${opts.modelA}".\n`)
         process.exit(1)
@@ -1853,13 +2232,19 @@ program
       process.stdout.write(renderCompareJson(buildCompareJson(projects, modelA, modelB, label, opts.provider)) + '\n')
       return
     }
-    await renderCompare(range, opts.provider)
+    if (opts.modelA || opts.modelB) {
+      if (!opts.modelA || !opts.modelB) {
+        process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
+        process.exit(1)
+      }
+    }
+    await renderCompare(range, opts.provider, opts.modelA, opts.modelB)
   })
 
 program
   .command('audit')
   .description("Token audit: raw provider token fields vs codeburn's displayed totals and cost derivation")
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', '30days')
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
@@ -1899,7 +2284,7 @@ program
 program
   .command('models')
   .description('Per-model token + cost table, optionally exploded by task type or agent')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', '30days')
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
@@ -1908,6 +2293,7 @@ program
   .option('--by-agent', 'One row per (provider, model, agent) instead of one row per (provider, model). Claude subagent transcripts only; other providers and main sessions bucket under "main"')
   .option('--top <n>', 'Show only the top N rows', (v: string) => parseInt(v, 10))
   .option('--min-cost <usd>', 'Hide rows below this cost threshold', (v: string) => parseFloat(v))
+  .option('--unpriced', 'Show only models with usage that currently price at $0')
   .option('--no-totals', 'Suppress the footer totals row')
   .option('--format <format>', 'Output format: table, markdown, json, csv', 'table')
   .action(async (opts) => {
@@ -1932,27 +2318,60 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
-    const rows = await aggregateModels(projects, {
+    const topN = typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined
+    let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : 0.01,
+      // `aggregateModels` filters and slices before the unpriced filter. Its
+      // rows are sorted cost-first, so a small --top would remove exactly the
+      // rows `--unpriced` exists to show. Take the whole set here and slice
+      // after filtering and ranking instead.
+      topN: opts.unpriced ? undefined : topN,
+      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
+    if (opts.unpriced) {
+      const unpriced = findUnpricedModels(rows.map(row => ({
+        model: row.model,
+        calls: row.calls,
+        cost: row.costUSD,
+        tokens: row.totalTokens,
+      })))
+      const unpricedRank = new Map<string, number>()
+      for (const [rank, usage] of unpriced.entries()) {
+        // Breakdown modes can emit several rows for one model. Keep the first
+        // rank so all rows for that model stay together and N still counts rows.
+        if (!unpricedRank.has(usage.model)) unpricedRank.set(usage.model, rank)
+      }
+      rows = rows
+        .filter(row => unpricedRank.has(row.model))
+        .sort((a, b) => (unpricedRank.get(a.model)! - unpricedRank.get(b.model)!))
+      if (topN !== undefined) rows = rows.slice(0, topN)
+    }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
     if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {
-      process.stdout.write('No model usage found for the selected period.\n')
+      process.stdout.write(opts.unpriced
+        ? 'No unpriced models found for the selected period.\n'
+        : 'No model usage found for the selected period.\n')
       return
     }
+    // The friendly name is useless for `model-alias`, which keys on the raw ID.
+    // Sanitized because this bypasses the shared display path in models-report.
+    const renderRows = opts.unpriced && fmt !== 'json'
+      ? rows.map(row => ({ ...row, modelDisplayName: sanitizeModelForDisplay(row.model) }))
+      : rows
     if (fmt === 'json') {
       process.stdout.write(renderJson(rows) + '\n')
     } else if (fmt === 'csv') {
-      process.stdout.write(renderCsv(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
+      process.stdout.write(renderCsv(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
     } else if (fmt === 'markdown' || fmt === 'md') {
-      process.stdout.write(renderMarkdown(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderMarkdown(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
     } else if (fmt === 'table') {
-      process.stdout.write(renderTable(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderTable(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      // Never advise aliasing unconditionally: a subscription or flat-rate model
+      // is correctly $0, and mapping it onto another model's rate invents spend.
+      if (opts.unpriced) process.stdout.write(unpricedModelHint() + '\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)
@@ -1962,15 +2381,20 @@ program
 program
   .command('sessions')
   .description('Full per-session usage report')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', '30days')
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
   .option('--format <format>', 'Output format: table, json', 'table')
+  .option('--by-pr', 'Group spend by the pull requests each session referenced')
+  .option('--by-work-unit', 'Group sessions into provider-recorded work units: one row per orchestration root with its delegated children folded beneath')
+  .option('--no-pager', 'Print the complete table directly instead of opening the interactive browser')
   .action(async (opts) => {
     assertProvider(opts.provider, 'sessions')
     assertFormat(opts.format, ['table', 'json'], 'sessions')
-    const { aggregateSessions, renderJson, renderTable } = await import('./sessions-report.js')
+    const { aggregateSessions, buildPrAttribution, renderJson, renderTable, renderWorkUnitJson, renderWorkUnitTable } = await import('./sessions-report.js')
+    const wantsInteractive = opts.format === 'table' && !opts.byPr && !opts.byWorkUnit && opts.pager !== false && process.stdin.isTTY === true && process.stdout.isTTY === true
+    if (wantsInteractive) setInteractiveScanUI()
     await loadPricing()
 
     let range
@@ -1985,15 +2409,88 @@ program
       range = getDateRange(opts.period).range
     }
 
-    const rows = aggregateSessions(await parseAllSessions(range, opts.provider))
-    const output = opts.format === 'json' ? renderJson(rows) : renderTable(rows)
-    process.stdout.write(output + '\n')
+    const projects = await parseAllSessions(range, opts.provider)
+    if (opts.byPr) {
+      const { rows: prRows, totals } = buildPrAttribution(projects)
+      if (opts.format === 'json') {
+        process.stdout.write(JSON.stringify({ prs: prRows, distinct: totals }, null, 2) + '\n')
+        return
+      }
+      if (prRows.length === 0) {
+        process.stdout.write('No sessions with captured PR links in this period. Links are captured as sessions are parsed; older transcripts gain them on their next re-parse.\n')
+        return
+      }
+      const { unattributedCost, sessions, subagentSessions } = totals
+      const { renderTable: renderTextTable } = await import('./text-table.js')
+      const modelsCell = (models: string[]): string =>
+        models.length === 0 ? '' : models.slice(0, 2).join(', ') + (models.length > 2 ? ` +${models.length - 2}` : '')
+      const table = renderTextTable(
+        [
+          { header: 'PR' },
+          { header: 'Cost', right: true },
+          { header: 'Saved', right: true },
+          { header: 'Sessions', right: true },
+          { header: 'Calls', right: true },
+          { header: 'Models' },
+          { header: 'First' },
+          { header: 'Last' },
+        ],
+        prRows.map(r => [
+          r.label,
+          `${r.approx ? '~' : ''}$${r.cost.toFixed(2)}`,
+          `$${r.savingsUSD.toFixed(2)}`,
+          String(r.sessions),
+          String(r.calls),
+          modelsCell(r.models),
+          r.firstStarted.slice(0, 10),
+          r.lastEnded.slice(0, 10),
+        ]),
+      )
+      // Footer reconciles to the ROUNDED row values actually printed (not the
+      // exact float sum), so the visible column adds up to the stated total.
+      const shownAttributed = prRows.reduce((sum, r) => sum + Number(r.cost.toFixed(2)), 0)
+      const approxNote = prRows.some(r => r.approx)
+        ? ' ~ marks rows estimated from a whole-session even split (transcript expired before per-turn capture).'
+        : ''
+      const subagentNote = subagentSessions > 0
+        ? ` + ${subagentSessions} folded-in subagent run${subagentSessions === 1 ? '' : 's'}`
+        : ''
+      process.stdout.write(table + `\nRows sum to $${shownAttributed.toFixed(2)} attributed across ${sessions} PR-linked session${sessions === 1 ? '' : 's'}${subagentNote}. $${unattributedCost.toFixed(2)} of that spend was not tied to a specific PR.${approxNote}\n`)
+      return
+    }
+    const rows = aggregateSessions(projects)
+    if (opts.byWorkUnit) {
+      const { resolveWorkUnits } = await import('./work-units.js')
+      const { inferSessionProvider } = await import('./session-output.js')
+      const resolution = resolveWorkUnits(projects.flatMap(project => project.sessions.map(session => ({
+        sessionId: session.sessionId,
+        provider: inferSessionProvider(session),
+        lineage: session.lineage,
+      }))))
+      if (opts.format === 'json') {
+        process.stdout.write(renderWorkUnitJson(rows, resolution) + '\n')
+        return
+      }
+      process.stdout.write(renderWorkUnitTable(rows, resolution) + '\n')
+      return
+    }
+    if (opts.format === 'json') {
+      process.stdout.write(renderJson(rows) + '\n')
+      return
+    }
+
+    if (wantsInteractive) {
+      const { runSessionsTui } = await import('./sessions-tui.js')
+      await runSessionsTui(rows, { period: opts.from || opts.to ? formatDateRangeLabel(opts.from, opts.to) : opts.period, provider: opts.provider })
+      return
+    }
+    process.stdout.write(renderTable(rows) + '\n')
   })
 
 program
   .command('yield')
   .description('Track which AI spend shipped to main vs reverted/abandoned (experimental)')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', 'week')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', 'week')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
   .option('--format <format>', 'Output format: text, json', 'text')
   .action(async (opts) => {
@@ -2016,7 +2513,7 @@ program
 program
   .command('spend')
   .description('Emit model x project spend flow data')
-  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all', '30days')
+  .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', '30days')
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
@@ -2115,5 +2612,35 @@ program
 registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
+registerPluginCommands(program)
 
-program.parse()
+program
+  .command('serve')
+  .description('Run a resident query server over stdio (used by the desktop app to avoid per-fetch CLI startup cost)')
+  .option('--stdio', 'Serve JSON requests over stdin/stdout (the only mode)')
+  .action(() => {
+    // Never reached: the serve entry is dispatched before commander parses,
+    // because serving needs the buildProgram factory itself. Registered so
+    // `codeburn serve` appears in help and never falls through to `report`.
+  })
+
+return program
+}
+
+if (process.argv[2] === 'serve') {
+  const { runStdioServe } = await import('./serve.js')
+  // Bind the REAL exit before serving. runCaptured() replaces process.exit with
+  // a throw for the duration of a request, and a request still in flight when
+  // the drain bound expires never restores it - so the exit below would throw
+  // instead of exiting, which is exactly the orphan this line prevents.
+  const hardExit = process.exit.bind(process)
+  await runStdioServe(buildProgram)
+  // stdin closed, so the owning app is gone. Exit outright: any handle that
+  // outlives the transport (a watcher, a pending timer) would otherwise leave
+  // this child running as an orphan for as long as the machine is up.
+  hardExit(0)
+} else {
+  const program = buildProgram()
+  await registerLoadedPluginCommands(program)
+  program.parse()
+}

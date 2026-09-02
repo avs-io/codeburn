@@ -1,24 +1,29 @@
 import { claude } from './claude.js'
 import { cline } from './cline.js'
+import { clineCli } from './cline-cli.js'
 import { codewhale } from './codewhale.js'
 import { codebuff } from './codebuff.js'
 import { codex } from './codex.js'
 import { copilot } from './copilot.js'
 import { droid } from './droid.js'
 import { devin } from './devin.js'
+import { dsh } from './dsh.js'
 import { gemini } from './gemini.js'
 import { hermes } from './hermes.js'
 import { ibmBob } from './ibm-bob.js'
 import { kiloCode } from './kilo-code.js'
 import { kiro } from './kiro.js'
 import { kimi } from './kimi.js'
+import { kimicode } from './kimicode.js'
 import { lingtaiTui } from './lingtai-tui.js'
 import { mistralVibe } from './mistral-vibe.js'
 import { mux } from './mux.js'
 import { openclaw } from './openclaw.js'
+import { openclaude } from './openclaude.js'
 import { openDesign } from './open-design.js'
 import { pi, omp } from './pi.js'
 import { qwen } from './qwen.js'
+import { quickdesk } from './quickdesk.js'
 import { rooCode } from './roo-code.js'
 import { zerostack } from './zerostack.js'
 import { grok } from './grok.js'
@@ -188,11 +193,34 @@ async function loadZed(): Promise<Provider | null> {
   }
 }
 
-const coreProviders: Provider[] = [claude, cline, codewhale, codebuff, codex, copilot, devin, droid, gemini, hermes, ibmBob, kiloCode, kiro, kimi, lingtaiTui, mistralVibe, mux, openclaw, openDesign, pi, omp, qwen, rooCode, zerostack, grok]
+const coreProviders: Provider[] = [claude, cline, clineCli, codewhale, codebuff, codex, copilot, devin, droid, dsh, gemini, hermes, ibmBob, kiloCode, kiro, kimi, kimicode, lingtaiTui, mistralVibe, mux, openclaw, openclaude, openDesign, pi, omp, qwen, quickdesk, rooCode, zerostack, grok]
 
 // Lazily loaded providers, listed by name so --provider validation works even
 // when an optional module fails to load. Must stay in sync with getAllProviders.
 const lazyProviderNames = ['antigravity', 'forge', 'goose', 'cursor', 'opencode', 'cursor-agent', 'crush', 'warp', 'vercel-gateway', 'zcode', 'zed']
+
+// Display names for lazy providers. Must match the `displayName` on the
+// loaded Provider object; `providerDisplayName` + getAllProviders() test
+// is the drift check.
+const lazyProviderDisplayNames: Record<string, string> = {
+  antigravity: 'Antigravity',
+  forge: 'Forge',
+  goose: 'Goose',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+  'cursor-agent': 'Cursor Agent',
+  crush: 'Crush',
+  warp: 'Warp',
+  'vercel-gateway': 'Vercel AI Gateway',
+  zcode: 'ZCode',
+  zed: 'Zed',
+}
+
+export function providerDisplayName(name: string): string {
+  const core = coreProviders.find(p => p.name === name)
+  if (core) return core.displayName
+  return lazyProviderDisplayNames[name] ?? name
+}
 
 // Canonical set of every provider name (core + lazy), used to validate the
 // --provider CLI flag. Computed lazily so importing this module never depends on
@@ -258,12 +286,11 @@ export async function discoverAllSessions(
   const filtered = providerFilter && providerFilter !== 'all'
     ? allProviders.filter(p => p.name === providerFilter)
     : allProviders
-  const all: SessionSource[] = []
-  for (const provider of filtered) {
-    const sessions = await safeDiscoverSessions(provider)
-    all.push(...sessions)
-  }
-  return all
+  // Each provider's discovery is its own serial directory walk; run them
+  // concurrently and concatenate in registry order so the result stays
+  // byte-identical to the sequential version.
+  const perProvider = await Promise.all(filtered.map(provider => safeDiscoverSessions(provider)))
+  return perProvider.flat()
 }
 
 export async function getProvider(name: string): Promise<Provider | undefined> {

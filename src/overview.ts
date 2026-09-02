@@ -4,9 +4,11 @@ import { homedir } from 'os'
 
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
-import { findUnpricedModels, getShortModelName } from './models.js'
+import { findUnpricedModels, getShortModelName, unpricedModelHint } from './models.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
 import { markEstimated } from './format.js'
 import { dateKey } from './day-aggregator.js'
+import type { DailyEntry } from './daily-cache.js'
 import type { BudgetStatus, BudgetTier } from './budget.js'
 
 // Display-only helpers. The shared formatters omit thousands separators and
@@ -83,18 +85,37 @@ function renderTable(c: ChalkInstance, cols: Col[], rows: string[][]): string {
   ].join('\n')
 }
 
+/// The durable slice renderOverview needs: headline totals + the day set behind
+/// them + how much of the total came from carried (expired-source) days.
+export type OverviewDurable = {
+  cost: number
+  savingsUSD: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  days: DailyEntry[]
+  carriedCostUSD: number
+  /// Cost a --project/--exclude filter could not attribute (cached days with no
+  /// per-project split). Optional so callers that never filter can omit it.
+  unattributedCostUSD?: number
+}
+
 export function renderOverview(
   projects: ProjectSummary[],
-  opts: { label: string; color: boolean; budget?: OverviewBudget },
+  opts: { label: string; color: boolean; budget?: OverviewBudget; durable?: OverviewDurable },
 ): string {
   const c = new Chalk(opts.color ? {} : { level: 0 })
   const heading = (text: string): string => c.cyan.bold(text)
   const out: string[] = []
+  const durable = opts.durable
 
   out.push(c.bold('CodeBurn') + c.dim('  ' + opts.label))
   out.push('')
 
-  if (projects.length === 0) {
+  if (projects.length === 0 && !(durable && durable.cost > 0)) {
     out.push(c.dim(`No usage found for ${opts.label}.`))
     return out.join('\n') + '\n'
   }
@@ -120,7 +141,7 @@ export function renderOverview(
     byProject.set(pname, pe)
     for (const s of p.sessions) {
       inTok += s.totalInputTokens
-      outTok += s.totalOutputTokens
+      outTok += sessionBillableOutputTokens(s)
       cacheR += s.totalCacheReadTokens
       cacheW += s.totalCacheWriteTokens
       for (const [m, d] of Object.entries(s.modelBreakdown)) {
@@ -128,7 +149,14 @@ export function renderOverview(
         e.cost += d.costUSD
         e.calls += d.calls
         e.estimatedCost += d.estimatedCostUSD ?? 0
-        e.tokens += d.tokens.inputTokens + d.tokens.outputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        e.tokens += d.tokens.inputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        byModel.set(m, e)
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [m, output] of Object.entries(sessionModelBillableOutputTokens(s))) {
+        const e = byModel.get(m) ?? { cost: 0, calls: 0, tokens: 0, estimatedCost: 0 }
+        e.tokens += output
         byModel.set(m, e)
       }
       for (const [cat, d] of Object.entries(s.categoryBreakdown)) {
@@ -143,7 +171,9 @@ export function renderOverview(
       for (const t of s.turns) {
         const day = dateKey(t.timestamp || t.assistantCalls[0]?.timestamp || '')
         for (const call of t.assistantCalls) {
-          const tk = call.usage.inputTokens + call.usage.outputTokens + call.usage.cacheReadInputTokens + call.usage.cacheCreationInputTokens
+          const usage = call.usage
+          const billableOut = callBillableOutputTokens(call)
+          const tk = (usage?.inputTokens ?? 0) + billableOut + (usage?.cacheReadInputTokens ?? 0) + (usage?.cacheCreationInputTokens ?? 0)
           const pv = byProvider.get(call.provider) ?? { cost: 0, tokens: 0 }
           pv.cost += call.costUSD
           pv.tokens += tk
@@ -157,6 +187,29 @@ export function renderOverview(
           }
         }
       }
+    }
+  }
+
+  // Headline totals and the day-resolved views (Daily, Highest-value days) come
+  // from the durable daily cache so they match the menubar exactly, carried
+  // (expired-source) days included. The per-tool / per-model / per-project
+  // breakdowns above stay live: they need surviving session detail.
+  if (durable) {
+    cost = durable.cost
+    savings = durable.savingsUSD
+    calls = durable.calls
+    sessions = durable.sessions
+    inTok = durable.inputTokens
+    outTok = durable.outputTokens
+    cacheR = durable.cacheReadTokens
+    cacheW = durable.cacheWriteTokens
+    byDay.clear()
+    for (const d of durable.days) {
+      byDay.set(d.date, {
+        cost: d.cost,
+        tokens: d.inputTokens + d.outputTokens + d.cacheReadTokens + d.cacheWriteTokens,
+        providers: new Set(Object.keys(d.providers)),
+      })
     }
   }
 
@@ -181,7 +234,7 @@ export function renderOverview(
       .join(', ')
     const more = unpriced.length > 3 ? ` +${unpriced.length - 3} more` : ''
     out.push(kv('Unpriced', c.yellow(`${unpriced.length} model${unpriced.length === 1 ? '' : 's'} at $0: `) + shown + more))
-    out.push(kv('', c.dim('Fix: codeburn model-alias "<model>" <known-model>')))
+    out.push(kv('', c.dim(unpricedModelHint())))
   }
   if (opts.budget) {
     const label = opts.budget.tier === 'daily'
@@ -302,6 +355,20 @@ export function renderOverview(
   const topModel = modelRows[0] ? getShortModelName(modelRows[0][0]) : ''
   const mostly = topTool ? `, mostly ${topTool}${topModel ? ` / ${topModel}` : ''}` : ''
   out.push(c.dim('Bottom line: ') + `${opts.label} totals ${formatCost(cost)} across ${formatTokens(totalTokens)} tokens${mostly}.`)
+
+  // When some of the period's total came from days whose session logs have since
+  // expired, say so once. The figure is real (preserved in the durable daily
+  // cache); it just can't be re-derived from surviving files anymore.
+  if (durable && durable.carriedCostUSD > 0) {
+    out.push(c.dim(`  includes ${formatCost(durable.carriedCostUSD)} preserved from expired session logs`))
+  }
+
+  // A project filter cannot claim days the cache holds without a project split
+  // (recorded before that split existed), so they sit outside this total. Say how
+  // much rather than let the filtered figure look inexplicably short.
+  if (durable && (durable.unattributedCostUSD ?? 0) > 0) {
+    out.push(c.dim(`  excludes ${formatCost(durable.unattributedCostUSD!)} from days with no per-project history`))
+  }
 
   return out.join('\n') + '\n'
 }

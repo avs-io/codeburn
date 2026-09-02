@@ -72,6 +72,8 @@ enum UsageDataChangeGuard {
         add(expand(environment["CODEWHALE_HOME"] ?? path(homeDirectory, ".codewhale"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".deepseek", "sessions"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".cline", "data"), scanFirstLevelDirectories: false)
+        let dshHome = expand(environment["DSH_HOME"] ?? path(homeDirectory, ".dsh"), homeDirectory: homeDirectory)
+        add(path(dshHome, "sessions"))
         add(expand(environment["CODEBUFF_DATA_DIR"] ?? path(xdgConfig, "manicode"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
         let factoryHome = expand(environment["FACTORY_DIR"] ?? path(homeDirectory, ".factory"), homeDirectory: homeDirectory)
         add(path(factoryHome, "sessions"), scanFirstLevelDirectories: false)
@@ -99,6 +101,8 @@ enum UsageDataChangeGuard {
         for name in [".openclaw", ".clawdbot", ".moltbot", ".moldbot"] {
             add(path(homeDirectory, name, "agents"), scanFirstLevelDirectories: false)
         }
+        let openClaudeRoot = expand(environment["CODEBURN_OPENCLAUDE_DIR"] ?? path(homeDirectory, ".openclaude"), homeDirectory: homeDirectory)
+        add(path(openClaudeRoot, "projects"), scanFirstLevelDirectories: true)
         add(path(applicationSupport, "Open Design"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".pi", "agent", "sessions"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".omp", "agent", "sessions"), scanFirstLevelDirectories: false)

@@ -12,23 +12,28 @@ For the architectural picture, see `../architecture.md`.
 |---|---|---|---|
 | [Claude](claude.md) | JSONL (no parser) | `src/providers/claude.ts` | none (covered indirectly) |
 | [Cline](cline.md) | JSON | `src/providers/cline.ts` | `tests/providers/cline.test.ts` |
+| [Cline CLI](cline-cli.md) | JSON | `src/providers/cline-cli.ts` | `tests/providers/cline-cli.test.ts` |
 | [CodeWhale](codewhale.md) | JSON | `src/providers/codewhale.ts` | `tests/providers/codewhale.test.ts` |
 | [Codex](codex.md) | JSONL | `src/providers/codex.ts` | `tests/providers/codex.test.ts` |
 | [Copilot](copilot.md) | JSONL + SQLite (OTel) + Nitrite .db (JetBrains) | `src/providers/copilot.ts` | `tests/providers/copilot.test.ts` |
 | [Devin](devin.md) | JSON + SQLite enrichment | `src/providers/devin.ts` | `tests/providers/devin.test.ts` |
 | [Droid](droid.md) | JSONL | `src/providers/droid.ts` | `tests/providers/droid.test.ts` |
+| [DeepSeek Harness](dsh.md) | JSONL (zstd frames) | `src/providers/dsh.ts` | `tests/providers/dsh.test.ts` |
 | [Gemini](gemini.md) | JSON / JSONL | `src/providers/gemini.ts` | none |
 | [Hermes Agent](hermes.md) | SQLite | `src/providers/hermes.ts` | `tests/providers/hermes.test.ts` |
 | [IBM Bob](ibm-bob.md) | JSON | `src/providers/ibm-bob.ts` | `tests/providers/ibm-bob.test.ts` |
 | [KiloCode](kilo-code.md) | JSON | `src/providers/kilo-code.ts` | `tests/providers/kilo-code.test.ts` |
 | [Kiro](kiro.md) | JSON | `src/providers/kiro.ts` | `tests/providers/kiro.test.ts` |
 | [Kimi](kimi.md) | JSONL | `src/providers/kimi.ts` | `tests/providers/kimi.test.ts` |
+| [Kimi Code](kimicode.md) | JSONL | `src/providers/kimicode.ts` | `tests/providers/kimicode.test.ts` |
 | [LingTai TUI](lingtai-tui.md) | JSONL | `src/providers/lingtai-tui.ts` | `tests/providers/lingtai-tui.test.ts` |
 | [Mistral Vibe](mistral-vibe.md) | JSON / JSONL | `src/providers/mistral-vibe.ts` | `tests/providers/mistral-vibe.test.ts` |
 | [OpenClaw](openclaw.md) | JSONL | `src/providers/openclaw.ts` | `tests/providers/openclaw.test.ts` |
+| [OpenClaude](openclaude.md) | JSONL | `src/providers/openclaude.ts` | `tests/providers/openclaude.test.ts` |
 | [Pi](pi.md) | JSONL | `src/providers/pi.ts` | `tests/providers/pi.test.ts` |
 | [OMP](omp.md) | JSONL | `src/providers/pi.ts` | `tests/providers/omp.test.ts` |
 | [Qwen](qwen.md) | JSONL | `src/providers/qwen.ts` | none |
+| [Quick Desktop](quickdesk.md) | EMF JSONL + SQLite | `src/providers/quickdesk.ts` | `tests/providers/quickdesk.test.ts` |
 | [Roo Code](roo-code.md) | JSON | `src/providers/roo-code.ts` | `tests/providers/roo-code.test.ts` |
 | [Zerostack](zerostack.md) | JSON | `src/providers/zerostack.ts` | `tests/providers/zerostack.test.ts` |
 | [Grok Build](grok.md) | JSON/JSONL | `src/providers/grok.ts` | `tests/providers/grok.test.ts` |

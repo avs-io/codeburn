@@ -1,4 +1,7 @@
 // @vitest-environment node
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
 
 // Stub electron so importing main.ts does not require an Electron runtime.
@@ -11,8 +14,9 @@ vi.mock('electron', () => ({
   shell: { openExternal: vi.fn() },
 }))
 
-import { createApplicationMenuTemplate, createBridgeHandlers } from './main'
+import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers } from './main'
 import { CliError } from './cli'
+import { Telemetry } from './telemetry'
 
 function fakeSpawn(result: unknown = { current: { cost: 12.34 } }) {
   const calls: string[][] = []
@@ -31,6 +35,7 @@ function fakeSpawn(result: unknown = { current: { cost: 12.34 } }) {
 // must spawn. cliStatus is the one channel that resolves without spawning.
 const CHANNELS = [
   'codeburn:getOverview',
+  'codeburn:getTimeline',
   'codeburn:getQuota',
   'codeburn:getPlans',
   'codeburn:getActReport',
@@ -65,6 +70,14 @@ const CHANNELS = [
   'codeburn:telemetryOnboarded',
   'codeburn:telemetryTrack',
   'codeburn:getUpdateStatus',
+  'codeburn:pluginList',
+  'codeburn:pluginInfo',
+  'codeburn:pluginAdd',
+  'codeburn:pluginRemove',
+  'codeburn:pluginVerify',
+  'codeburn:syncAutoStatus',
+  'codeburn:syncAutoEnable',
+  'codeburn:syncAutoDisable',
 ] as const
 
 const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = [
@@ -85,6 +98,12 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getOverview', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, 'claude-config:91dda17e8cf35193'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--claude-config-source', 'claude-config:91dda17e8cf35193'] },
   { channel: 'codeburn:getOverview', args: ['month', 'claude', { from: '2026-07-01', to: '2026-07-11' }, 'claude-desktop:980e1e488a654830'], argv: ['status', '--format', 'menubar-json', '--period', 'month', '--no-timeline', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11', '--claude-config-source', 'claude-desktop:980e1e488a654830'] },
+  // Combined scope emits --scope combined; an explicit local scope is identical
+  // to the default (no flag). The CLI rejects --scope with --provider, so a
+  // provider passed alongside combined is dropped (the renderer forces 'all').
+  { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'local'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--provider', 'claude'] },
   { channel: 'codeburn:getModels', args: ['week', 'claude', true, { from: '2026-07-01', to: '2026-07-11' }], argv: ['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getYield', args: ['today', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['yield', '--format', 'json', '--period', 'today', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
@@ -109,6 +128,20 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:setPlan', args: ['claude-max', 'claude'], argv: ['plan', 'set', 'claude-max', '--provider', 'claude'] },
   { channel: 'codeburn:resetPlan', args: ['cursor'], argv: ['plan', 'reset', '--provider', 'cursor'] },
   { channel: 'codeburn:exportData', args: ['json', 'all', '/tmp/codeburn-export'], argv: ['export', '-f', 'json', '-o', '/tmp/codeburn-export', '--provider', 'all'] },
+  // Plugin management
+  { channel: 'codeburn:pluginList', args: [], argv: ['plugin', 'list', '--json'] },
+  { channel: 'codeburn:pluginInfo', args: ['test-plugin'], argv: ['plugin', 'info', 'test-plugin', '--json'] },
+  { channel: 'codeburn:pluginAdd', args: ['/path/to/plugin'], argv: ['plugin', 'add', '/path/to/plugin'] },
+  { channel: 'codeburn:pluginAdd', args: ['teams'], argv: ['plugin', 'add', 'teams'] },
+  { channel: 'codeburn:pluginRemove', args: ['test-plugin'], argv: ['plugin', 'remove', 'test-plugin', '--confirm'] },
+  { channel: 'codeburn:pluginVerify', args: ['test-plugin'], argv: ['plugin', 'verify', 'test-plugin'] },
+  // Sync auto
+  { channel: 'codeburn:syncAutoStatus', args: [], argv: ['sync', 'auto', 'status', '--json'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, false], argv: ['sync', 'auto', 'enable', '--cadence', 'daily'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, false], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, true], argv: ['sync', 'auto', 'enable', '--cadence', 'daily', '--accept'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, true], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution', '--accept'] },
+  { channel: 'codeburn:syncAutoDisable', args: [], argv: ['sync', 'auto', 'disable'] },
 ]
 
 function flattenMenuItems(items: any[]): any[] {
@@ -208,6 +241,7 @@ describe('createBridgeHandlers (IPC input validation)', () => {
     { name: 'remove price override model that looks like a flag', channel: 'codeburn:removePriceOverride', args: ['--all'] },
     { name: 'claude config source that looks like a flag', channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, '-rf'] },
     { name: 'claude config source with shell metacharacters', channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, 'id; rm -rf'] },
+    { name: 'unknown scope', channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, undefined, undefined, 'everything'] },
   ]
 
   it.each(REJECTIONS)('rejects $name with a bad-args envelope and never spawns', async ({ channel, args }) => {
@@ -274,6 +308,155 @@ describe('createApplicationMenuTemplate', () => {
   })
 })
 
+describe('createBeforeQuitHandler', () => {
+  it('flushes app_close to a fast endpoint before allowing quit', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'cb-main-quit-'))
+    try {
+      const posts: Array<{ events: Array<{ name: string }> }> = []
+      const fetchFn = vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+        posts.push(JSON.parse(String(init?.body)) as { events: Array<{ name: string }> })
+        return { ok: true } as Response
+      }) as unknown as typeof fetch
+      const telemetry = new Telemetry({ stateDir, country: 'US', isPackaged: true, appVersion: '1', fetchFn })
+      telemetry.completeOnboarding(true)
+      await telemetry.flush() // isolate the final beat from the onboarding app_open
+      posts.length = 0
+
+      const quit = vi.fn()
+      const killChildren = vi.fn()
+      const handler = createBeforeQuitHandler({ getTelemetry: () => telemetry, killAll: killChildren, quit })
+      const firstEvent = { preventDefault: vi.fn() }
+      handler(firstEvent)
+
+      expect(firstEvent.preventDefault).toHaveBeenCalledOnce()
+      await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+      expect(killChildren).toHaveBeenCalledOnce()
+      expect(posts).toHaveLength(1)
+      expect(posts[0]!.events.map(event => event.name)).toContain('app_close')
+
+      const finalEvent = { preventDefault: vi.fn() }
+      handler(finalEvent)
+      expect(finalEvent.preventDefault).not.toHaveBeenCalled()
+      expect(quit).toHaveBeenCalledOnce()
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('allows quit at 1500ms when the endpoint never resolves and does not re-enter', async () => {
+    vi.useFakeTimers()
+    try {
+      const trackClose = vi.fn()
+      const flush = vi.fn(() => new Promise<boolean>(() => {}))
+      const quit = vi.fn()
+      const handler = createBeforeQuitHandler({
+        getTelemetry: () => ({ trackClose, flush }),
+        killAll: vi.fn(),
+        quit,
+      })
+
+      const firstEvent = { preventDefault: vi.fn() }
+      handler(firstEvent)
+      const repeatedEvent = { preventDefault: vi.fn() }
+      handler(repeatedEvent)
+
+      expect(firstEvent.preventDefault).toHaveBeenCalledOnce()
+      expect(repeatedEvent.preventDefault).toHaveBeenCalledOnce()
+      expect(trackClose).toHaveBeenCalledOnce()
+      expect(flush).toHaveBeenCalledOnce()
+
+      await vi.advanceTimersByTimeAsync(1499)
+      expect(quit).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(quit).toHaveBeenCalledOnce()
+
+      const finalEvent = { preventDefault: vi.fn() }
+      handler(finalEvent)
+      expect(finalEvent.preventDefault).not.toHaveBeenCalled()
+      expect(quit).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for asynchronous child cleanup before the final exit', async () => {
+    let releaseCleanup: (() => void) | undefined
+    const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve })
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => null,
+      killAll: () => cleanup,
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+    await Promise.resolve()
+    expect(quit).not.toHaveBeenCalled()
+
+    releaseCleanup?.()
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+  })
+
+  it('still flushes and quits when trackClose throws synchronously', async () => {
+    const trackClose = vi.fn(() => { throw new Error('track close failed') })
+    const flush = vi.fn(async () => true)
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => ({ trackClose, flush }),
+      killAll: vi.fn(),
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+    expect(trackClose).toHaveBeenCalledOnce()
+    expect(flush).toHaveBeenCalledOnce()
+  })
+
+  it('still quits when synchronous child cleanup throws', async () => {
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => null,
+      killAll: () => { throw new Error('child cleanup failed') },
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+  })
+
+  it('still quits when synchronous telemetry lookup throws', async () => {
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => { throw new Error('telemetry lookup failed') },
+      killAll: vi.fn(),
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+  })
+
+  it('does not wait for the timeout when telemetry cannot send yet', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'cb-main-no-consent-'))
+    try {
+      const fetchFn = vi.fn() as unknown as typeof fetch
+      const telemetry = new Telemetry({ stateDir, country: 'US', isPackaged: true, appVersion: '1', fetchFn })
+      const quit = vi.fn()
+      const handler = createBeforeQuitHandler({ getTelemetry: () => telemetry, killAll: vi.fn(), quit })
+
+      handler({ preventDefault: vi.fn() })
+      await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+      expect(fetchFn).not.toHaveBeenCalled()
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('createBridgeHandlers (cold-start warmup)', () => {
   const base = (extra: object) => ({ spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => '/bin/codeburn', getQuota: vi.fn(async () => []), ...extra })
 
@@ -294,6 +477,44 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
     expect(opts[1]?.extraEnv).toBeUndefined()
   })
 
+  it('drops a warmed overview to background priority only when the prefetch flag is set', async () => {
+    const opts: Array<Record<string, unknown> | undefined> = []
+    const spawnCli = vi.fn(async (_args: string[], o?: Record<string, unknown>) => { opts.push(o); return { current: { cost: 1 } } })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    await handlers['codeburn:getOverview']!('30days', 'all') // cold warmup → interactive
+    await handlers['codeburn:getOverview']!('30days', 'claude') // warmed, no flag → interactive
+    await handlers['codeburn:getOverview']!('30days', 'grok', undefined, null, true) // prefetch → background
+
+    expect(opts[0]?.priority).toBeUndefined()
+    expect(opts[1]?.priority).toBeUndefined()
+    expect(opts[2]?.priority).toBe('background')
+  })
+
+  it('classifies every first-click report warm as background without leaking the scheduler flag into argv', async () => {
+    const calls: Array<{ args: string[]; opts?: Record<string, unknown> }> = []
+    const spawnCli = vi.fn(async (args: string[], opts?: Record<string, unknown>) => {
+      calls.push({ args, opts })
+      return []
+    })
+    const handlers = createBridgeHandlers(base({ spawnCli }))
+    const cases: Array<[string, unknown[]]> = [
+      ['codeburn:getPlans', ['today', true]],
+      ['codeburn:getModels', ['today', 'all', false, undefined, true]],
+      ['codeburn:getSessions', ['today', 'all', undefined, true]],
+      ['codeburn:getCompareModels', ['today', 'all', true]],
+      ['codeburn:getYield', ['today', 'all', undefined, true]],
+      ['codeburn:getSpendFlow', ['today', 'all', undefined, true]],
+      ['codeburn:getOptimizeReport', ['today', 'all', undefined, true]],
+    ]
+
+    for (const [channel, args] of cases) await handlers[channel]!(...args)
+
+    expect(calls).toHaveLength(cases.length)
+    expect(calls.every(call => call.opts?.priority === 'background')).toBe(true)
+    expect(calls.every(call => !call.args.includes('true'))).toBe(true)
+  })
+
   it('re-arms the long timeout when the first overview fails (cache is still cold)', async () => {
     const opts: Array<{ timeoutMs?: number } | undefined> = []
     let n = 0
@@ -308,6 +529,71 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
     expect(await handlers['codeburn:getOverview']!('30days', 'all')).toMatchObject({ ok: true })
     expect(opts[0]?.timeoutMs).toBe(10 * 60_000)
     expect(opts[1]?.timeoutMs).toBe(10 * 60_000)
+  })
+
+  it('gives every section read the cold floor while hydration is still running', async () => {
+    // The repro: the moment `ready` flipped, act report / plan spawned with the
+    // plain 45s cap and were killed waiting behind the cold parse's lock.
+    const opts: Array<{ timeoutMs?: number } | undefined> = []
+    const spawnCli = vi.fn(async (_args: string[], o?: { timeoutMs?: number }) => {
+      opts.push(o)
+      return { current: { cost: 1 } }
+    })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    await handlers['codeburn:getActReport']!()
+    await handlers['codeburn:getPlans']!('30days')
+    await handlers['codeburn:getOptimizeReport']!('30days', 'all')
+    expect(opts.map(o => o?.timeoutMs)).toEqual([10 * 60_000, 10 * 60_000, 10 * 60_000])
+
+    // Once the overview lands, the cold cache is hot and reads revert to the
+    // plain default so a genuinely stuck child is still caught quickly.
+    await handlers['codeburn:getOverview']!('30days', 'all')
+    await handlers['codeburn:getActReport']!()
+    expect(opts[4]?.timeoutMs).toBeUndefined()
+  })
+
+  it('flags a cold-hydration timeout so the renderer keeps the splash', async () => {
+    const spawnCli = vi.fn(async () => { throw new CliError('timeout', 'no output for 45000ms') })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    expect(await handlers['codeburn:getActReport']!())
+      .toMatchObject({ ok: false, error: { kind: 'timeout', cold: true } })
+    expect(await handlers['codeburn:getOverview']!('30days', 'all'))
+      .toMatchObject({ ok: false, error: { kind: 'timeout', cold: true } })
+  })
+
+  it('gives up the cold claim once the cold window itself has elapsed', async () => {
+    // Without a bound this is a forever-splash: overviewWarmed only flips on
+    // success, so an install that can never hydrate would keep every timeout
+    // tagged cold and never reach the real error panel (or its CLI recovery).
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-08-16T00:00:00Z'))
+      const spawnCli = vi.fn(async () => { throw new CliError('timeout', 'no output for 45000ms') })
+      const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+      expect(await handlers['codeburn:getOverview']!('30days', 'all'))
+        .toMatchObject({ ok: false, error: { cold: true } })
+
+      // Past the 10-minute cold floor, still failing: this is an error, not news
+      // that indexing is in progress.
+      vi.setSystemTime(new Date('2026-08-16T00:10:01Z'))
+      const late = await handlers['codeburn:getOverview']!('30days', 'all') as { error: { kind: string; cold?: true } }
+      expect(late.error.kind).toBe('timeout')
+      expect(late.error.cold).toBeUndefined()
+      expect((await handlers['codeburn:getActReport']!() as { error: { cold?: true } }).error.cold).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('never flags a non-timeout failure as cold (a real error is real news)', async () => {
+    const spawnCli = vi.fn(async () => { throw new CliError('nonzero', 'permission denied') })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    const res = await handlers['codeburn:getActReport']!() as { error: { cold?: true } }
+    expect(res.error.cold).toBeUndefined()
   })
 
   it('parses CLI scan-progress stderr lines and forwards them to emitProgress', async () => {

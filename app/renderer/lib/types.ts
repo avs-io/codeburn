@@ -4,7 +4,11 @@
 
 // ————— Period + IPC error contract —————
 
-export type Period = 'today' | 'week' | '30days' | 'month' | 'all'
+export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
+
+// Dashboard usage scope: this device only ('local') or the aggregate across
+// every paired device ('combined'). Mirrors the macOS menubar's Scope setting.
+export type Scope = 'local' | 'combined'
 
 export type DateRange = { from: string; to: string }
 
@@ -14,6 +18,11 @@ export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 't
 export interface CliError {
   kind: CliErrorKind
   message: string
+  /** Set by the main process when the failure happened while the cold cache
+   *  hydration was still running. Such a failure is a "not ready yet", not a
+   *  broken install, so the UI keeps its splash/progress state. Optional so an
+   *  older preload simply never sets it. */
+  cold?: true
 }
 
 export type AliasRow = { from: string; to: string }
@@ -26,7 +35,7 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi'
   connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
@@ -35,6 +44,8 @@ export type QuotaProvider = {
   /** True when the provider is in a 429 backoff window (upstream rate limit). */
   rateLimited?: boolean
 }
+
+export type ProviderName = QuotaProvider['provider']
 
 // ————— src/menubar-json.ts —————
 
@@ -116,8 +127,23 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
 export type MenubarPayload = {
   generated: string
+  // Optional: older CLIs omit it. Present and true only on a stale read-only
+  // serve; absent otherwise. Absence must always be read as "assume fresh."
+  stale?: boolean
+  // Optional: only the resident serve child emits it, and only it may answer
+  // partially (it polls, so it converges). `complete: false` means the totals
+  // cover the files indexed so far and a later poll returns more. Absence — an
+  // older CLI, or any one-shot spawn including the spawn fallback — must be
+  // read as complete.
+  hydration?: HydrationState
   current: {
     label: string
     cost: number
@@ -148,8 +174,9 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
-    // as --provider), `label` the display name. Fall back to `providers` when absent.
-    providerDetails?: Array<{ id: string; label: string; cost: number }>
+    // as --provider), `label` the display name. `hasUsage` distinguishes active $0
+    // providers from detected-but-idle providers when present.
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean }>
     topProjects: Array<{
       name: string
       cost: number
@@ -178,6 +205,20 @@ export type MenubarPayload = {
       calls: number
       date: string
     }>
+    // Workflow-intelligence rollups (src/menubar-json.ts buildWorkflow /
+    // buildTopReworkedFiles). Optional: older CLIs omit them, so the Overview
+    // workflow card renders only when they are present with real signal.
+    workflow?: {
+      corrections: number
+      correctionRate: number | null
+      medianTimeToFirstEditMs: number | null
+    }
+    // Files most reworked by edit-family calls, basename-only, ranked by
+    // distinct sessions then edits (src/menubar-json.ts buildTopReworkedFiles).
+    topReworkedFiles?: Array<{ path: string; sessions: number; edits: number }>
+    // Share (0-1) of cost-bearing calls that resolved a price. Below 1 means some
+    // usage priced against no table entry; null when not computable.
+    pricingCoverage?: number | null
     retryTax: {
       totalUSD: number
       retries: number
@@ -206,6 +247,37 @@ export type MenubarPayload = {
     skills: Array<{ name: string; turns: number; cost: number }>
     subagents: Array<{ name: string; calls: number; cost: number }>
     mcpServers: Array<{ name: string; calls: number }>
+    // Spend by referenced pull request (every PR, cost-descending), attributed at turn
+    // granularity. Optional: older CLIs omit it, and it is absent when no PR links
+    // were observed. Rows carry attributed cost/calls and ARE summable;
+    // `attributedCost + unattributedCost === distinctCost`. `approx` marks a row
+    // fed by the legacy whole-session even split (transcript expired). `models` is
+    // the short model names that processed the PR (cost-desc); `categories` is the
+    // per-task-category attributed cost (cost-desc), omitted for legacy rows.
+    // `attributedCost`/`unattributedCost` are optional so a payload from an older
+    // CLI (by-reference rows, not summable) still type-checks and can be detected.
+    pullRequests?: {
+      rows: Array<{
+        url: string
+        label: string
+        cost: number
+        savingsUSD: number
+        sessions: number
+        calls: number
+        firstStarted: string
+        lastEnded: string
+        approx?: boolean
+        models?: string[]
+        categories?: Array<{ name: string; cost: number }>
+      }>
+      distinctCost: number
+      distinctSessions: number
+      // Count of subagent (sidechain) runs folded into the PR-linked parent
+      // sessions. Optional (absent when none folded, or from an older producer).
+      subagentSessions?: number
+      attributedCost?: number
+      unattributedCost?: number
+    }
   }
   optimize: {
     findingCount: number
@@ -218,6 +290,9 @@ export type MenubarPayload = {
   }
   history: {
     daily: DailyHistoryEntry[]
+    // Granular per-bucket timeline. Present only on the punchcard's dedicated
+    // fetch (every other payload passes --no-timeline).
+    timeline?: { bucketMinutes: number; points: Array<{ timestamp: string; cost: number }> }
   }
   // Active display currency. Payload costs are raw USD; the renderer multiplies by
   // `rate` and prefixes `symbol` at display time. Optional: older CLIs omit it.
@@ -351,9 +426,11 @@ export type SpendFlow = {
 // ————— src/optimize.ts —————
 
 export type WasteAction =
-  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' }
+  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' | 'manual' }
   | { type: 'command'; label: string; text: string }
   | { type: 'file-content'; label: string; path: string; content: string }
+
+export type FindingClass = 'fix' | 'nudge' | 'keep'
 
 export type OptimizeJsonReport = {
   period: { label: string; start: string | null; end: string | null }
@@ -368,6 +445,8 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    measuredSavingsUSD: number
+    byClass: Record<FindingClass, { tokensSaved: number; savingsUSD: number; count: number }>
   }
   findings: Array<{
     id: string
@@ -377,7 +456,20 @@ export type OptimizeJsonReport = {
     trend: 'active' | 'improving' | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: 'measured' | 'estimated'
     fix: WasteAction
+  }>
+  /** Still-applied fixes, re-measured on every run. Absent on older CLIs. */
+  appliedFixes?: Array<{
+    id: string
+    kind: string
+    findingId: string | null
+    appliedAt: string
+    verdict: 'worked' | 'partial' | 'no-effect' | 'pending'
+    estimatedTokens: number
+    realizedTokens: number
+    undoCommand: string
   }>
 }
 
@@ -421,6 +513,10 @@ export type ActReportJson = {
 // ————— src/sessions-report.ts —————
 export type SessionRow = {
   sessionId: string
+  // Captured human title (src/sessions-report.ts). Empty string when the
+  // transcript produced none; optional so older CLIs that predate the field
+  // render unchanged (the row falls back to the project as its primary label).
+  title?: string
   project: string
   provider: string
   models: string[]
@@ -568,6 +664,8 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  /** Proof of life during a silent parse phase; carries nothing else. */
+  | { kind: 'keepalive' }
   | { kind: 'done' }
 
 /** Update-availability status from the main process (app/electron/updates.ts). */
@@ -585,18 +683,26 @@ export interface CodeburnBridge {
   getUpdateStatus(): Promise<UpdateStatus>
   /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
   onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
-  getQuota(force?: boolean): Promise<QuotaProvider[]>
-  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null): Promise<MenubarPayload>
-  getPlans(period: Period): Promise<StatusJson>
+  getQuota(force?: boolean, disabled?: ProviderName[]): Promise<QuotaProvider[]>
+  // `background` (prefetch only) requests background CLI-spawn priority; optional
+  // so an older preload that ignores it degrades to interactive priority.
+  // `scope` selects local-device usage ('local', default) or paired-device
+  // aggregate ('combined'); optional so an older preload degrades to local.
+  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string): Promise<MenubarPayload>
+  getTimeline(period: Period, provider: string, range?: DateRange): Promise<MenubarPayload>
+  getPlans(period: Period, background?: boolean): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string
-  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange): Promise<ModelReportRow[]>
-  getSessions(period: Period, provider: string, range?: DateRange): Promise<SessionRow[]>
-  getCompareModels(period: Period, provider: string): Promise<ModelStats[]>
+  /** Node process.arch of the host ('arm64', 'x64', ...). Absent on preloads
+   *  that predate the direct-download update link. */
+  readonly arch?: string
+  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange, background?: boolean): Promise<ModelReportRow[]>
+  getSessions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionRow[]>
+  getCompareModels(period: Period, provider: string, background?: boolean): Promise<ModelStats[]>
   getCompare(period: Period, provider: string, modelA: string, modelB: string): Promise<CompareJsonReport>
-  getYield(period: Period, provider: string, range?: DateRange): Promise<YieldJsonReport>
-  getSpendFlow(period: Period, provider: string, range?: DateRange): Promise<SpendFlow>
-  getOptimizeReport(period: Period, provider: string, range?: DateRange): Promise<OptimizeJsonReport>
+  getYield(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<YieldJsonReport>
+  getSpendFlow(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SpendFlow>
+  getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>
@@ -622,4 +728,14 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  // Plugin management
+  pluginList(): Promise<unknown>
+  pluginInfo(name: string): Promise<unknown>
+  pluginAdd(source: string): Promise<ActionResult>
+  pluginRemove(name: string): Promise<ActionResult>
+  pluginVerify(name: string): Promise<ActionResult>
+  // Sync auto
+  syncAutoStatus(): Promise<unknown>
+  syncAutoEnable(cadence: string, attribution: boolean, accept: boolean): Promise<unknown>
+  syncAutoDisable(): Promise<ActionResult>
 }
