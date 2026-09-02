@@ -33,15 +33,16 @@ const CLAUDE_NAMES: [&str; 2] = ["claude.cmd", "claude.exe"];
 #[cfg(not(windows))]
 const CLAUDE_NAMES: [&str; 1] = ["claude"];
 
-/// Alphanumerics plus `._/-` and space, with `\`, `:`, `(`, `)` also allowed on Windows
-/// so a user-supplied `CODEBURN_BIN` path like `C:\Users\...\codeburn.cmd` is accepted.
-/// None of these are shell metacharacters in a direct-argv spawn (we never invoke `sh -c`).
+/// Alphanumerics plus `._/-` and space, with `\`, `:`, `(`, `)`, `~` also allowed on
+/// Windows so a user-supplied `CODEBURN_BIN` path like `C:\Users\...\codeburn.cmd` is
+/// accepted — including 8.3 short names (`C:\Users\RUNNER~1\...`). None of these are
+/// shell metacharacters in a direct-argv spawn (we never invoke `sh -c`).
 fn is_safe_arg(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|c| {
             c.is_ascii_alphanumeric()
                 || matches!(c, '.' | '_' | '/' | '-' | ' ')
-                || (cfg!(windows) && matches!(c, '\\' | ':' | '(' | ')'))
+                || (cfg!(windows) && matches!(c, '\\' | ':' | '(' | ')' | '~'))
         })
 }
 
@@ -700,5 +701,15 @@ mod tests {
         assert!(validate_cli_path("relative/codeburn").is_err());
         assert!(validate_cli_path("codeburn; rm -rf /").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_8_3_short_names_are_safe_argv() {
+        let short = r"C:\Users\RUNNER~1\AppData\Local\Temp\codeburn.cmd";
+        #[cfg(windows)]
+        assert!(is_safe_arg(short));
+        #[cfg(not(windows))]
+        assert!(!is_safe_arg(short));
+        assert!(!is_safe_arg("codeburn; rm -rf /"));
     }
 }

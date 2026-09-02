@@ -104,7 +104,8 @@ CODEBURN_BIN="node $(pwd)/../dist/cli.js" npm run tauri dev
 ```
 
 `CODEBURN_BIN` is validated against a strict allowlist (alphanumerics plus `._/-` and space;
-`\ : ( )` also allowed on Windows) before use; anything else falls back to auto-resolution.
+`\ : ( ) ~` also allowed on Windows, including 8.3 short names like `RUNNER~1`) before use;
+anything else falls back to auto-resolution.
 
 Without `CODEBURN_BIN` the app looks for `codeburn` (`codeburn.cmd` / `codeburn.exe` on Windows)
 on the inherited `PATH`, then in the usual npm and node prefixes (`%APPDATA%\npm`,
