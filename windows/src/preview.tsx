@@ -93,8 +93,27 @@ const missing = buildGlanceView({
 
 const overflow = buildGlanceView({
   cliFound: true,
-  today: payload({ cost: 42.1, sessions: 6, calls: 12 }),
-  week: payload({ cost: 1284, sessions: 20, calls: 80 }),
+  today: payload({
+    cost: 42.1,
+    sessions: 6,
+    calls: 12,
+    project: 'checkout-api',
+    model: 'claude-sonnet',
+  }),
+  week: payload({
+    cost: 1284,
+    sessions: 20,
+    calls: 80,
+    daily: [
+      { date: '2026-08-24', cost: 80 },
+      { date: '2026-08-25', cost: 140 },
+      { date: '2026-08-26', cost: 220 },
+      { date: '2026-08-27', cost: 190 },
+      { date: '2026-08-28', cost: 260 },
+      { date: '2026-08-29', cost: 352 },
+      { date: '2026-08-30', cost: 42.1 },
+    ],
+  }),
   error: null,
   refreshing: false,
   hasEverSucceeded: true,
