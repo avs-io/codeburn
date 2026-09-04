@@ -171,9 +171,9 @@ enum ClinePassSubscriptionService {
             throw FetchError.parseFailure
         }
         return QuotaSummary(
-            providerFilter: .all,
+            providerFilter: .cline,
             connection: .connected,
-            primary: weekly ?? fiveHour ?? monthly,
+            primary: details.first(where: { $0.percent >= 1 }) ?? weekly ?? fiveHour ?? monthly,
             details: details,
             planLabel: nil,
             footerLines: []

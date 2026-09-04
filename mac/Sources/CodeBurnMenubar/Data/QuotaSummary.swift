@@ -51,11 +51,11 @@ struct QuotaSummary: Equatable {
         case danger     // >=90%  red
     }
 
-    /// The glance value (percent + color) for Capacity Dock. Every provider is
-    /// put on the same billing horizon: the weekly window if one exists, else the
-    /// monthly window. Only when a provider exposes neither does it fall back to
-    /// the window nearest exhaustion. Empty data stays nil rather than
-    /// masquerading as 0%.
+    /// The glance value (percent + color) for Capacity Dock. ClinePass promotes
+    /// a fully exhausted hard limit to primary; otherwise every provider is put
+    /// on the same billing horizon: weekly when present, else monthly. Only when
+    /// neither is available does it fall back to the window nearest exhaustion.
+    /// Empty data stays nil rather than masquerading as 0%.
     var headlineWindow: Window? {
         var candidates = details
         if let primary, !candidates.contains(primary) {
@@ -64,6 +64,7 @@ struct QuotaSummary: Equatable {
         func firstMatching(_ needle: String) -> Window? {
             candidates.first { $0.label.range(of: needle, options: .caseInsensitive) != nil }
         }
+        if providerFilter == .cline, let primary, primary.percent >= 1 { return primary }
         if let weekly = firstMatching("week") { return weekly }
         if let monthly = firstMatching("month") { return monthly }
         return candidates.max { lhs, rhs in lhs.percent < rhs.percent }

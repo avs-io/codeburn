@@ -61,6 +61,7 @@ final class ClinePassQuotaTests: XCTestCase {
         )
 
         XCTAssertEqual(summary.connection, .connected)
+        XCTAssertEqual(summary.providerFilter, .cline)
         XCTAssertEqual(summary.details.map(\.label), ["5-hour", "Weekly", "Monthly"])
         XCTAssertEqual(summary.details.map(\.percent), [0.135, 0.42, 0.07])
         XCTAssertEqual(summary.primary?.label, "Weekly")
@@ -77,6 +78,24 @@ final class ClinePassQuotaTests: XCTestCase {
         XCTAssertEqual(
             request.value(forHTTPHeaderField: "Authorization"),
             "Bearer \(Self.syntheticKey)")
+    }
+
+    func testAnyExhaustedWindowBecomesTheDockPrimary() throws {
+        for exhaustedType in ["five_hour", "weekly", "monthly"] {
+            let limits = ["five_hour", "weekly", "monthly"].map { type in
+                let percent = type == exhaustedType ? 100 : (type == "weekly" ? 40 : 0)
+                return #"{"type":"\#(type)","percentUsed":\#(percent),"resetsAt":null}"#
+            }.joined(separator: ",")
+            let body = #"{"success":true,"data":{"limits":[\#(limits)]}}"#
+
+            let summary = try ClinePassSubscriptionService.decode(Data(body.utf8))
+
+            XCTAssertEqual(summary.providerFilter, .cline)
+            XCTAssertEqual(summary.primary?.percent ?? -1, 1, accuracy: 0.0001)
+            XCTAssertEqual(
+                summary.primary?.label,
+                exhaustedType == "five_hour" ? "5-hour" : exhaustedType.capitalized)
+        }
     }
 
     func testAuthenticationResponsesAreTerminal() async throws {

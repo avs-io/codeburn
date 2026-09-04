@@ -37,6 +37,43 @@ struct QuotaSummaryHeadlineTests {
         #expect(summary.headlineWindow == weekly)
     }
 
+    @Test("an exhausted hard limit overrides the normal weekly headline")
+    func exhaustedWindowOutranksWeekly() {
+        let monthly = QuotaSummary.Window(label: "Monthly", percent: 1, resetsAt: nil)
+        let weekly = QuotaSummary.Window(label: "Weekly", percent: 0.4, resetsAt: nil)
+        let summary = QuotaSummary(
+            providerFilter: .cline,
+            connection: .connected,
+            primary: monthly,
+            details: [
+                QuotaSummary.Window(label: "5-hour", percent: 0, resetsAt: nil),
+                weekly,
+                monthly,
+            ],
+            planLabel: nil,
+            footerLines: []
+        )
+
+        #expect(summary.headlineWindow == monthly)
+        #expect(QuotaSummary.severity(for: summary.headlineWindow!.percent) == .danger)
+    }
+
+    @Test("other providers preserve the weekly headline when their primary is exhausted")
+    func exhaustedPrimaryDoesNotChangeOtherProviders() {
+        let fiveHour = QuotaSummary.Window(label: "5-hour", percent: 1, resetsAt: nil)
+        let weekly = QuotaSummary.Window(label: "Weekly", percent: 0.4, resetsAt: nil)
+        let summary = QuotaSummary(
+            providerFilter: .codex,
+            connection: .connected,
+            primary: fiveHour,
+            details: [fiveHour, weekly],
+            planLabel: "Pro",
+            footerLines: []
+        )
+
+        #expect(summary.headlineWindow == weekly)
+    }
+
     @Test("falls back to the busiest window when no billing label is present")
     func fallsBackToBusiestWindow() {
         let session = QuotaSummary.Window(label: "Current session", percent: 0.73, resetsAt: nil)
