@@ -3,9 +3,11 @@
 /// the optional `liveSessions` block of the menubar payload; the app renders
 /// only what it finds here.
 import { open, readdir, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { reportedContextWindow } from './context-tree.js'
+import { FIRST_LINE_READ_CAP } from './launcher-homes.js'
 import { getShortModelName } from './models.js'
 import type { ApiUsage, AssistantMessageContent, JournalEntry } from './types.js'
 
@@ -58,6 +60,11 @@ export type LiveSessionInput = {
   subagentActivityMs: number[]
 }
 
+export type LiveSessionRoots = {
+  claudeRoots?: string[]
+  codexRoots?: string[]
+}
+
 /// Pure core: liveness and parent/sub-agent folding, newest first.
 export function buildLiveSessions(
   inputs: LiveSessionInput[],
@@ -98,6 +105,21 @@ async function readTail(filePath: string, maxBytes: number): Promise<string> {
     const text = buffer.toString('utf8')
     // A mid-file start almost certainly lands inside a line; drop that fragment.
     return start > 0 ? text.slice(text.indexOf('\n') + 1) : text
+  } finally {
+    await handle.close()
+  }
+}
+
+async function readHeadLine(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await open(filePath, 'r')
+  try {
+    const { size } = await handle.stat()
+    const buffer = Buffer.alloc(Math.min(size, maxBytes))
+    if (buffer.length === 0) return ''
+    await handle.read(buffer, 0, buffer.length, 0)
+    const text = buffer.toString('utf8')
+    const newline = text.indexOf('\n')
+    return newline >= 0 ? text.slice(0, newline) : text
   } finally {
     await handle.close()
   }
@@ -205,19 +227,29 @@ type FileTimes = { path: string; mtimeMs: number; birthtimeMs: number }
 /// provider registry. `discoverAllSessions` walks every provider's tree and
 /// costs about half a second on a large history; this block only ever reads
 /// Claude transcripts, and it runs on every payload build.
-async function transcriptRoots(): Promise<string[]> {
+async function claudeTranscriptRoots(): Promise<string[]> {
   const configured = await getClaudeConfigDirs().catch(() => [])
   return [...configured.map(dir => join(dir, 'projects')), ...getDesktopSessionsDirs()]
 }
 
+function codexTranscriptRoots(): string[] {
+  const home = process.env['CODEX_HOME']?.trim() || join(homedir(), '.codex')
+  return [join(home, 'sessions')]
+}
+
 /// Every transcript touched inside the window. One recursive listing per root,
 /// then a stat per file: nothing is opened until it is known to be live.
-async function liveTranscripts(nowMs: number, windowMs: number): Promise<FileTimes[]> {
+async function liveTranscripts(
+  roots: string[],
+  nowMs: number,
+  windowMs: number,
+  accepts: (name: string) => boolean,
+): Promise<FileTimes[]> {
   const paths: string[] = []
-  for (const root of await transcriptRoots()) {
+  for (const root of roots) {
     const entries = await readdir(root, { recursive: true, withFileTypes: true }).catch(() => [])
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+      if (!entry.isFile() || !accepts(entry.name)) continue
       paths.push(join(entry.parentPath, entry.name))
     }
   }
@@ -230,14 +262,193 @@ async function liveTranscripts(nowMs: number, windowMs: number): Promise<FileTim
   return stats.filter((entry): entry is FileTimes => entry !== null)
 }
 
+type CodexEntry = {
+  timestamp?: string
+  type?: string
+  payload?: {
+    type?: string
+    id?: string
+    session_id?: string
+    thread_source?: string
+    parent_thread_id?: string | null
+    cwd?: string
+    model?: string
+    git?: { branch?: string }
+    info?: {
+      model?: string
+      model_name?: string
+      model_context_window?: number
+      last_token_usage?: {
+        input_tokens?: number
+        output_tokens?: number
+        total_tokens?: number
+      }
+    }
+  }
+}
+
+type ScannedCodexFile = Omit<ScannedFile, 'isSidechain'> & {
+  startedMs: number | null
+  parentSessionId: string | null
+}
+
+function codexSessionId(filePath: string): string {
+  const name = basename(filePath)
+  return /^rollout-.{19}-(.+)\.jsonl$/.exec(name)?.[1] ?? name.replace(/\.jsonl$/, '')
+}
+
+function codexContextTokens(usage: NonNullable<NonNullable<CodexEntry['payload']>['info']>['last_token_usage']): number | null {
+  if (!usage) return null
+  const total = usage.total_tokens ?? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0)
+  return Number.isFinite(total) && total > 0 ? total : null
+}
+
+async function scanCodexTranscript(filePath: string): Promise<ScannedCodexFile> {
+  const result: ScannedCodexFile = {
+    sessionId: codexSessionId(filePath),
+    cwd: '',
+    branch: null,
+    model: null,
+    contextTokens: null,
+    contextWindow: null,
+    startedMs: null,
+    parentSessionId: null,
+  }
+
+  try {
+    const first = JSON.parse(await readHeadLine(filePath, FIRST_LINE_READ_CAP)) as CodexEntry
+    if (first.type === 'session_meta' && first.payload) {
+      if (typeof first.payload.id === 'string' && first.payload.id) result.sessionId = first.payload.id
+      if (first.payload.thread_source === 'subagent') {
+        const rootSessionId = first.payload.session_id
+        const directParentId = first.payload.parent_thread_id
+        result.parentSessionId = typeof rootSessionId === 'string' && rootSessionId && rootSessionId !== result.sessionId
+          ? rootSessionId
+          : typeof directParentId === 'string' && directParentId
+            ? directParentId
+            : null
+      }
+      if (typeof first.payload.cwd === 'string' && first.payload.cwd) result.cwd = first.payload.cwd
+      if (typeof first.payload.git?.branch === 'string' && first.payload.git.branch) result.branch = first.payload.git.branch
+      const startedMs = typeof first.timestamp === 'string' ? Date.parse(first.timestamp) : NaN
+      if (Number.isFinite(startedMs)) result.startedMs = startedMs
+    }
+  } catch {
+    // Filename and file times still provide a truthful minimal session row.
+  }
+
+  let tail = ''
+  try {
+    tail = await readTail(filePath, TAIL_BYTES)
+  } catch {
+    return result
+  }
+  const lines = tail.split('\n')
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+    if (!line || !line.trim()) continue
+    let entry: CodexEntry
+    try {
+      entry = JSON.parse(line) as CodexEntry
+    } catch {
+      continue
+    }
+    const payload = entry.payload
+    if (!payload) continue
+    if (!result.cwd && typeof payload.cwd === 'string' && payload.cwd) result.cwd = payload.cwd
+    const rawModel = payload.model ?? payload.info?.model ?? payload.info?.model_name
+    if (!result.model && typeof rawModel === 'string' && rawModel) result.model = getShortModelName(rawModel)
+    if (result.contextTokens === null && entry.type === 'event_msg' && payload.type === 'token_count') {
+      result.contextTokens = codexContextTokens(payload.info?.last_token_usage)
+      const window = payload.info?.model_context_window
+      if (typeof window === 'number' && Number.isFinite(window) && window > 0) result.contextWindow = window
+    }
+    if (result.model && result.contextTokens !== null && result.cwd) break
+  }
+  return result
+}
+
+function toCodexInput(scan: ScannedCodexFile, file: FileTimes): LiveSessionInput {
+  return {
+    id: scan.sessionId,
+    provider: 'codex',
+    project: scan.cwd ? basename(scan.cwd) : scan.sessionId,
+    branch: scan.branch,
+    model: scan.model,
+    contextTokens: scan.contextTokens,
+    contextWindow: scan.contextWindow,
+    startedMs: scan.startedMs ?? file.birthtimeMs,
+    lastActivityMs: file.mtimeMs,
+    subagentActivityMs: [],
+  }
+}
+
+async function findCodexTranscript(roots: string[], sessionId: string): Promise<FileTimes | null> {
+  const suffix = `-${sessionId}.jsonl`
+  for (const root of roots) {
+    const entries = await readdir(root, { recursive: true, withFileTypes: true }).catch(() => [])
+    const entry = entries.find(candidate => candidate.isFile() && candidate.name.endsWith(suffix))
+    if (!entry) continue
+    const path = join(entry.parentPath, entry.name)
+    const info = await stat(path).catch(() => null)
+    if (info?.isFile()) {
+      return { path, mtimeMs: info.mtimeMs, birthtimeMs: info.birthtimeMs || info.mtimeMs }
+    }
+  }
+  return null
+}
+
+async function collectCodexLiveSessionInputs(
+  roots: string[],
+  nowMs: number,
+  windowMs: number,
+): Promise<LiveSessionInput[]> {
+  const files = await liveTranscripts(
+    roots,
+    nowMs,
+    windowMs,
+    name => /^rollout-.+\.jsonl$/.test(name),
+  )
+  const inputs = new Map<string, LiveSessionInput>()
+  const pendingSubagents: Array<{ parentSessionId: string; mtimeMs: number }> = []
+  for (const { file, scan } of await Promise.all(files.map(async file => ({
+    file,
+    scan: await scanCodexTranscript(file.path),
+  })))) {
+    if (scan.parentSessionId) {
+      pendingSubagents.push({ parentSessionId: scan.parentSessionId, mtimeMs: file.mtimeMs })
+    } else {
+      inputs.set(scan.sessionId, toCodexInput(scan, file))
+    }
+  }
+
+  for (const subagent of pendingSubagents) {
+    let parent = inputs.get(subagent.parentSessionId)
+    if (!parent) {
+      const parentFile = await findCodexTranscript(roots, subagent.parentSessionId)
+      if (!parentFile) continue
+      const parentScan = await scanCodexTranscript(parentFile.path)
+      if (parentScan.sessionId !== subagent.parentSessionId || parentScan.parentSessionId) continue
+      parent = toCodexInput(parentScan, parentFile)
+      inputs.set(parent.id, parent)
+    }
+    parent.subagentActivityMs.push(subagent.mtimeMs)
+  }
+
+  return [...inputs.values()]
+}
+
 /// Walks the live transcripts and builds the pure-core inputs. Sidechain
 /// (sub-agent) transcripts fold into their parent session: they keep it alive
 /// while it waits on them.
 export async function collectLiveSessionInputs(
   nowMs: number,
   windowSeconds: number,
+  roots: LiveSessionRoots = {},
 ): Promise<LiveSessionInput[]> {
   const windowMs = windowSeconds * 1000
+  const claudeRoots = roots.claudeRoots ?? await claudeTranscriptRoots()
+  const codexRoots = roots.codexRoots ?? codexTranscriptRoots()
   const inputs = new Map<string, LiveSessionInput>()
   type PendingSidechain = { sessionId: string; mtimeMs: number; path: string }
   const pendingSidechains: PendingSidechain[] = []
@@ -270,7 +481,7 @@ export async function collectLiveSessionInputs(
     )
   }
 
-  for (const file of await liveTranscripts(nowMs, windowMs)) {
+  for (const file of await liveTranscripts(claudeRoots, nowMs, windowMs, name => name.endsWith('.jsonl'))) {
     const scan = await scanTranscript(file.path)
     if (scan.isSidechain) {
       pendingSidechains.push({ sessionId: scan.sessionId, mtimeMs: file.mtimeMs, path: file.path })
@@ -292,13 +503,17 @@ export async function collectLiveSessionInputs(
     parent.subagentActivityMs.push(sidechain.mtimeMs)
   }
 
-  return [...inputs.values()]
+  return [
+    ...inputs.values(),
+    ...await collectCodexLiveSessionInputs(codexRoots, nowMs, windowMs),
+  ]
 }
 
 export async function collectLiveSessions(
   nowMs: number = Date.now(),
   windowSeconds: number = LIVE_WINDOW_SECONDS,
+  roots: LiveSessionRoots = {},
 ): Promise<LiveSessionsBlock> {
-  const inputs = await collectLiveSessionInputs(nowMs, windowSeconds)
+  const inputs = await collectLiveSessionInputs(nowMs, windowSeconds, roots)
   return buildLiveSessions(inputs, nowMs, windowSeconds)
 }

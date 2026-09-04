@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { LIVE_WINDOW_SECONDS, TAIL_BYTES, buildLiveSessions, scanTranscript, type LiveSessionInput } from '../src/live-sessions.js'
+import { LIVE_WINDOW_SECONDS, TAIL_BYTES, buildLiveSessions, collectLiveSessions, scanTranscript, type LiveSessionInput } from '../src/live-sessions.js'
 
 const NOW = Date.parse('2026-09-01T12:00:00.000Z')
 
@@ -77,6 +77,76 @@ describe('buildLiveSessions', () => {
 
   it('treats a missing timestamp as not live rather than as the epoch', () => {
     expect(buildLiveSessions([input({ lastActivityMs: 0 })], NOW, LIVE_WINDOW_SECONDS).sessions).toEqual([])
+  })
+})
+
+describe('collectLiveSessions', () => {
+  it('includes a recently touched Codex rollout in the menubar payload', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'live-sessions-providers-'))
+    const claudeRoot = join(root, 'claude')
+    const codexRoot = join(root, 'codex')
+    const rolloutDir = join(codexRoot, '2026', '09', '01')
+    await mkdir(claudeRoot, { recursive: true })
+    await mkdir(rolloutDir, { recursive: true })
+    const rollout = join(rolloutDir, 'rollout-2026-09-01T11-00-00-codex-live.jsonl')
+    await writeFile(rollout, [
+      {
+        timestamp: '2026-09-01T11:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: 'codex-live',
+          cwd: '/Users/x/codeburn',
+          git: { branch: 'feat/live-sessions' },
+        },
+      },
+      {
+        timestamp: '2026-09-01T11:59:40.000Z',
+        type: 'turn_context',
+        payload: { cwd: '/Users/x/codeburn', model: 'gpt-5.6-sol' },
+      },
+      {
+        timestamp: '2026-09-01T11:59:50.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: { total_tokens: 32_100 },
+            model_context_window: 272_000,
+          },
+        },
+      },
+    ].map(line => JSON.stringify(line)).join('\n'))
+    await utimes(rollout, new Date(NOW - 3_600_000), new Date(NOW - 3_600_000))
+    const subagent = join(rolloutDir, 'rollout-2026-09-01T11-59-00-codex-subagent.jsonl')
+    await writeFile(subagent, JSON.stringify({
+      timestamp: '2026-09-01T11:59:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: 'codex-subagent',
+        session_id: 'codex-live',
+        thread_source: 'subagent',
+        parent_thread_id: 'codex-live',
+        cwd: '/Users/x/codeburn',
+      },
+    }))
+    await utimes(subagent, new Date(NOW - 10_000), new Date(NOW - 10_000))
+
+    const block = await collectLiveSessions(NOW, LIVE_WINDOW_SECONDS, {
+      claudeRoots: [claudeRoot],
+      codexRoots: [codexRoot],
+    })
+
+    expect(block.sessions).toHaveLength(1)
+    expect(block.sessions[0]).toMatchObject({
+      id: 'codex-live',
+      provider: 'codex',
+      project: 'codeburn',
+      branch: 'feat/live-sessions',
+      model: 'GPT-5.6 Sol',
+      contextTokens: 32_100,
+      contextWindow: 272_000,
+      idleSeconds: 10,
+    })
   })
 })
 
