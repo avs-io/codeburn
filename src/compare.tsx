@@ -8,6 +8,7 @@ import { parseAllSessions, setInteractiveScanUI } from './parser.js'
 import { getAllProviders } from './providers/index.js'
 import type { ProjectSummary, DateRange } from './types.js'
 import { patchStdoutForWindows } from './ink-win.js'
+import { startUserTimingGuard } from './user-timing-guard.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 
 const ORANGE = '#FF8C42'
@@ -541,8 +542,13 @@ export async function renderCompare(range: DateRange, provider: string, modelA?:
     presetModels = [a.model, b.model]
   }
 
-  const { waitUntilExit } = render(
-    <CompareView projects={projects} onBack={() => process.exit(0)} presetModels={presetModels} />
-  )
-  await waitUntilExit()
+  const stopUserTimingGuard = startUserTimingGuard()
+  try {
+    const { waitUntilExit } = render(
+      <CompareView projects={projects} onBack={() => process.exit(0)} presetModels={presetModels} />
+    )
+    await waitUntilExit()
+  } finally {
+    stopUserTimingGuard()
+  }
 }

@@ -24,6 +24,7 @@ import { getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
 import { formatDayRangeLabel, getDateRange, parseDayFlag, PERIODS, PERIOD_LABELS, shiftDay, type Period } from './cli-date.js'
 import { BSU, patchStdoutForWindows } from './ink-win.js'
+import { startUserTimingGuard } from './user-timing-guard.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -2463,6 +2464,7 @@ export async function renderDashboard(period: Period = 'week', provider: string 
       }
     }
     process.stdin.on('data', hardQuitGuard)
+    const stopUserTimingGuard = startUserTimingGuard()
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
       <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} initialHistoryIndexing={progressive} initialCacheWasCold={cacheWasCold} autoFallbackFromEmptyToday={auto} terminateProcess={exitCode => { setImmediate(() => exitAfterCacheCleanup(exitCode)) }} />
     ))
@@ -2471,6 +2473,7 @@ export async function renderDashboard(period: Period = 'week', provider: string 
     } finally {
       process.stdin.off('data', hardQuitGuard)
       app.dispose()
+      stopUserTimingGuard()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={opened} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
