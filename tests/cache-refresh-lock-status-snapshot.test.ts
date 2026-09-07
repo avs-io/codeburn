@@ -134,16 +134,44 @@ function cliEnv(home: string, extraEnv: Record<string, string> = {}): NodeJS.Pro
   }
 }
 
-type CliResult = { status: number | null, stdout: string, stderr: string }
+type CliResult = { status: number | null, stdout: string, stderr: string, signal: NodeJS.Signals | null }
+
+// Same wall bound as runCli's spawnSync timeout — not a longer wait. SIGTERM
+// grace is only the hang-escalation path, not the happy path.
+const CLI_CHILD_MS = 60_000
+const TERM_GRACE_MS = 1_000
+
+function stillRunning(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null
+}
 
 function runCli(args: string[], home: string, extraEnv: Record<string, string> = {}): CliResult {
   const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
     cwd: process.cwd(),
     env: cliEnv(home, extraEnv),
     encoding: 'utf-8',
-    timeout: 60_000,
+    timeout: CLI_CHILD_MS,
   })
-  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', signal: result.signal }
+}
+
+async function stopCliChild(child: ChildProcess): Promise<void> {
+  if (!stillRunning(child)) return
+  await new Promise<void>(resolve => {
+    let settled = false
+    const done = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(grace)
+      resolve()
+    }
+    const grace = setTimeout(() => {
+      if (stillRunning(child)) child.kill('SIGKILL')
+    }, TERM_GRACE_MS)
+    child.once('exit', done)
+    child.kill('SIGTERM')
+    if (!stillRunning(child)) done()
+  })
 }
 
 function runCliAsync(
@@ -163,10 +191,32 @@ function runCliAsync(
   const promise = new Promise<CliResult>((resolve, reject) => {
     let stdout = ''
     let stderr = ''
+    let settled = false
+    let termTimer: ReturnType<typeof setTimeout> | undefined
+    let killTimer: ReturnType<typeof setTimeout> | undefined
+    const clearTimers = (): void => {
+      if (termTimer !== undefined) clearTimeout(termTimer)
+      if (killTimer !== undefined) clearTimeout(killTimer)
+      termTimer = undefined
+      killTimer = undefined
+    }
+    const settle = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimers()
+      fn()
+    }
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8') })
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8') })
-    child.once('error', reject)
-    child.once('close', status => { resolve({ status, stdout, stderr }) })
+    child.once('error', err => { settle(() => reject(err)) })
+    child.once('close', (status, signal) => { settle(() => resolve({ status, stdout, stderr, signal })) })
+    termTimer = setTimeout(() => {
+      if (!stillRunning(child)) return
+      child.kill('SIGTERM')
+      killTimer = setTimeout(() => {
+        if (stillRunning(child)) child.kill('SIGKILL')
+      }, TERM_GRACE_MS)
+    }, CLI_CHILD_MS)
   })
   return { child, promise }
 }
@@ -289,13 +339,16 @@ describe('degraded read-only parse is never persisted as a status snapshot', () 
       await held.handle.release()
       degraded = await running.promise
     } finally {
-      if (running.child.exitCode === null && running.child.signalCode === null) {
-        running.child.kill('SIGTERM')
-      }
+      await stopCliChild(running.child)
       await running.promise.catch(() => undefined)
       await held.handle.release()
     }
 
+    if (degraded.status !== 0) {
+      throw new Error(
+        `CLI stuck after lock-wait ready: status=${degraded.status} signal=${degraded.signal} stderr=${degraded.stderr}`,
+      )
+    }
     expect(degraded.status, `stderr: ${degraded.stderr}`).toBe(0)
     const degradedPayload = JSON.parse(degraded.stdout) as { stale?: boolean, current: { calls: number } }
     // The primary parse went read-only behind the held lock and served the
