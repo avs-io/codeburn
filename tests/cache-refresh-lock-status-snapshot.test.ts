@@ -13,6 +13,12 @@ import { saveStatusSnapshot } from '../src/session-cache.js'
 const LOCK_WAIT_PROBE = pathToFileURL(join(process.cwd(), 'tests/fixtures/cache-refresh-lock-wait-probe.mjs')).href
 
 const roots: string[] = []
+const asyncCli: { child: ChildProcess, promise: Promise<unknown> }[] = []
+
+function forgetAsyncCli(child: ChildProcess): void {
+  const i = asyncCli.findIndex(entry => entry.child === child)
+  if (i >= 0) asyncCli.splice(i, 1)
+}
 
 async function waitFor(path: string, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -53,7 +59,15 @@ function recordPath(cacheDir: string, queryKey: string): string {
 
 afterEach(async () => {
   delete process.env['CODEBURN_CACHE_DIR']
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+  const owned = asyncCli.splice(0)
+  try {
+    await Promise.all(owned.map(async ({ child, promise }) => {
+      try { await stopCliChild(child) } catch { /* still remove roots */ }
+      try { await promise } catch { /* spawn error or already rejected */ }
+    }))
+  } finally {
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+  }
 })
 
 describe('status snapshot child-process write lock', () => {
@@ -204,6 +218,7 @@ function runCliAsync(
       if (settled) return
       settled = true
       clearTimers()
+      forgetAsyncCli(child)
       fn()
     }
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8') })
@@ -218,6 +233,7 @@ function runCliAsync(
       }, TERM_GRACE_MS)
     }, CLI_CHILD_MS)
   })
+  asyncCli.push({ child, promise })
   return { child, promise }
 }
 
