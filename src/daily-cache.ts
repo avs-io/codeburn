@@ -366,11 +366,17 @@ import type { DateRange, ProjectSummary } from './types.js'
 // Codex moves cold sessions into, which were skipped, so days settled after
 // that move miss their Codex usage. Calls and cost only rise, so no
 // PENDING_REDERIVE_PROVIDER_VERSIONS entry is needed. A Node without zstd
-// cannot read them and stays at 75, so its cache never claims v76 and a later
-// Node upgrade still adopts and re-derives it. The next bump must retire this
-// split: raise the Node floor to 22.15 and drop the fallback, or give the
-// no-zstd runtime a generation of its own just below the new version.
-export const DAILY_CACHE_VERSION = zstdSupported ? 76 : 75
+// cannot read them and stayed at 75, so its cache never claimed v76 and a
+// later Node upgrade still adopts and re-derives it.
+// v77: Warp conversations that carry only total_billed_cost_in_cents are
+// priced from it instead of the credits estimate. Calls are unchanged, so no
+// PENDING_REDERIVE_PROVIDER_VERSIONS entry is needed. A Node without zstd
+// takes 76, so it re-derives for this fix too and a zstd Node still adopts
+// and re-derives its file. This is the last bump that can keep the split: a
+// no-zstd Node adopts any file at its own number, and after this release zstd
+// Nodes will have written v77 files next to it. Raise the Node floor to 22.15
+// and drop the fallback before the next bump.
+export const DAILY_CACHE_VERSION = zstdSupported ? 77 : 76
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
