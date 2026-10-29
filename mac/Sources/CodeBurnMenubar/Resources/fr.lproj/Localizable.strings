@@ -731,6 +731,7 @@
 "Synced from cursor.com %@" = "Synchronisé depuis cursor.com %@";
 "Not synced from cursor.com yet" = "Pas encore synchronisé depuis cursor.com";
 "Cursor login expired, open Cursor to sign in again" = "La connexion à Cursor a expiré, ouvrez Cursor pour vous reconnecter";
+"Cursor encrypted its app session. Allow the Safe Storage keychain prompt, then click Retry." = "Cursor a chiffré sa session. Autorisez l'invite du trousseau Safe Storage, puis cliquez sur Réessayer.";
 "Couldn't reach cursor.com, will retry" = "Impossible de joindre cursor.com, nouvel essai prévu";
 "Couldn't read the usage export from cursor.com, will retry" = "Impossible de lire l'export d'utilisation de cursor.com, nouvel essai prévu";
 "Sync Cursor usage from cursor.com" = "Synchroniser l'utilisation de Cursor depuis cursor.com";

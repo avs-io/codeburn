@@ -102,6 +102,16 @@ final class CursorQuotaTests: XCTestCase {
         await assertFetchError(.expiredSession, deps: expired)
     }
 
+    func testCursorSafeStorageV10UnlocksToTheJWT() throws {
+        let stored = "cursor-safe-storage:v1:djEwaLx01xXA5BrTaEen3asJGsszpUzl3kjapkdjjClgeE4="
+        XCTAssertEqual(
+            CursorSafeStorage.decrypt(stored, password: "cursor-key-not-a-secret"),
+            "header.payload.signature"
+        )
+        XCTAssertNil(CursorSafeStorage.decrypt(stored, password: "wrong-password"))
+        XCTAssertEqual(try CursorSafeStorage.unlock("plain.jwt.token"), "plain.jwt.token")
+    }
+
     func testUnreadableLocalStoreIsReportedHonestlyWithoutNetwork() async throws {
         struct SyntheticStoreFailure: Error {}
         let deps = CursorSubscriptionService.Deps(

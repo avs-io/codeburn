@@ -727,6 +727,7 @@
 "Synced from cursor.com %@" = "已從 cursor.com 同步（%@）";
 "Not synced from cursor.com yet" = "尚未從 cursor.com 同步";
 "Cursor login expired, open Cursor to sign in again" = "Cursor 登入已過期，請開啟 Cursor 重新登入";
+"Cursor encrypted its app session. Allow the Safe Storage keychain prompt, then click Retry." = "Cursor 已加密其工作階段。請允許 Safe Storage 鑰匙圈提示，然後點擊重試。";
 "Couldn't reach cursor.com, will retry" = "無法連線到 cursor.com，將會重試";
 "Couldn't read the usage export from cursor.com, will retry" = "無法讀取 cursor.com 的用量匯出，將會重試";
 "Sync Cursor usage from cursor.com" = "從 cursor.com 同步 Cursor 用量";

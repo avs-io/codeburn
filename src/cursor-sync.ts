@@ -7,8 +7,8 @@ import { getCodeburnCacheDir } from './cache-dir.js'
 import { readConfig } from './config.js'
 import { cursorImportPath, importCursorCsvText, loadCursorImport, replacedProviders, type CoverageRange, type CursorImportSummary } from './cursor-import.js'
 import { invalidateProviderDays, toDateString } from './daily-cache.js'
-import { cursorAccessTokenFromDatabase, cursorDatabasePath, cursorSessionCookie, cursorTokenClaims } from './quota/cursor.js'
-import { sanitizeError } from './quota/security.js'
+import { cursorAccessTokenFromDatabase, cursorDatabasePath, cursorSessionCookie, cursorTokenClaims, unwrapCursorStoredToken } from './quota/cursor.js'
+import { readKeychainPassword, sanitizeError } from './quota/security.js'
 
 // Downloads the account's own usage export, the same CSV as Export CSV at
 // cursor.com/dashboard/usage, with the session the Cursor app keeps locally
@@ -75,7 +75,7 @@ export type CursorSyncStatus = {
   state: 'ok' | 'syncing-never' | 'error' | 'off' | 'no-login'
   lastSuccessAt: string | null
   // A fixed code for the apps to localize; `error` is its English text.
-  errorCode?: 'login' | 'network' | 'export'
+  errorCode?: 'login' | 'network' | 'export' | 'locked'
   error?: string
 }
 
@@ -83,9 +83,11 @@ const STATUS_ERRORS = {
   login: 'Cursor login expired, open Cursor to sign in again',
   network: "Couldn't reach cursor.com, will retry",
   export: "Couldn't read the usage export from cursor.com, will retry",
+  locked: 'Cursor encrypted its app session. CodeBurn could not unlock Safe Storage. Allow the keychain prompt, then click Retry.',
 } as const
 
 function statusErrorCode(lastError: string): keyof typeof STATUS_ERRORS {
+  if (/Safe Storage|encrypted its app session/.test(lastError)) return 'locked'
   if (/sign in again|HTTP 40[13]\b/.test(lastError)) return 'login'
   if (/HTTP (429|5\d\d)\b|fetch failed|time(d)? ?out|abort|network|socket|ENOTFOUND|ECONN|ETIMEDOUT|EAI_AGAIN/i.test(lastError)) return 'network'
   return 'export'
@@ -105,8 +107,16 @@ export async function cursorSyncStatus(now = Date.now()): Promise<CursorSyncStat
   const enabled = await cursorSyncEnabled()
   const lastSuccessAt = state.lastSuccessAt !== undefined ? new Date(state.lastSuccessAt).toISOString() : null
   if (!enabled) return { enabled, state: 'off', lastSuccessAt }
-  const claims = token ? cursorTokenClaims(token) : null
-  if (token === null || (token !== undefined && (!claims || !cursorSessionCookie(token, now)))) {
+  let session = token
+  if (token && token.startsWith('cursor-safe-storage:')) {
+    const unwrapped = await unwrapCursorStoredToken(token, readKeychainPassword)
+    if ('locked' in unwrapped) {
+      return { enabled, state: 'no-login', lastSuccessAt, errorCode: 'locked', error: STATUS_ERRORS.locked }
+    }
+    session = unwrapped.token
+  }
+  const claims = session ? cursorTokenClaims(session) : null
+  if (token === null || (token !== undefined && (!claims || !cursorSessionCookie(session!, now)))) {
     return { enabled, state: 'no-login', lastSuccessAt, errorCode: 'login', error: STATUS_ERRORS.login }
   }
   const code = state.lastError ? statusErrorCode(state.lastError) : null
@@ -178,8 +188,11 @@ export async function maybeSyncCursor(opts: { force?: boolean; now?: number; fet
     if (!force && !(await cursorSyncEnabled())) return null
     state = await readState()
     if (!force && state.nextAttemptAt !== undefined && now < state.nextAttemptAt) return null
-    const token = (await cursorAccessTokenFromDatabase(cursorDatabasePath()))?.trim()
-    if (!token) throw new Skip('the Cursor app is not signed in on this machine')
+    const stored = (await cursorAccessTokenFromDatabase(cursorDatabasePath()))?.trim()
+    if (!stored) throw new Skip('the Cursor app is not signed in on this machine')
+    const unwrapped = await unwrapCursorStoredToken(stored, readKeychainPassword)
+    if ('locked' in unwrapped) throw new Skip(STATUS_ERRORS.locked)
+    const token = unwrapped.token
     const claims = cursorTokenClaims(token)
     const cookie = cursorSessionCookie(token, now)
     if (!claims || !cookie) throw new Skip('the Cursor app session is expired; open Cursor and sign in again')
