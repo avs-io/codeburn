@@ -109,7 +109,16 @@ final class CursorQuotaTests: XCTestCase {
             "header.payload.signature"
         )
         XCTAssertNil(CursorSafeStorage.decrypt(stored, password: "wrong-password"))
-        XCTAssertEqual(try CursorSafeStorage.unlock("plain.jwt.token"), "plain.jwt.token")
+        XCTAssertEqual(try CursorSafeStorage.unlock("plain.jwt.token", allowPrompt: false), "plain.jwt.token")
+    }
+
+    func testBackgroundRefreshNeverAsksTheKeychainWithoutConsent() {
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.CursorQuota.\(#function)")
+        defer { TestDefaults.forget(suiteName) }
+        let stored = "cursor-safe-storage:v1:djEwaLx01xXA5BrTaEen3asJGsszpUzl3kjapkdjjClgeE4="
+        XCTAssertThrowsError(try CursorSafeStorage.unlock(stored, allowPrompt: false, defaults: defaults)) { error in
+            XCTAssertEqual(error as? CursorSubscriptionService.FetchError, .safeStorageLocked)
+        }
     }
 
     func testUnreadableLocalStoreIsReportedHonestlyWithoutNetwork() async throws {

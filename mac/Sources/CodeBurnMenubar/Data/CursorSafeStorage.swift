@@ -7,18 +7,32 @@ import CommonCrypto
 /// account `Cursor`). Plaintext tokens pass through. The secret is never logged.
 enum CursorSafeStorage {
     static let prefix = "cursor-safe-storage:"
+    static let consentKey = "codeburn.cursor.keychainConsent"
     private static let service = "Cursor Safe Storage"
     private static let accounts = ["Cursor Key", "Cursor"]
+    private static let lock = NSLock()
+    // The token a stored blob opened to, so a background refresh reads each blob once.
+    private nonisolated(unsafe) static var opened: (stored: String, jwt: String)?
 
-    static func unlock(_ stored: String) throws -> String {
+    /// Keychain consent is user-initiated, as for Claude: `allowPrompt` is a
+    /// Retry or Reconnect click. A background refresh reads only after such a
+    /// read succeeded, and its first locked read turns that off again.
+    static func unlock(_ stored: String, allowPrompt: Bool, defaults: UserDefaults = .standard) throws -> String {
         guard stored.hasPrefix(prefix) else { return stored }
-        guard let password = readPassword() else {
+        if !allowPrompt, let last = lock.withLock({ opened }), last.stored == stored { return last.jwt }
+        guard allowPrompt || defaults.bool(forKey: consentKey),
+              let jwt = readPassword().flatMap({ decrypt(stored, password: $0) }) else {
+            defaults.removeObject(forKey: consentKey)
             throw CursorSubscriptionService.FetchError.safeStorageLocked
         }
-        guard let jwt = decrypt(stored, password: password) else {
-            throw CursorSubscriptionService.FetchError.safeStorageLocked
-        }
+        defaults.set(true, forKey: consentKey)
+        lock.withLock { opened = (stored: stored, jwt: jwt) }
         return jwt
+    }
+
+    static func forget(defaults: UserDefaults) {
+        defaults.removeObject(forKey: consentKey)
+        lock.withLock { opened = nil }
     }
 
     /// PBKDF2-HMAC-SHA1(password, "saltysalt", 1003, 16) + AES-128-CBC, IV 16 spaces.
@@ -67,16 +81,14 @@ enum CursorSafeStorage {
         for account in accounts {
             if let value = securityPassword(account: account) { return value }
         }
-        return securityPassword(account: nil)
+        // No service-only lookup: after a Deny it finds the same item and asks again.
+        return nil
     }
 
-    private static func securityPassword(account: String?) -> String? {
+    private static func securityPassword(account: String) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        var args = ["find-generic-password", "-s", service]
-        if let account { args += ["-a", account] }
-        args.append("-w")
-        process.arguments = args
+        process.arguments = ["find-generic-password", "-s", service, "-a", account, "-w"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice

@@ -43,7 +43,7 @@ enum CursorSubscriptionService {
             case .expiredSession:
                 return "The Cursor app session is expired or invalid. Sign in again, then click Retry."
             case .safeStorageLocked:
-                return "Cursor encrypted its app session. CodeBurn could not unlock Safe Storage. Allow the keychain prompt, then click Retry."
+                return "Cursor encrypted its app session. Click Retry or Reconnect, then allow the Cursor Safe Storage keychain prompt."
             case .authenticationRejected:
                 return "Cursor rejected the current app session. Sign in again, then click Retry."
             case .appDataUnreadable:
@@ -91,10 +91,11 @@ enum CursorSubscriptionService {
             // keep it off the main actor so a lock held by Cursor cannot
             // stall the UI.
             let loadAccessToken = deps.loadAccessToken
+            let allowPrompt = CapacityDockProviderRefreshInteraction.isUserInitiated
             let raw = try await Task.detached {
                 let loaded = try loadAccessToken()?.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard let loaded, !loaded.isEmpty else { return nil as String? }
-                return try CursorSafeStorage.unlock(loaded)
+                return try CursorSafeStorage.unlock(loaded, allowPrompt: allowPrompt)
             }.value
             guard let loaded = raw else { throw FetchError.noCredentials }
             accessToken = loaded
