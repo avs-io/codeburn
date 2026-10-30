@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   cursorAccessTokenFromDatabase,
   cursorDatabasePath,
+  cursorLockedMessage,
   cursorSessionCookie,
   decodeCursorUsage,
   decryptCursorSafeStorage,
@@ -127,6 +128,12 @@ describe('Cursor safe-storage session', () => {
     expect(opened).toEqual({ token: syntheticJWT() })
   })
 
+  it('names the sync command only on macOS, which has a keychain prompt', () => {
+    expect(cursorLockedMessage('darwin')).toBe('Cursor encrypted its app session. Run codeburn import cursor --sync, then allow the Cursor Safe Storage keychain prompt.')
+    expect(cursorLockedMessage('win32')).toBe('Cursor encrypted its app session, which CodeBurn cannot unlock on Windows yet.')
+    expect(cursorLockedMessage('linux')).toBe('Cursor encrypted its app session, which CodeBurn cannot unlock on Linux yet.')
+  })
+
   it('fetches quota from an encrypted app token without calling it expired', async () => {
     const token = syntheticJWT()
     const seen: string[] = []
@@ -154,7 +161,7 @@ describe('Cursor safe-storage session', () => {
       fetch: neverFetch,
     })
     expect(result.quota.connection).toBe('terminalFailure')
-    expect(result.quota.footerLines[0]).toContain('codeburn import cursor --sync')
+    expect(result.quota.footerLines).toEqual([cursorLockedMessage()])
     expect(reads).toBe(0)
   })
 })

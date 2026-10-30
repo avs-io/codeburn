@@ -7,7 +7,7 @@ import { getCodeburnCacheDir } from './cache-dir.js'
 import { readConfig } from './config.js'
 import { cursorImportPath, importCursorCsvText, loadCursorImport, replacedProviders, type CoverageRange, type CursorImportSummary } from './cursor-import.js'
 import { invalidateProviderDays, toDateString } from './daily-cache.js'
-import { cursorAccessTokenFromDatabase, cursorDatabasePath, cursorSessionCookie, cursorTokenClaims, isCursorSafeStorageToken, unwrapCursorStoredToken } from './quota/cursor.js'
+import { cursorAccessTokenFromDatabase, cursorDatabasePath, cursorLockedMessage, cursorSessionCookie, cursorTokenClaims, isCursorSafeStorageToken, unwrapCursorStoredToken } from './quota/cursor.js'
 import { readKeychainPassword, sanitizeError } from './quota/security.js'
 
 // Downloads the account's own usage export, the same CSV as Export CSV at
@@ -88,7 +88,7 @@ const STATUS_ERRORS = {
   login: 'Cursor login expired, open Cursor to sign in again',
   network: "Couldn't reach cursor.com, will retry",
   export: "Couldn't read the usage export from cursor.com, will retry",
-  locked: 'Cursor encrypted its app session. Run codeburn import cursor --sync, then allow the Cursor Safe Storage keychain prompt.',
+  locked: cursorLockedMessage(),
 } as const
 
 function statusErrorCode(lastError: string): keyof typeof STATUS_ERRORS {
