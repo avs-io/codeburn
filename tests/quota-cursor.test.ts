@@ -131,6 +131,7 @@ describe('Cursor safe-storage session', () => {
     const token = syntheticJWT()
     const seen: string[] = []
     const result = await fetchCursorQuota({
+      allowKeychain: true,
       now: () => NOW,
       loadAccessToken: async () => encryptSafeStorage(token, password),
       readKeychain: async () => ({ status: 'found', value: password }),
@@ -142,6 +143,19 @@ describe('Cursor safe-storage session', () => {
     expect(result.quota.connection).toBe('connected')
     expect(result.quota.planLabel).toBe('Pro')
     expect(seen[0]).toBe(`WorkosCursorSessionToken=user_123%3A%3A${token}`)
+  })
+
+  it('leaves the keychain alone unless the caller allows it', async () => {
+    let reads = 0
+    const result = await fetchCursorQuota({
+      now: () => NOW,
+      loadAccessToken: async () => encryptSafeStorage(syntheticJWT(), password),
+      readKeychain: async () => { reads += 1; return { status: 'found', value: password } },
+      fetch: neverFetch,
+    })
+    expect(result.quota.connection).toBe('terminalFailure')
+    expect(result.quota.footerLines[0]).toContain('codeburn import cursor --sync')
+    expect(reads).toBe(0)
   })
 })
 

@@ -30,12 +30,12 @@ const UNREADABLE_FOOTER = ["Could not read the Cursor app's local session data. 
 const RATE_LIMITED_FOOTER = ['Cursor rate-limited the quota request.']
 const UNAVAILABLE_FOOTER = ['Cursor is temporarily unavailable.']
 const PARSE_FOOTER = ['Cursor returned an unrecognized quota response.']
-const LOCKED_FOOTER = ['Cursor encrypted its app session. CodeBurn could not unlock Safe Storage. Allow the keychain prompt, then click Retry.']
+const LOCKED_FOOTER = ['Cursor encrypted its app session. Run codeburn import cursor --sync, then allow the Cursor Safe Storage keychain prompt.']
 const SAFE_STORAGE_PREFIX = 'cursor-safe-storage:'
 const SAFE_STORAGE_SERVICE = 'Cursor Safe Storage'
 // Cursor 3.27's account is "Cursor Key". Older Electron builds used "Cursor".
-// A service-only lookup is the last try, for a renamed account.
-const SAFE_STORAGE_ACCOUNTS: (string | null)[] = ['Cursor Key', 'Cursor', null]
+// No service-only lookup: after a Deny it finds the same item and asks again.
+const SAFE_STORAGE_ACCOUNTS: (string | null)[] = ['Cursor Key', 'Cursor']
 
 /** Cursor is an Electron app, so its state database follows the VS Code layout
  *  of whichever platform it runs on. */
@@ -265,7 +265,7 @@ export function cursorSessionCookie(token: string, now: number): string | null {
 
 export type CursorResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 
-export async function fetchCursorQuota(options: Partial<CursorDeps> & { signal?: AbortSignal } = {}): Promise<CursorResult> {
+export async function fetchCursorQuota(options: Partial<CursorDeps> & { signal?: AbortSignal; allowKeychain?: boolean } = {}): Promise<CursorResult> {
   const deps = { ...defaultDeps(), ...options }
   let token: string | null
   try {
@@ -278,6 +278,8 @@ export async function fetchCursorQuota(options: Partial<CursorDeps> & { signal?:
   }
   if (!token) return { quota: empty('disconnected', SIGNED_OUT_FOOTER) }
 
+  // Keychain consent is user-initiated, as for Claude: only a caller that says so may raise the prompt.
+  if (isCursorSafeStorageToken(token) && !options.allowKeychain) return { quota: empty('terminalFailure', LOCKED_FOOTER) }
   const unwrapped = await unwrapCursorStoredToken(token, deps.readKeychain)
   if ('locked' in unwrapped) return { quota: empty('terminalFailure', LOCKED_FOOTER) }
   const cookie = cursorSessionCookie(unwrapped.token, deps.now())
